@@ -480,6 +480,15 @@ impl DynarecCompiler {
             .expect("declare_function failed");
         self.ctx.func.signature = sig;
 
+        // Does any instruction in the block either read or write CPSR?
+        // If not, we skip the CPSR load+store at function entry/exit
+        // entirely — saves ~2 x86 instructions per compiled call on
+        // single-shape blocks like "MOV R1, #42" (S=0, cond=AL).
+        let touches_cpsr = opcodes.iter().any(|&insn| {
+            let dec = Self::decode_supported_dp(insn).expect("pre-validated");
+            dec.s || dec.cond != ArmCond::Al
+        });
+
         {
             let mut builder =
                 FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
@@ -491,26 +500,38 @@ impl DynarecCompiler {
             let gpr_ptr = builder.block_params(entry)[0];
             let cpsr_ptr = builder.block_params(entry)[1];
 
-            // Load CPSR into a mutable variable at function entry. Cond
-            // checks read from it; S-bit / compare ops write back to it.
-            // Storing once at function exit.
+            // Load CPSR only if we'll actually use it. When no instr
+            // reads flags (cond=AL) or writes flags (S=0), the var
+            // stays unused and Cranelift eliminates both the load and
+            // the matching store at function exit.
             let cpsr_var = builder.declare_var(types::I32);
-            let cpsr_initial =
-                builder
-                    .ins()
-                    .load(types::I32, MemFlags::trusted(), cpsr_ptr, 0);
-            builder.def_var(cpsr_var, cpsr_initial);
+            if touches_cpsr {
+                let cpsr_initial = builder.ins().load(
+                    types::I32,
+                    MemFlags::trusted(),
+                    cpsr_ptr,
+                    0,
+                );
+                builder.def_var(cpsr_var, cpsr_initial);
+            } else {
+                let zero = builder.ins().iconst(types::I32, 0);
+                builder.def_var(cpsr_var, zero);
+            }
 
             for &insn in opcodes {
                 let dec = Self::decode_supported_dp(insn).expect("pre-validated");
                 emit_conditional_instr(&mut builder, gpr_ptr, cpsr_var, dec);
             }
 
-            // Flush CPSR back out.
-            let cpsr_final = builder.use_var(cpsr_var);
-            builder
-                .ins()
-                .store(MemFlags::trusted(), cpsr_final, cpsr_ptr, 0);
+            if touches_cpsr {
+                let cpsr_final = builder.use_var(cpsr_var);
+                builder.ins().store(
+                    MemFlags::trusted(),
+                    cpsr_final,
+                    cpsr_ptr,
+                    0,
+                );
+            }
 
             builder.ins().return_(&[]);
             builder.finalize();
