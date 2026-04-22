@@ -3081,6 +3081,13 @@ fn emit_thumb_format2(
         gpr_ptr,
         Offset32::new(dec.rs * 4),
     );
+    // For Imm3 shape (imm3 ∈ [0,7], always non-negative), rhs sign
+    // bit is known 0, so the same simplified V formula Thumb3 uses
+    // applies:
+    //   ADD V = ~rs & result & 0x8000_0000
+    //   SUB V = rs & ~result & 0x8000_0000
+    // Saves 2 CLIF ops per Thumb2 imm3 instruction vs general.
+    let is_small_positive_imm = matches!(dec.operand, Thumb2Operand::Imm3(_));
     let rhs = match dec.operand {
         Thumb2Operand::Imm3(v) => builder.ins().iconst(types::I32, v as i64),
         Thumb2Operand::Reg(rn) => builder.ins().load(
@@ -3101,8 +3108,45 @@ fn emit_thumb_format2(
         gpr_ptr,
         Offset32::new(dec.rd * 4),
     );
-    let new_cpsr = emit_flag_update(builder, cpsr_var, dp_equivalent, rs_val, rhs, result);
-    builder.def_var(cpsr_var, new_cpsr);
+
+    if is_small_positive_imm {
+        // Inlined flag update with simplified V (mirrors emit_thumb_format3
+        // ADD/SUB path).
+        let zero = builder.ins().iconst(types::I32, 0);
+        let n_shifted = builder.ins().band_imm(result, 0x8000_0000_u32 as i64);
+        let z_bool = builder.ins().icmp(IntCC::Equal, result, zero);
+        let z_u32 = builder.ins().uextend(types::I32, z_bool);
+        let z_shifted = builder.ins().ishl_imm(z_u32, 30);
+        let (c_bool, v_shifted) = if dec.sub {
+            let c = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, rs_val, rhs);
+            let not_result = builder.ins().bnot(result);
+            let v_bits = builder.ins().band(rs_val, not_result);
+            let v_top = builder.ins().band_imm(v_bits, 0x8000_0000_u32 as i64);
+            (c, builder.ins().ushr_imm(v_top, 3))
+        } else {
+            let c = builder.ins().icmp(IntCC::UnsignedLessThan, result, rs_val);
+            let not_rs = builder.ins().bnot(rs_val);
+            let v_bits = builder.ins().band(not_rs, result);
+            let v_top = builder.ins().band_imm(v_bits, 0x8000_0000_u32 as i64);
+            (c, builder.ins().ushr_imm(v_top, 3))
+        };
+        let c_u32 = builder.ins().uextend(types::I32, c_bool);
+        let c_shifted = builder.ins().ishl_imm(c_u32, 29);
+        let cpsr = builder.use_var(cpsr_var);
+        let cleared = builder.ins().band_imm(cpsr, 0x0fff_ffff);
+        let nz = builder.ins().bor(n_shifted, z_shifted);
+        let cv = builder.ins().bor(c_shifted, v_shifted);
+        let flags = builder.ins().bor(nz, cv);
+        let new_cpsr = builder.ins().bor(cleared, flags);
+        builder.def_var(cpsr_var, new_cpsr);
+    } else {
+        // Reg operand → rhs sign could be anything; use general path.
+        let new_cpsr =
+            emit_flag_update(builder, cpsr_var, dp_equivalent, rs_val, rhs, result);
+        builder.def_var(cpsr_var, new_cpsr);
+    }
 }
 
 /// Emit a Thumb format 3 instruction with the flag update SKIPPED.
