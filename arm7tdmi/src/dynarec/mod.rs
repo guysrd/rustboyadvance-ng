@@ -1068,7 +1068,13 @@ impl DynarecCompiler {
                 let skip_fu = skip[k];
                 match item {
                     ThumbItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
-                    ThumbItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, *d),
+                    ThumbItem::F2(d) => {
+                        if skip_fu {
+                            emit_thumb_format2_no_flags(&mut builder, gpr_ptr, *d);
+                        } else {
+                            emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, *d);
+                        }
+                    }
                     ThumbItem::F3(d) => {
                         if skip_fu {
                             emit_thumb_format3_no_flags(&mut builder, gpr_ptr, *d);
@@ -3147,6 +3153,43 @@ fn emit_thumb_format2(
             emit_flag_update(builder, cpsr_var, dp_equivalent, rs_val, rhs, result);
         builder.def_var(cpsr_var, new_cpsr);
     }
+}
+
+/// Emit a Thumb format 2 instruction with the flag update SKIPPED.
+/// Counterpart to `emit_thumb_format2` used by the dead-flag-write pass.
+/// Drops the entire cpsr pack sequence; still performs the ADD/SUB
+/// and writes the result back to rd.
+fn emit_thumb_format2_no_flags(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    dec: DecodedThumb2,
+) {
+    let rs_val = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        gpr_ptr,
+        Offset32::new(dec.rs * 4),
+    );
+    let rhs = match dec.operand {
+        Thumb2Operand::Imm3(v) => builder.ins().iconst(types::I32, v as i64),
+        Thumb2Operand::Reg(rn) => builder.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            gpr_ptr,
+            Offset32::new(rn * 4),
+        ),
+    };
+    let result = if dec.sub {
+        builder.ins().isub(rs_val, rhs)
+    } else {
+        builder.ins().iadd(rs_val, rhs)
+    };
+    builder.ins().store(
+        MemFlags::trusted(),
+        result,
+        gpr_ptr,
+        Offset32::new(dec.rd * 4),
+    );
 }
 
 /// Emit a Thumb format 3 instruction with the flag update SKIPPED.
