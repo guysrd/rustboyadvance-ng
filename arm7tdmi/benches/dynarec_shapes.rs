@@ -107,6 +107,23 @@ fn bench_arm_cmp_imm(c: &mut Criterion) {
     });
 }
 
+fn bench_shift_pair_sxtb(c: &mut Criterion) {
+    // LSL R1, R0, #24 ; ASR R1, R1, #24
+    // Matcher in patterns.rs collapses this to a single sxtb stencil;
+    // compare vs what the two per-instr emits would produce.
+    let mut compiler = DynarecCompiler::new();
+    let func = compiler.try_compile_thumb_block(&[0x0601, 0x1609]).unwrap();
+    let mut gpr = [0u32; 15];
+    gpr[0] = 0xdead_beef;
+    let mut cpsr = 0u32;
+    c.bench_function("shift_pair_sxtb", |b| {
+        b.iter(|| {
+            func(black_box(gpr.as_mut_ptr()), black_box(&mut cpsr as *mut u32));
+            black_box(&mut gpr);
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_thumb_mov_imm,
@@ -115,5 +132,6 @@ criterion_group!(
     bench_thumb_dp_chain,
     bench_arm_mov_imm,
     bench_arm_cmp_imm,
+    bench_shift_pair_sxtb,
 );
 criterion_main!(benches);

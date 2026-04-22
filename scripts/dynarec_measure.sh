@@ -84,6 +84,7 @@ T_thumb_cmp_imm=$(parse_bench thumb_cmp_imm)
 T_thumb_dp_chain=$(parse_bench thumb_dp_chain)
 T_arm_mov_imm=$(parse_bench arm_mov_imm)
 T_arm_cmp_imm=$(parse_bench arm_cmp_imm)
+T_shift_pair_sxtb=$(parse_bench shift_pair_sxtb)
 
 echo "ns/iter per shape:"
 echo "  thumb_mov_imm   = $T_thumb_mov_imm"
@@ -92,6 +93,7 @@ echo "  thumb_cmp_imm   = $T_thumb_cmp_imm"
 echo "  thumb_dp_chain  = $T_thumb_dp_chain"
 echo "  arm_mov_imm     = $T_arm_mov_imm"
 echo "  arm_cmp_imm     = $T_arm_cmp_imm"
+echo "  shift_pair_sxtb = $T_shift_pair_sxtb"
 
 # -----------------------------------------------------------------------------
 # 2. Weighted cycles: fixed empirical weights (calls/sec on real gameplay).
@@ -102,6 +104,9 @@ W_thumb_cmp_imm=5000000
 W_thumb_dp_chain=3000000
 W_arm_mov_imm=2000000
 W_arm_cmp_imm=1500000
+# Shift-pair sign/zero extend idiom is compiler-generated for every
+# i8/i16 -> i32 widening; pokeemerald trace samples ~2.5M/s.
+W_shift_pair_sxtb=2500000
 
 WEIGHTED=$(awk "BEGIN { printf \"%.0f\", \
     $T_thumb_mov_imm*$W_thumb_mov_imm \
@@ -109,7 +114,8 @@ WEIGHTED=$(awk "BEGIN { printf \"%.0f\", \
   + $T_thumb_cmp_imm*$W_thumb_cmp_imm \
   + $T_thumb_dp_chain*$W_thumb_dp_chain \
   + $T_arm_mov_imm*$W_arm_mov_imm \
-  + $T_arm_cmp_imm*$W_arm_cmp_imm }")
+  + $T_arm_cmp_imm*$W_arm_cmp_imm \
+  + $T_shift_pair_sxtb*$W_shift_pair_sxtb }")
 
 # -----------------------------------------------------------------------------
 # 3. fps_bench replay for correctness + FPS sanity.
