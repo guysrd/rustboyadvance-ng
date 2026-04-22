@@ -525,9 +525,53 @@ impl DynarecCompiler {
                 builder.def_var(cpsr_var, zero);
             }
 
-            for &insn in opcodes {
-                let dec = Self::decode_supported_dp(insn).expect("pre-validated");
-                emit_conditional_instr(&mut builder, gpr_ptr, cpsr_var, dec);
+            // Dead-flag-write pre-pass, mirror of the one in
+            // try_compile_thumb_block (exp 10). If instruction k's
+            // flag-write is wholly covered by k+1's flag-write AND
+            // instruction k+1 has cond=AL AND S=1, then k's flag update
+            // is observably dead.
+            //
+            // ARM DP flag-write masks (NZCV bitmask: N=8, Z=4, C=2, V=1):
+            //   ADD/SUB/CMP/CMN:        0b1111 (full NZCV)
+            //   MOV/MVN/TST/TEQ:        0b1100 (NZ only — preserves CV)
+            // When S=0, the instr writes no flags → doesn't kill anything
+            // downstream and can't itself be dead-eliminated (its write
+            // was already zero).
+            fn arm_dp_flag_write_mask(dec: &DecodedDp) -> u8 {
+                if !dec.s {
+                    return 0;
+                }
+                match dec.op {
+                    DpOp::Add | DpOp::Sub | DpOp::Cmp | DpOp::Cmn => 0b1111,
+                    DpOp::Mov | DpOp::Mvn | DpOp::Tst | DpOp::Teq => 0b1100,
+                }
+            }
+            let decoded: Vec<DecodedDp> = opcodes
+                .iter()
+                .map(|&i| Self::decode_supported_dp(i).expect("pre-validated"))
+                .collect();
+            let n = decoded.len();
+            let mut skip_flags: Vec<bool> = vec![false; n];
+            for k in 0..n.saturating_sub(1) {
+                let cur = arm_dp_flag_write_mask(&decoded[k]);
+                let next_reads_flags = decoded[k + 1].cond != ArmCond::Al;
+                let next_writes_full = arm_dp_flag_write_mask(&decoded[k + 1]);
+                if cur != 0
+                    && !next_reads_flags
+                    && (cur & !next_writes_full) == 0
+                {
+                    skip_flags[k] = true;
+                }
+            }
+
+            for (k, dec) in decoded.iter().enumerate() {
+                if skip_flags[k] {
+                    emit_conditional_instr_no_flags(
+                        &mut builder, gpr_ptr, cpsr_var, *dec,
+                    );
+                } else {
+                    emit_conditional_instr(&mut builder, gpr_ptr, cpsr_var, *dec);
+                }
             }
 
             if touches_cpsr {
@@ -2685,6 +2729,28 @@ fn emit_conditional_instr(
     builder.ins().jump(merge, &[]);
     builder.switch_to_block(merge);
     builder.seal_block(merge);
+}
+
+/// Same as `emit_conditional_instr` but skips the flag-update portion
+/// of the contained DP emit. Used by the dead-flag-write pass in
+/// `try_compile_imm_block` when the next instruction in the block
+/// unconditionally overwrites this one's NZCV footprint.
+///
+/// For a conditional instruction (cond != AL) whose body is flag-dead,
+/// the dead-flag analysis still emits the cond-check + body, the body
+/// just doesn't pack flags. That's strictly correct since the next
+/// unconditional flag-write overwrites.
+fn emit_conditional_instr_no_flags(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    cpsr_var: Variable,
+    mut dec: DecodedDp,
+) {
+    // Trick: pass S=false into the emit path so emit_data_processing_imm
+    // skips the emit_flag_update call entirely. Result + writeback are
+    // unchanged.
+    dec.s = false;
+    emit_conditional_instr(builder, gpr_ptr, cpsr_var, dec);
 }
 
 /// Emit a Thumb format 14 PUSH or POP register list.
