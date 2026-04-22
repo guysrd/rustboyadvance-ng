@@ -1044,6 +1044,12 @@ impl DynarecCompiler {
             .expect("declare_function failed");
         self.ctx.func.signature = sig;
 
+        // Block-level pattern pre-pass: if the whole block matches a
+        // known synthesized shape (shift-pair sign/zero extend, etc),
+        // emit its hand-lowered stencil and return. Stencils are in
+        // arm7tdmi::dynarec::patterns.
+        let matched_pattern = patterns::try_match_thumb(opcodes);
+
         {
             let mut builder =
                 FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
@@ -1059,6 +1065,21 @@ impl DynarecCompiler {
             let cpsr_initial =
                 builder.ins().load(types::I32, MemFlags::trusted(), cpsr_ptr, 0);
             builder.def_var(cpsr_var, cpsr_initial);
+
+            if let Some(pattern) = &matched_pattern {
+                patterns::emit_pattern_thumb(
+                    &mut builder,
+                    gpr_ptr,
+                    cpsr_var,
+                    pattern,
+                );
+                let cpsr_final = builder.use_var(cpsr_var);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), cpsr_final, cpsr_ptr, 0);
+                builder.ins().return_(&[]);
+                builder.finalize();
+            } else {
 
             // Dead flag-write analysis: if instruction k's flag write is
             // wholly covered by instruction k+1's flag write AND k+1
@@ -1137,6 +1158,7 @@ impl DynarecCompiler {
                 .store(MemFlags::trusted(), cpsr_final, cpsr_ptr, 0);
             builder.ins().return_(&[]);
             builder.finalize();
+            } // end else (pattern match fell through to per-instruction path)
         }
 
         self.module
@@ -2135,7 +2157,7 @@ impl DynarecCompiler {
     ///     oo = 00 LSL, 01 LSR, 10 ASR  (11 is format 2 add/sub, rejected)
     ///     imm5 = iiiii
     ///     Rs = sss, Rd = ddd
-    fn decode_thumb_format1(op: u16) -> Option<DecodedThumb1> {
+    pub(crate) fn decode_thumb_format1(op: u16) -> Option<DecodedThumb1> {
         if (op >> 13) & 0b111 != 0b000 {
             return None;
         }
@@ -2575,14 +2597,14 @@ struct DecodedThumbPcBranch {
 /// for now. Format 4 reg shifts (LSL/LSR/ASR/ROR with register amount)
 /// would extend this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShiftKind { Lsl, Lsr, Asr }
+pub(crate) enum ShiftKind { Lsl, Lsr, Asr }
 
 #[derive(Clone, Copy, Debug)]
-struct DecodedThumb1 {
-    kind: ShiftKind,
-    imm5: u32,
-    rs: i32,
-    rd: i32,
+pub(crate) struct DecodedThumb1 {
+    pub(crate) kind: ShiftKind,
+    pub(crate) imm5: u32,
+    pub(crate) rs: i32,
+    pub(crate) rd: i32,
 }
 
 /// A decoded ARM LDR / STR immediate instruction. Pre indexed, no writeback,
