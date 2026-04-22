@@ -3268,72 +3268,83 @@ fn emit_flag_update(
     result: Value,
 ) -> Value {
     let zero = builder.ins().iconst(types::I32, 0);
-    let one = builder.ins().iconst(types::I32, 1);
 
-    // N = result >> 31.
-    let n = builder.ins().ushr_imm(result, 31);
+    // N at bit 31 directly: `result & 0x8000_0000`. Saves the
+    // ushr_imm(31) + ishl_imm(31) round-trip that previously went
+    // through bit 0.
+    let n_shifted = builder
+        .ins()
+        .band_imm(result, 0x8000_0000_u32 as i64);
 
-    // Z = (result == 0) ? 1 : 0.
+    // Z at bit 30: (result == 0) → i8 {0, 1} → uextend → shift up.
     let z_bool = builder.ins().icmp(IntCC::Equal, result, zero);
-    let z = builder.ins().uextend(types::I32, z_bool);
+    let z_u32 = builder.ins().uextend(types::I32, z_bool);
+    let z_shifted = builder.ins().ishl_imm(z_u32, 30);
 
-    // C and V depend on op:
+    // C/V depend on op:
     //   ADD/CMN: C = unsigned carry-out; V = signed overflow.
     //   SUB/CMP: C = NOT borrow; V = signed overflow.
-    //   Logical (TST/TEQ/MOV/MVN with S=1): C unchanged (we preserve
-    //     the previous C bit), V unchanged.
-    let (c, v) = match op {
+    //   Logical (TST/TEQ/MOV/MVN with S=1): C unchanged, V unchanged.
+    //
+    // For logical ops we skip the C/V compute AND the cpsr C/V
+    // round-trip entirely: the merge mask at the bottom preserves
+    // bits 29/28 in place when `preserve_cv` is true.
+    let (c_shifted, v_shifted, preserve_cv) = match op {
         DpOp::Add | DpOp::Cmn => {
-            // C: result < rn (unsigned) → carry out
             let c_bool = builder.ins().icmp(IntCC::UnsignedLessThan, result, rn);
-            let c = builder.ins().uextend(types::I32, c_bool);
-            // V: (~(rn ^ op2) & (rn ^ result)) >> 31
+            let c_u32 = builder.ins().uextend(types::I32, c_bool);
+            let c_shifted = builder.ins().ishl_imm(c_u32, 29);
+            // V: (~(rn ^ op2) & (rn ^ result)) & 0x8000_0000, shifted to bit 28.
             let xor_ab = builder.ins().bxor(rn, op2);
             let nxor_ab = builder.ins().bnot(xor_ab);
             let xor_ar = builder.ins().bxor(rn, result);
             let v_bits = builder.ins().band(nxor_ab, xor_ar);
-            let v = builder.ins().ushr_imm(v_bits, 31);
-            (c, v)
+            let v_top = builder.ins().band_imm(v_bits, 0x8000_0000_u32 as i64);
+            let v_shifted = builder.ins().ushr_imm(v_top, 3);
+            (c_shifted, v_shifted, false)
         }
         DpOp::Sub | DpOp::Cmp => {
-            // C: rn >= op2 (unsigned) → not-borrow
-            let c_bool = builder.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, rn, op2);
-            let c = builder.ins().uextend(types::I32, c_bool);
-            // V: ((rn ^ op2) & (rn ^ result)) >> 31
+            let c_bool = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, rn, op2);
+            let c_u32 = builder.ins().uextend(types::I32, c_bool);
+            let c_shifted = builder.ins().ishl_imm(c_u32, 29);
             let xor_ab = builder.ins().bxor(rn, op2);
             let xor_ar = builder.ins().bxor(rn, result);
             let v_bits = builder.ins().band(xor_ab, xor_ar);
-            let v = builder.ins().ushr_imm(v_bits, 31);
-            (c, v)
+            let v_top = builder.ins().band_imm(v_bits, 0x8000_0000_u32 as i64);
+            let v_shifted = builder.ins().ushr_imm(v_top, 3);
+            (c_shifted, v_shifted, false)
         }
         DpOp::Mov | DpOp::Mvn | DpOp::Tst | DpOp::Teq => {
-            // Logical ops preserve C and V (no shifter carry is computed
-            // for the simple imm/reg-no-shift shapes we support yet).
-            let cpsr = builder.use_var(cpsr_var);
-            let c = {
-                let shifted = builder.ins().ushr_imm(cpsr, 29);
-                builder.ins().band(shifted, one)
-            };
-            let v = {
-                let shifted = builder.ins().ushr_imm(cpsr, 28);
-                builder.ins().band(shifted, one)
-            };
-            (c, v)
+            // Logical ops: leave C/V in place in cpsr. zero contributes
+            // nothing to the OR below.
+            (zero, zero, true)
         }
     };
 
-    // Merge new NZCV into CPSR (bits 31/30/29/28), preserving the others.
+    // Merge new NZCV into CPSR. For ADD/SUB/CMP/CMN we clear all four
+    // top bits (0x0fff_ffff) and OR the new NZCV in. For MOV/MVN/TST/TEQ
+    // we keep bits 29/28 (C/V) in place, so we only clear bits 31/30
+    // (0x3fff_ffff) and OR in the new N/Z only.
     let cpsr = builder.use_var(cpsr_var);
-    let mask = builder.ins().iconst(types::I32, 0x0fff_ffff); // clear top 4 bits
+    let mask = builder.ins().iconst(
+        types::I32,
+        if preserve_cv {
+            0x3fff_ffff
+        } else {
+            0x0fff_ffff
+        },
+    );
     let cleared = builder.ins().band(cpsr, mask);
-    let n_shifted = builder.ins().ishl_imm(n, 31);
-    let z_shifted = builder.ins().ishl_imm(z, 30);
-    let c_shifted = builder.ins().ishl_imm(c, 29);
-    let v_shifted = builder.ins().ishl_imm(v, 28);
     let nz = builder.ins().bor(n_shifted, z_shifted);
-    let cv = builder.ins().bor(c_shifted, v_shifted);
-    let flags = builder.ins().bor(nz, cv);
-    builder.ins().bor(cleared, flags)
+    if preserve_cv {
+        builder.ins().bor(cleared, nz)
+    } else {
+        let cv = builder.ins().bor(c_shifted, v_shifted);
+        let flags = builder.ins().bor(nz, cv);
+        builder.ins().bor(cleared, flags)
+    }
 }
 
 #[cfg(test)]
