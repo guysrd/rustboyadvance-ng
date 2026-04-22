@@ -3058,18 +3058,43 @@ fn emit_thumb_format3(
         return;
     }
 
+    // For Thumb3 ADD/SUB/CMP, imm8 ∈ [0, 255] (always positive → sign
+    // bit always 0). Specializing the V-flag formula:
+    //   ADD V = ~rd & result & 0x8000_0000  (4 CLIF ops vs 6 general)
+    //   SUB V = rd & ~result & 0x8000_0000  (4 CLIF ops vs 6 general)
+    // Saves 2 ops per instruction on this hot shape.
     let rd_val = builder.ins().load(
         types::I32,
         MemFlags::trusted(),
         gpr_ptr,
         Offset32::new(dec.rd * 4),
     );
+    let zero = builder.ins().iconst(types::I32, 0);
 
-    let (result, dp_equivalent, writeback) = match dec.op {
+    let (result, c_bool, v_shifted, writeback) = match dec.op {
         Thumb3Op::Mov => unreachable!(),
-        Thumb3Op::Cmp => (builder.ins().isub(rd_val, imm8), DpOp::Cmp, false),
-        Thumb3Op::Add => (builder.ins().iadd(rd_val, imm8), DpOp::Add, true),
-        Thumb3Op::Sub => (builder.ins().isub(rd_val, imm8), DpOp::Sub, true),
+        Thumb3Op::Cmp | Thumb3Op::Sub => {
+            let result = builder.ins().isub(rd_val, imm8);
+            let c = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, rd_val, imm8);
+            let not_result = builder.ins().bnot(result);
+            let v_bits = builder.ins().band(rd_val, not_result);
+            let v_top = builder.ins().band_imm(v_bits, 0x8000_0000_u32 as i64);
+            let v = builder.ins().ushr_imm(v_top, 3);
+            (result, c, v, matches!(dec.op, Thumb3Op::Sub))
+        }
+        Thumb3Op::Add => {
+            let result = builder.ins().iadd(rd_val, imm8);
+            let c = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThan, result, rd_val);
+            let not_rd = builder.ins().bnot(rd_val);
+            let v_bits = builder.ins().band(not_rd, result);
+            let v_top = builder.ins().band_imm(v_bits, 0x8000_0000_u32 as i64);
+            let v = builder.ins().ushr_imm(v_top, 3);
+            (result, c, v, true)
+        }
     };
 
     if writeback {
@@ -3080,7 +3105,22 @@ fn emit_thumb_format3(
             Offset32::new(dec.rd * 4),
         );
     }
-    let new_cpsr = emit_flag_update(builder, cpsr_var, dp_equivalent, rd_val, imm8, result);
+
+    // N/Z pack via the same icmp+uextend+ishl pattern emit_flag_update
+    // uses on ADD/SUB (exp 4 confirmed select() regresses on x86_64).
+    let n_shifted = builder.ins().band_imm(result, 0x8000_0000_u32 as i64);
+    let z_bool = builder.ins().icmp(IntCC::Equal, result, zero);
+    let z_u32 = builder.ins().uextend(types::I32, z_bool);
+    let z_shifted = builder.ins().ishl_imm(z_u32, 30);
+    let c_u32 = builder.ins().uextend(types::I32, c_bool);
+    let c_shifted = builder.ins().ishl_imm(c_u32, 29);
+
+    let cpsr = builder.use_var(cpsr_var);
+    let cleared = builder.ins().band_imm(cpsr, 0x0fff_ffff);
+    let nz = builder.ins().bor(n_shifted, z_shifted);
+    let cv = builder.ins().bor(c_shifted, v_shifted);
+    let flags = builder.ins().bor(nz, cv);
+    let new_cpsr = builder.ins().bor(cleared, flags);
     builder.def_var(cpsr_var, new_cpsr);
 }
 
