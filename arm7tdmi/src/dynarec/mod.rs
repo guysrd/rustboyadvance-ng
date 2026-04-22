@@ -3035,6 +3035,29 @@ fn emit_thumb_format3(
     dec: DecodedThumb3,
 ) {
     let imm8 = builder.ins().iconst(types::I32, dec.imm8 as i64);
+
+    // MOV imm8 fast path: imm8 ∈ [0, 255] so N is always 0, C/V are
+    // preserved, Z is a compile-time constant (imm8==0). Skip the
+    // general emit_flag_update + skip the rd_val load (MOV doesn't
+    // read rd).
+    if let Thumb3Op::Mov = dec.op {
+        builder.ins().store(
+            MemFlags::trusted(),
+            imm8,
+            gpr_ptr,
+            Offset32::new(dec.rd * 4),
+        );
+        let cpsr = builder.use_var(cpsr_var);
+        let cleared = builder.ins().band_imm(cpsr, 0x3fff_ffff);
+        let new_cpsr = if dec.imm8 == 0 {
+            builder.ins().bor_imm(cleared, 0x4000_0000_u32 as i64)
+        } else {
+            cleared
+        };
+        builder.def_var(cpsr_var, new_cpsr);
+        return;
+    }
+
     let rd_val = builder.ins().load(
         types::I32,
         MemFlags::trusted(),
@@ -3043,19 +3066,10 @@ fn emit_thumb_format3(
     );
 
     let (result, dp_equivalent, writeback) = match dec.op {
-        Thumb3Op::Mov => (imm8, DpOp::Mov, true),
-        Thumb3Op::Cmp => {
-            let r = builder.ins().isub(rd_val, imm8);
-            (r, DpOp::Cmp, false)
-        }
-        Thumb3Op::Add => {
-            let r = builder.ins().iadd(rd_val, imm8);
-            (r, DpOp::Add, true)
-        }
-        Thumb3Op::Sub => {
-            let r = builder.ins().isub(rd_val, imm8);
-            (r, DpOp::Sub, true)
-        }
+        Thumb3Op::Mov => unreachable!(),
+        Thumb3Op::Cmp => (builder.ins().isub(rd_val, imm8), DpOp::Cmp, false),
+        Thumb3Op::Add => (builder.ins().iadd(rd_val, imm8), DpOp::Add, true),
+        Thumb3Op::Sub => (builder.ins().isub(rd_val, imm8), DpOp::Sub, true),
     };
 
     if writeback {
@@ -3066,14 +3080,6 @@ fn emit_thumb_format3(
             Offset32::new(dec.rd * 4),
         );
     }
-
-    // Flag update mirrors the ARM DP S bit path. For Thumb MOV imm8 the
-    // DpOp::Mov branch of emit_flag_update preserves C and V which matches
-    // ARMv4 Thumb semantics. ADD/SUB/CMP compute the right NZCV in that
-    // same function.
-    // Use the pre writeback rd value as the "rn" operand for flag calc.
-    // For MOV imm8, rn is unused by the flag path (DpOp::Mov only reads
-    // result for N/Z).
     let new_cpsr = emit_flag_update(builder, cpsr_var, dp_equivalent, rd_val, imm8, result);
     builder.def_var(cpsr_var, new_cpsr);
 }
