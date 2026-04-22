@@ -1016,11 +1016,66 @@ impl DynarecCompiler {
                 builder.ins().load(types::I32, MemFlags::trusted(), cpsr_ptr, 0);
             builder.def_var(cpsr_var, cpsr_initial);
 
-            for item in &items {
+            // Dead flag-write analysis: if instruction k's flag write is
+            // wholly covered by instruction k+1's flag write AND k+1
+            // doesn't read any flags (cond=AL), then instruction k's
+            // flag update is dead and can be skipped. This matters for
+            // chains like [MOV #1, MOV #2, ADD] where the first two
+            // MOVs' NZ updates are overwritten by the ADD.
+            //
+            // Flag write masks per-item:
+            //   F3 MOV:        NZ         (preserves CV, so writes_covered_by ⊆ NZ)
+            //   F3 CMP/ADD/SUB: NZCV
+            //   F4 logical:    NZ         (preserves CV)
+            //   F4 CMP/CMN:    NZCV
+            //   F1 shift:      NZC        (shifter-carry writes C; V preserved)
+            //   F2 ADD/SUB:    NZCV
+            //   F5 MOV/ADD:    (none)
+            //   F5 CMP:        NZCV
+            //
+            // Using NZCV bitmask: N=8, Z=4, C=2, V=1.
+            fn flag_write_mask(item: &ThumbItem) -> u8 {
+                match item {
+                    ThumbItem::F3(d) => match d.op {
+                        Thumb3Op::Mov => 0b1100,       // N, Z
+                        _ => 0b1111,                    // NZCV
+                    },
+                    ThumbItem::F4(d) => match d.op {
+                        Thumb4Op::Tst | Thumb4Op::Cmp | Thumb4Op::Cmn => 0b1111,
+                        _ => 0b1100, // logical: N, Z
+                    },
+                    ThumbItem::F1(_) => 0b1110,         // N, Z, C
+                    ThumbItem::F2(_) => 0b1111,
+                    ThumbItem::F5(d) => match d.op {
+                        Thumb5Op::Cmp => 0b1111,
+                        _ => 0,
+                    },
+                }
+            }
+            let n = items.len();
+            let mut skip: Vec<bool> = vec![false; n];
+            // Thumb has implicit AL cond on formats 1-5, so no flag reads
+            // between items. Dead-write condition = next_write ⊇ current_write.
+            for k in 0..n.saturating_sub(1) {
+                let cur = flag_write_mask(&items[k]);
+                let next = flag_write_mask(&items[k + 1]);
+                if cur != 0 && (cur & !next) == 0 {
+                    skip[k] = true;
+                }
+            }
+
+            for (k, item) in items.iter().enumerate() {
+                let skip_fu = skip[k];
                 match item {
                     ThumbItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
                     ThumbItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, *d),
-                    ThumbItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d),
+                    ThumbItem::F3(d) => {
+                        if skip_fu {
+                            emit_thumb_format3_no_flags(&mut builder, gpr_ptr, *d);
+                        } else {
+                            emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d);
+                        }
+                    }
                     ThumbItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
                     ThumbItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
                 }
@@ -3048,6 +3103,65 @@ fn emit_thumb_format2(
     );
     let new_cpsr = emit_flag_update(builder, cpsr_var, dp_equivalent, rs_val, rhs, result);
     builder.def_var(cpsr_var, new_cpsr);
+}
+
+/// Emit a Thumb format 3 instruction with the flag update SKIPPED.
+/// Used by the dead-flag-write pass in `try_compile_thumb_block` when
+/// the next in-block instruction overwrites this one's flag bits.
+/// Drops the entire cpsr pack/merge sequence; still writes back the
+/// result for ADD/SUB/MOV.
+fn emit_thumb_format3_no_flags(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    dec: DecodedThumb3,
+) {
+    let imm8 = builder.ins().iconst(types::I32, dec.imm8 as i64);
+    match dec.op {
+        Thumb3Op::Mov => {
+            builder.ins().store(
+                MemFlags::trusted(),
+                imm8,
+                gpr_ptr,
+                Offset32::new(dec.rd * 4),
+            );
+        }
+        Thumb3Op::Cmp => {
+            // Compare-only with no flag write is a true no-op; do
+            // nothing. This path is only reached if the dead-flag pass
+            // marked it skippable, which implies the next instr
+            // overwrites NZCV — effectively CMP vanishes.
+        }
+        Thumb3Op::Add => {
+            let rd_val = builder.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                gpr_ptr,
+                Offset32::new(dec.rd * 4),
+            );
+            let result = builder.ins().iadd(rd_val, imm8);
+            builder.ins().store(
+                MemFlags::trusted(),
+                result,
+                gpr_ptr,
+                Offset32::new(dec.rd * 4),
+            );
+        }
+        Thumb3Op::Sub => {
+            let rd_val = builder.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                gpr_ptr,
+                Offset32::new(dec.rd * 4),
+            );
+            let result = builder.ins().isub(rd_val, imm8);
+            builder.ins().store(
+                MemFlags::trusted(),
+                result,
+                gpr_ptr,
+                Offset32::new(dec.rd * 4),
+            );
+        }
+    }
 }
 
 /// Emit a Thumb format 3 immediate8 instruction. Always updates NZCV.
