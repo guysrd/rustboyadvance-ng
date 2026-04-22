@@ -39,6 +39,17 @@ cached_interp = []
 # host machine code. Cranelift is a heavy dep, so gate strictly behind this
 # feature; the default build is unchanged.
 dynarec = ["cached_interp", "dep:cranelift", "dep:cranelift-module", "dep:cranelift-jit", "dep:cranelift-native"]
+# Enables the Cranelift-disasm dump helper (arm7tdmi::dynarec::dump) for
+# the shape-optimization research loop. Implies dynarec. Pulls in capstone
+# for arm64 disassembly.
+dynarec_asm_dump = ["dynarec", "dep:capstone"]
+# Enables the criterion-based per-shape micro-bench (benches/dynarec_shapes.rs).
+# Implies dynarec.
+bench = ["dynarec", "dep:criterion"]
+# One-shot shape frequency profile counter installed in BlockCache::finish_record.
+# Off by default; scripts/dynarec_measure.sh turns it on for a single profile
+# pass, then rebuilds without it.
+shape_profile = ["dynarec"]
 
 [dependencies.cranelift]
 version = "0.122"
@@ -55,3 +66,17 @@ optional = true
 [dependencies.cranelift-native]
 version = "0.122"
 optional = true
+
+[dependencies.capstone]
+version = "0.12"
+optional = true
+
+[dependencies.criterion]
+version = "0.5"
+optional = true
+default-features = false
+
+[[bench]]
+name = "dynarec_shapes"
+harness = false
+required-features = ["bench"]

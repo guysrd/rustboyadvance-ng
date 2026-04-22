@@ -34,6 +34,26 @@ use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
+/// Differential-execution helpers, shared between `#[cfg(test)] mod tests`
+/// and `tests/dynarec_pattern_differential.rs`. Always compiled under
+/// `dynarec` so integration test binaries can link to them.
+pub mod test_utils;
+
+/// Block-level pattern matcher: given a Thumb/ARM opcode block, try to
+/// recognize a hand-lowered shape (mul-by-constant, div-by-constant, CLZ,
+/// popcount, etc.) and emit a tighter host-code stencil. Returning `None`
+/// means "no pattern matched, fall through to the per-instruction emitters
+/// as usual." Stub for the shape-optimization research loop (see
+/// docs/program-shapekarpathy.md).
+pub(crate) mod patterns;
+
+/// Cranelift-disasm dump helper: same code paths as production, but
+/// bypasses define_function so we can pull `CompiledCode::code_buffer()`
+/// and hand it to capstone for arm64 disassembly. Used by the research
+/// loop's baseline tests; not in the default build.
+#[cfg(feature = "dynarec_asm_dump")]
+pub mod dump;
+
 /// Rust side trampoline signatures the dynarec calls into for memory ops.
 /// The opaque *mut u8 is a "cpu ctx" pointer; whoever constructs the
 /// DynarecCompiler supplies trampolines that interpret that pointer the
@@ -3319,112 +3339,10 @@ fn emit_flag_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Differential-execution test: run the same ARM opcode sequence through
-    /// the scalar interpreter and through the dynarec, assert the resulting
-    /// register file matches. Catches any divergence introduced when we
-    /// add new opcode shapes.
-    fn differential(opcodes: &[u32], initial_gpr: [u32; 15]) {
-        use crate::cpu::{Arm7tdmiCore, CpuAction};
-        use crate::memory::MemoryAccess;
-        use rustboyadvance_utils::Shared;
-
-        // Build a SimpleMemory program from the opcodes, starting at PC 0.
-        let mut program = Vec::with_capacity(opcodes.len() * 4);
-        for op in opcodes {
-            program.extend_from_slice(&op.to_le_bytes());
-        }
-
-        // --- Interpreter run ---
-        let mut mem = crate::SimpleMemory::new(1024);
-        mem.load_program(&program);
-        let mem_shared = Shared::new(mem);
-        let mut cpu = Arm7tdmiCore::new(mem_shared);
-        cpu.gpr = initial_gpr;
-        // Drive each opcode through step_arm_exec directly — avoids the
-        // pipeline dance, which isn't the point of this test.
-        for &op in opcodes {
-            // The handler reads operands from gpr; ignore the returned
-            // CpuAction since none of our supported shapes flush the
-            // pipeline.
-            let _: CpuAction = {
-                let hash = (((op >> 16) & 0xff0) | ((op >> 4) & 0xf)) as usize;
-                let arm_info = &Arm7tdmiCore::<crate::SimpleMemory>::ARM_LUT[hash];
-                (arm_info.handler_fn)(&mut cpu, op)
-            };
-            // We intentionally skip next_fetch_access updates — SimpleMemory
-            // doesn't do timing anyway.
-            let _ = MemoryAccess::NonSeq;
-        }
-        let interp_gpr = cpu.gpr;
-
-        // --- Dynarec run ---
-        let mut compiler = DynarecCompiler::new();
-        let func = compiler
-            .try_compile_imm_block(opcodes)
-            .expect("dynarec should support these opcodes");
-        let mut dyn_gpr = initial_gpr;
-        // AL condition on every instr → cpsr value doesn't matter. For S=1
-        // ops it will get written back to this buffer.
-        let mut dyn_cpsr = 0u32;
-        func(dyn_gpr.as_mut_ptr(), &mut dyn_cpsr);
-
-        assert_eq!(
-            dyn_gpr, interp_gpr,
-            "dynarec and interpreter diverged on block {:x?}",
-            opcodes
-        );
-    }
-
-    /// Same idea as `differential` but also compares the CPSR NZCV bits
-    /// after execution, so we catch flag-computation bugs in the S-bit /
-    /// compare-only paths.
-    fn differential_with_flags(opcodes: &[u32], initial_gpr: [u32; 15], initial_cpsr: u32) {
-        use crate::cpu::Arm7tdmiCore;
-        use rustboyadvance_utils::Shared;
-
-        let mut program = Vec::with_capacity(opcodes.len() * 4);
-        for op in opcodes {
-            program.extend_from_slice(&op.to_le_bytes());
-        }
-
-        // --- Interpreter run ---
-        let mut mem = crate::SimpleMemory::new(1024);
-        mem.load_program(&program);
-        let mem_shared = Shared::new(mem);
-        let mut cpu = Arm7tdmiCore::new(mem_shared);
-        cpu.gpr = initial_gpr;
-        // Overwrite CPSR with the test's desired initial flag state.
-        cpu.cpsr = crate::psr::RegPSR::new(initial_cpsr);
-        for &op in opcodes {
-            let hash = (((op >> 16) & 0xff0) | ((op >> 4) & 0xf)) as usize;
-            let arm_info = &Arm7tdmiCore::<crate::SimpleMemory>::ARM_LUT[hash];
-            let _ = (arm_info.handler_fn)(&mut cpu, op);
-        }
-        let interp_gpr = cpu.gpr;
-        let interp_cpsr = cpu.cpsr.get() & 0xF000_0000; // compare NZCV only
-
-        // --- Dynarec run ---
-        let mut compiler = DynarecCompiler::new();
-        let func = compiler
-            .try_compile_imm_block(opcodes)
-            .expect("dynarec should support these opcodes");
-        let mut dyn_gpr = initial_gpr;
-        let mut dyn_cpsr = initial_cpsr;
-        func(dyn_gpr.as_mut_ptr(), &mut dyn_cpsr);
-        let dyn_cpsr_flags = dyn_cpsr & 0xF000_0000;
-
-        assert_eq!(
-            dyn_gpr, interp_gpr,
-            "gpr diverged on {:x?}\ninterp={:?}\ndynrec={:?}",
-            opcodes, interp_gpr, dyn_gpr
-        );
-        assert_eq!(
-            dyn_cpsr_flags, interp_cpsr,
-            "NZCV diverged on {:x?}: interp={:#010x} dynarec={:#010x}",
-            opcodes, interp_cpsr, dyn_cpsr_flags
-        );
-    }
+    // Differential helpers moved to pub test_utils so integration tests
+    // (tests/dynarec_pattern_differential.rs) can call them without
+    // duplicating the interpreter-setup boilerplate.
+    use crate::dynarec::test_utils::{differential, differential_with_flags};
 
     #[test]
     fn differential_cmp_various() {
