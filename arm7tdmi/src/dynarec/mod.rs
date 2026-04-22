@@ -294,7 +294,14 @@ impl DynarecCompiler {
     fn build(bus: Option<BusTrampolines>) -> Self {
         let isa_builder = cranelift_native::builder()
             .expect("host architecture not supported by Cranelift");
-        let flag_builder = settings::builder();
+        let mut flag_builder = settings::builder();
+        // We don't need stack unwinding for these JIT blocks — they're
+        // never in the middle of a panic unwind, and any exception path
+        // returns via the normal fn pointer. Disabling unwind_info
+        // shrinks the emitted prologue/epilogue (no CFI directives).
+        flag_builder
+            .set("unwind_info", "false")
+            .expect("set unwind_info=false");
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder
             .finish(flags)
