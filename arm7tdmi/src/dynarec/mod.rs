@@ -1686,10 +1686,14 @@ impl DynarecCompiler {
         }
 
         /// True for body items whose scalar handler returns
-        /// `CpuAction::AdvancePC(NonSeq)` — i.e. STORE shapes. The
-        /// dynarec needs to charge `(n - s)` extra cycles after each
-        /// such item so the next fetch matches scalar's NonSeq access.
-        fn body_item_is_store(item: &Body) -> bool {
+        /// `CpuAction::AdvancePC(NonSeq)`. The dynarec needs to charge
+        /// `(n - s)` extra cycles after each such item so the next
+        /// fetch matches scalar's NonSeq access. For format 14 this is
+        /// BOTH push AND pop (scalar exec_thumb_push_pop initializes
+        /// `result = CpuAction::AdvancePC(NonSeq)` before the POP/PUSH
+        /// branches). For format 9/11 only the STORE path returns
+        /// NonSeq; the LDR path returns Seq.
+        fn body_item_is_nonseq_advance(item: &Body) -> bool {
             match item {
                 Body::F9(d) => !d.load,
                 Body::F11(d) => !d.load,
@@ -1854,7 +1858,7 @@ impl DynarecCompiler {
                 // store covers both:
                 //   - in-body STORE → next body item's fetch
                 //   - last body STORE → tail/branch fetch
-                if body_item_is_store(item) {
+                if body_item_is_nonseq_advance(item) {
                     builder
                         .ins()
                         .call(pay_extra_nonseq_ref, &[cpu_ctx, entry_pc_val]);
@@ -1877,8 +1881,8 @@ impl DynarecCompiler {
                     // fetch is paid by the cached-interp loop out of
                     // `cpu.next_fetch_access`, so we need to flip it to
                     // NonSeq here if the last instruction was a store.
-                    let tail_is_store = body_item_is_store(b);
-                    if tail_is_store {
+                    let tail_is_nonseq = body_item_is_nonseq_advance(b);
+                    if tail_is_nonseq {
                         let nonseq_ref = self
                             .module
                             .declare_func_in_func(imports.set_next_fetch_nonseq, builder.func);
