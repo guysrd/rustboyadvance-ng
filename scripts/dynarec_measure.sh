@@ -3,9 +3,13 @@
 #
 # Prints a single scalar `weighted_cycles` per the autoresearch loop in
 # docs/program-shapekarpathy.md. The agent greps this value to decide
-# keep/discard after every commit. Also prints a per-ROM FPS sanity pair
-# so regressions that only show up on one game's code paths still fail
-# the keep/discard gate.
+# keep/discard after every commit. Also prints per-ROM FPS (correctness
+# sanity — each ROM is a separate regression gate) AND a per-ROM CPU/GPU
+# self-time breakdown gathered by running the SDL replay under `perf
+# record`. The breakdown catches experiments that move cost from one
+# subsystem to another without changing wall time; useful when an
+# optimization claims to speed up the CPU but actually just shifts
+# overhead into GPU scanline rendering (or vice versa).
 #
 # Weighted cycles =
 #   sum over shapes of (ns_iter[shape] * call_count_weight[shape])
@@ -19,10 +23,15 @@
 #
 # FPS sanity runs the real SDL frontend end-to-end (video render + all
 # GPU/CPU subsystems, `--no-audio` to silence the audio path noise).
-# Two ROMs, both must stay within their regression budget — this is the
-# "each game is a separate measure" half of the gate. fps_bench was
-# fast but headless; the SDL binary catches GPU-side regressions that
-# never show up in a core-only replay.
+# Two ROMs, both must stay within their regression budget.
+#
+# CPU/GPU breakdown uses perf record -F 997 -g --call-graph dwarf during
+# the SDL replay, then perf report --sort=symbol to pull self-time per
+# function, and classifies every symbol into one of {cpu, gpu, bus,
+# audio, other} by prefix/substring match. The script only prints
+# CPU% and GPU% in the canonical block because those are the two the
+# shape-opt loop actually needs to distinguish, but the full class
+# split is dumped to the log for debugging.
 #
 # Shape weights (calls / second in real gameplay, rounded):
 #   thumb_mov_imm    8.0M
@@ -35,10 +44,15 @@
 #
 # Usage:
 #   bash scripts/dynarec_measure.sh > run.log 2>&1
-#   grep "^weighted_cycles:\\|^pokeemerald_fps:\\|^mario_kart_fps:" run.log
+#   grep "^weighted_cycles:\\|^pokeemerald_\\|^mario_kart_" run.log
 #
 # Env overrides:
-#   BIOS, POKEEMERALD_ROM, MARIO_KART_ROM, POKEEMERALD_REC, MARIO_KART_REC
+#   BIOS
+#   POKEEMERALD_ROM, MARIO_KART_ROM
+#   POKEEMERALD_REC, MARIO_KART_REC
+#   PERF_BIN (default: /usr/lib/linux-tools-6.8.0-110/perf on this host;
+#            set to `perf` if your distro's wrapper resolves correctly)
+#   NO_PERF=1 to skip the perf record passes (faster; drops CPU/GPU %)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,6 +63,7 @@ POKEEMERALD_ROM="${POKEEMERALD_ROM:-/home/user/pokeemerlad/pokeemerald/pokeemera
 MARIO_KART_ROM="${MARIO_KART_ROM:-/tmp/mks/Mario Kart - Super Circuit (USA).gba}"
 POKEEMERALD_REC="${POKEEMERALD_REC:-/tmp/rbarec.rec}"
 MARIO_KART_REC="${MARIO_KART_REC:-/tmp/mks.rec}"
+PERF_BIN="${PERF_BIN:-/usr/lib/linux-tools-6.8.0-110/perf}"
 
 START_TS=$(date +%s)
 
@@ -61,10 +76,6 @@ cargo bench -p arm7tdmi --bench dynarec_shapes --features dynarec,bench -- --qui
   | tee "$BENCH_LOG"
 
 parse_bench() {
-    # Criterion line looks like:
-    #   thumb_mov_imm           time:   [1.7100 ns 1.7225 ns 1.7350 ns]
-    # Strip brackets, read median ($5) + unit ($6). Print the value in
-    # ns. If no match was found, print 0.
     local name="$1"
     local result
     result=$(awk -v n="$name" '
@@ -126,23 +137,127 @@ WEIGHTED=$(awk "BEGIN { printf \"%.0f\", \
   + $T_shift_pair_sxtb*$W_shift_pair_sxtb }")
 
 # -----------------------------------------------------------------------------
-# 3. Per-ROM SDL replay: full frontend, video on, --no-audio.
+# 3. Per-ROM SDL replay + perf record for CPU/GPU breakdown.
 # -----------------------------------------------------------------------------
-# Build the SDL binary once (release) so the per-ROM runs share a binary.
-echo "--- building rustboyadvance-sdl2 (release, features dynarec) ---"
-cargo build --release -p rustboyadvance-sdl2 --features dynarec 2>&1 | tail -3
+# Build the SDL binary with debug symbols so perf can symbolize. RUSTFLAGS
+# is scoped to this build; the bench and test paths above used whatever
+# profile was already built, which is fine.
+echo "--- building rustboyadvance-sdl2 (release + debug syms, features dynarec) ---"
+RUSTFLAGS="-C debuginfo=2" \
+    cargo build --release -p rustboyadvance-sdl2 --features dynarec 2>&1 | tail -3
 
 SDL_BIN="$REPO/target/release/rustboyadvance-sdl2"
 
-# Run SDL replay on one (ROM, REC) pair. Prints the avg fps number
-# parsed from the "replay done" summary line, or 0.0 on any failure.
-# Stderr of the binary is captured but not shown on success to keep the
-# log short — interesting signals (error backtraces) still go to the
-# end of the log on failure.
-run_sdl_replay() {
+# Classify a function name into one of {cpu, gpu, bus, audio, other}.
+# Tuned for rustboyadvance's module layout and the dynarec's hot
+# functions; add new rules as hot spots move.
+classify_symbol() {
+    local sym="$1"
+    case "$sym" in
+        # GPU: scanline compositor, BG rendering, OBJ rendering, pixel ops
+        *gpu::sfx*|*finalize_scanline*|*finalize_pixel*|\
+        *render_scanline*|*render_reg_bg*|*render_aff_bg*|\
+        *render::text*|*render::obj*|*render::bitmap*|\
+        *gpu::Gpu*|*gpu::render*|*obj_buffer*|*palette_ram*|*Rgb15*)
+            echo gpu
+            return ;;
+        # Audio: sound module, APU event handling, resampler, sample mix
+        *sound::*|*SoundController*|*Psg*|*ApuEvent*|*resampler*|*audio::*)
+            echo audio
+            return ;;
+        # Bus: SysBus load/store dispatch, memory reads/writes, cartridge
+        *SysBus*|*sysbus::*|*cartridge::*|*Cartridge*|\
+        *load_32*|*load_16*|*load_8*|\
+        *store_32*|*store_16*|*store_8*|\
+        *read_32*|*read_16*|*read_8*|\
+        *write_32*|*write_16*|*write_8*|\
+        *BusIO*|*MemoryInterface*)
+            echo bus
+            return ;;
+        # CPU: arm/thumb exec, cpu::step, dynarec dispatch, dynarec blocks,
+        # plus the emulator-driver functions that call into them. The
+        # driver functions (single_step, frame, handle_events, dma_step,
+        # cpu_step, cpu_interrupt) are thin wrappers around CPU execution
+        # so they cleanly belong to the CPU budget.
+        *arm::exec*|*thumb::exec*|*arm7tdmi::cpu*|*cpu::step*|\
+        *replay_cached_block*|*step_block*|*record_new_block*|\
+        *Arm7tdmiCore*|\
+        *dynarec_thumb*|*dynarec_arm*|*dynarec_imm_block*|\
+        *dynarec::trampolines*|*dynarec::patterns*|\
+        *exec_arm*|*exec_thumb*|*alu::*|*register_shift*|\
+        *scheduler*|*Scheduler*|*BinaryHeap*|\
+        *GameBoyAdvance*|*gba::*|*single_step*|*handle_events*|\
+        *cpu_step*|*cpu_interrupt*|*dma_step*|*dma::DmaController*|\
+        *interrupt::*|*timer::*|*Timers*)
+            echo cpu
+            return ;;
+        # Unresolved hex symbols in the 0x7xxx... range are overwhelmingly
+        # Cranelift-JIT-emitted dynarec blocks: perf can't symbolize them
+        # without a /tmp/perf-<pid>.map file from the JIT, which Cranelift
+        # doesn't emit by default. Since every compiled block IS CPU
+        # work by definition (that's the whole point of dynarec), bucket
+        # them as cpu rather than lose 10-15% of the sample budget to
+        # "other". Addresses below that range are usually libc/SDL
+        # helpers and stay in "other".
+        0x00007[0-9a-f]*|0x00006[0-9a-f]*|0x00005[0-9a-f]*)
+            echo cpu
+            return ;;
+    esac
+    echo other
+}
+
+# Given a perf.data, print lines "<class_name> <self_pct>" summing to
+# ~100%. We read `perf report --sort=symbol -g none --stdio` and
+# classify each symbol row.
+perf_classify_pcts() {
+    local perf_data="$1"
+    "$PERF_BIN" report -i "$perf_data" --sort=symbol -g none --stdio 2>/dev/null \
+      | awk '
+        # Look for lines like "   22.88%    22.88%  [.] <SysBus as ...>::load_16"
+        # Columns: Children% Self% [x] Symbol...
+        /^[[:space:]]+[0-9]+\.[0-9]+%[[:space:]]+[0-9]+\.[0-9]+%/ {
+            self_pct = $2
+            # Reconstruct symbol: everything past the [x] column.
+            sym = ""
+            for (i = 4; i <= NF; i++) {
+                sym = sym ($i)
+                if (i < NF) sym = sym " "
+            }
+            # Strip surrounding brackets like [.] that AWK's $3 consumed.
+            gsub("%", "", self_pct)
+            print self_pct "\t" sym
+        }
+    ' | while IFS=$'\t' read -r pct sym; do
+        class=$(classify_symbol "$sym")
+        echo "$class $pct"
+    done | awk '
+        { sums[$1] += $2 }
+        END {
+            # Print in a stable order so the log is diffable across runs.
+            split("cpu gpu bus audio other", order, " ")
+            for (i = 1; i <= 5; i++) {
+                k = order[i]
+                printf "%s %.1f\n", k, (k in sums ? sums[k] : 0.0)
+            }
+        }
+    '
+}
+
+# Run one SDL replay pass under perf, returning FPS and populating a
+# global assoc array with the per-class self-time. We use globals
+# because bash can't return multiple values cleanly.
+declare -A CLASS_PCT
+run_sdl_replay_with_perf() {
     local label="$1"
     local rom="$2"
     local rec="$3"
+
+    # Reset the class table for this call.
+    CLASS_PCT[cpu]=0.0
+    CLASS_PCT[gpu]=0.0
+    CLASS_PCT[bus]=0.0
+    CLASS_PCT[audio]=0.0
+    CLASS_PCT[other]=0.0
 
     if [[ ! -f "$BIOS" || ! -f "$rom" || ! -f "$rec" ]]; then
         echo "--- $label skipped (BIOS/ROM/REC not found) ---" >&2
@@ -151,36 +266,68 @@ run_sdl_replay() {
     fi
 
     echo "--- $label: SDL replay ---" >&2
-    local log
+    local log perf_data
     log=$(mktemp)
-    # --skip-bios so we're not burning wall time on the BIOS animation.
-    # --no-audio so no SDL audio device noise.
-    # --replay drives the keypad and exits when the last edge is past.
-    if ! "$SDL_BIN" \
-            --bios "$BIOS" \
-            --skip-bios \
-            --no-audio \
-            --replay "$rec" \
-            "$rom" > "$log" 2>&1; then
-        echo "--- $label FAILED, tail of log: ---" >&2
-        tail -n 30 "$log" >&2
-        rm -f "$log"
-        echo "0.0"
-        return
+    perf_data="/tmp/dynarec-measure-${label}.perf"
+    rm -f "$perf_data"
+
+    # Two modes: with perf (default) or without (NO_PERF=1 for fast
+    # dev iterations that don't need the subsystem breakdown).
+    if [[ "${NO_PERF:-0}" == "1" ]] || [[ ! -x "$PERF_BIN" ]]; then
+        if ! "$SDL_BIN" \
+                --bios "$BIOS" --skip-bios --no-audio \
+                --replay "$rec" "$rom" > "$log" 2>&1; then
+            echo "--- $label FAILED, tail of log: ---" >&2
+            tail -n 30 "$log" >&2
+            rm -f "$log"
+            echo "0.0"
+            return
+        fi
+    else
+        # perf record -F 997 -g --call-graph dwarf keeps sampling cost
+        # under ~1% and produces call-graph data we can symbolize. Output
+        # data is discarded after extraction — this is a temp file.
+        if ! "$PERF_BIN" record -F 997 -g --call-graph dwarf -q \
+                -o "$perf_data" -- \
+                "$SDL_BIN" \
+                --bios "$BIOS" --skip-bios --no-audio \
+                --replay "$rec" "$rom" > "$log" 2>&1; then
+            echo "--- $label FAILED, tail of log: ---" >&2
+            tail -n 30 "$log" >&2
+            rm -f "$log" "$perf_data"
+            echo "0.0"
+            return
+        fi
     fi
 
-    # "replay done: N frames in T.TTs wall, F.F avg fps (...)" is printed
-    # to stdout (not stderr) by the SDL frontend's replay exit path.
     local fps
     fps=$(grep -oE "[0-9]+\\.[0-9]+ avg fps" "$log" | tail -1 | awk '{print $1}')
     [[ -z "$fps" ]] && fps="0.0"
     echo "$label: $fps FPS" >&2
     rm -f "$log"
+
+    # Populate the classification table from perf data.
+    if [[ -f "$perf_data" ]]; then
+        echo "--- $label: perf subsystem breakdown ---" >&2
+        while read -r class pct; do
+            CLASS_PCT[$class]="$pct"
+            printf "  %-6s %s%%\n" "$class" "$pct" >&2
+        done < <(perf_classify_pcts "$perf_data")
+        rm -f "$perf_data"
+    fi
+
     echo "$fps"
 }
 
-POKEEMERALD_FPS=$(run_sdl_replay pokeemerald "$POKEEMERALD_ROM" "$POKEEMERALD_REC")
-MARIO_KART_FPS=$(run_sdl_replay mario_kart  "$MARIO_KART_ROM"  "$MARIO_KART_REC")
+POKEEMERALD_FPS=$(run_sdl_replay_with_perf pokeemerald "$POKEEMERALD_ROM" "$POKEEMERALD_REC")
+POKEEMERALD_CPU=${CLASS_PCT[cpu]:-0.0}
+POKEEMERALD_GPU=${CLASS_PCT[gpu]:-0.0}
+POKEEMERALD_BUS=${CLASS_PCT[bus]:-0.0}
+
+MARIO_KART_FPS=$(run_sdl_replay_with_perf mario_kart "$MARIO_KART_ROM" "$MARIO_KART_REC")
+MARIO_KART_CPU=${CLASS_PCT[cpu]:-0.0}
+MARIO_KART_GPU=${CLASS_PCT[gpu]:-0.0}
+MARIO_KART_BUS=${CLASS_PCT[bus]:-0.0}
 
 rm -f "$BENCH_LOG"
 END_TS=$(date +%s)
@@ -191,8 +338,14 @@ SECONDS_ELAPSED=$((END_TS - START_TS))
 # -----------------------------------------------------------------------------
 echo
 echo "---"
-printf "weighted_cycles:    %s\n" "$WEIGHTED"
-printf "pokeemerald_fps:    %s\n" "$POKEEMERALD_FPS"
-printf "mario_kart_fps:     %s\n" "$MARIO_KART_FPS"
-printf "peak_vram_mb:       0.0\n"
-printf "seconds:            %d\n" "$SECONDS_ELAPSED"
+printf "weighted_cycles:        %s\n" "$WEIGHTED"
+printf "pokeemerald_fps:        %s\n" "$POKEEMERALD_FPS"
+printf "pokeemerald_cpu_pct:    %s\n" "$POKEEMERALD_CPU"
+printf "pokeemerald_gpu_pct:    %s\n" "$POKEEMERALD_GPU"
+printf "pokeemerald_bus_pct:    %s\n" "$POKEEMERALD_BUS"
+printf "mario_kart_fps:         %s\n" "$MARIO_KART_FPS"
+printf "mario_kart_cpu_pct:     %s\n" "$MARIO_KART_CPU"
+printf "mario_kart_gpu_pct:     %s\n" "$MARIO_KART_GPU"
+printf "mario_kart_bus_pct:     %s\n" "$MARIO_KART_BUS"
+printf "peak_vram_mb:           0.0\n"
+printf "seconds:                %d\n" "$SECONDS_ELAPSED"
