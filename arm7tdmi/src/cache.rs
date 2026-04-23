@@ -32,6 +32,9 @@ use crate::memory::MemoryInterface;
 #[cfg(feature = "dynarec")]
 use crate::dynarec::DynarecCompiler;
 
+#[cfg(feature = "shape_profile")]
+use crate::dynarec::shape_profile::{self, ShapeId};
+
 /// Fn pointer shape produced by the unified Thumb mem+branch compile path
 /// in the `dynarec` module. Same four args and return value semantics that
 /// try_compile_thumb_mem_block_with_branch hands out.
@@ -84,6 +87,13 @@ pub struct Block<I: MemoryInterface> {
     /// blocks that contain any shape the dynarec doesn't yet support.
     #[cfg(feature = "dynarec")]
     pub compiled: Option<CompiledThumbFn>,
+    /// Shape classification (only under `shape_profile` feature). Set
+    /// alongside `compiled` in `finish_record` so the dispatcher can
+    /// `shape_profile::tick` the right counter on every replay.
+    /// None when the block didn't compile (falls back to interpreter)
+    /// or when the dynarec feature is off.
+    #[cfg(feature = "shape_profile")]
+    pub shape: Option<ShapeId>,
 }
 
 impl<I: MemoryInterface> Block<I> {
@@ -93,6 +103,8 @@ impl<I: MemoryInterface> Block<I> {
             entry_pc,
             #[cfg(feature = "dynarec")]
             compiled: None,
+            #[cfg(feature = "shape_profile")]
+            shape: None,
         }
     }
 }
@@ -306,6 +318,23 @@ impl<I: MemoryInterface> BlockCache<I> {
                 && let Some(compiler) = self.compiler.as_mut()
             {
                 block.compiled = try_compile_thumb(compiler, &block);
+                // Tag the block with its shape category so the dispatcher
+                // can `shape_profile::tick` the right counter on every
+                // invocation. Only meaningful when the compile succeeded
+                // — interpreter-path blocks don't have a bench-comparable
+                // shape.
+                #[cfg(feature = "shape_profile")]
+                if block.compiled.is_some() {
+                    let raws: Vec<u16> = block
+                        .instrs
+                        .iter()
+                        .filter_map(|i| match i {
+                            DecodedInstr::Thumb { raw, .. } => Some(*raw),
+                            DecodedInstr::Arm { .. } => None,
+                        })
+                        .collect();
+                    block.shape = Some(shape_profile::classify_thumb(&raws));
+                }
             }
         }
 

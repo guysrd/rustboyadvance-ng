@@ -39,6 +39,15 @@ use cranelift_module::{FuncId, Linkage, Module};
 /// `dynarec` so integration test binaries can link to them.
 pub mod test_utils;
 
+/// Per-shape execution-count profiler, gated behind the `shape_profile`
+/// feature. Drives the `W_*` retraining step in scripts/dynarec_measure.sh
+/// — the counters here tell the agent how many times per second each
+/// bench shape's compiled block actually runs in real gameplay, replacing
+/// the hand-picked constants with measured ones. Pure no-op on the
+/// default build.
+#[cfg(feature = "shape_profile")]
+pub mod shape_profile;
+
 /// Block-level pattern matcher: given a Thumb/ARM opcode block, try to
 /// recognize a hand-lowered shape (mul-by-constant, div-by-constant, CLZ,
 /// popcount, etc.) and emit a tighter host-code stencil. Returning `None`

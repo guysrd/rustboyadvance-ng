@@ -575,6 +575,16 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             && let Some(compiled) = block.compiled
             && entry_thumb
         {
+            // Bump the per-shape execution counter under `shape_profile`
+            // so `scripts/dynarec_measure.sh` can retrain the W_* weights
+            // from measured gameplay rather than hand-picked constants.
+            // No-op under the default build (the feature gates the whole
+            // counter infra).
+            #[cfg(feature = "shape_profile")]
+            if let Some(shape) = block.shape {
+                super::dynarec::shape_profile::tick(shape);
+            }
+
             let mut pc_out: u32 = 0;
             let mut cpsr_word: u32 = self.cpsr.get();
             let gpr_ptr = self.gpr.as_mut_ptr();

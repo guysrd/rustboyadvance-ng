@@ -142,9 +142,14 @@ WEIGHTED=$(awk "BEGIN { printf \"%.0f\", \
 # Build the SDL binary with debug symbols so perf can symbolize. RUSTFLAGS
 # is scoped to this build; the bench and test paths above used whatever
 # profile was already built, which is fine.
-echo "--- building rustboyadvance-sdl2 (release + debug syms, features dynarec) ---"
+echo "--- building rustboyadvance-sdl2 (release + debug syms, features dynarec,shape_profile) ---"
+# shape_profile implies dynarec. It's safe to leave on for every measure
+# run: the per-block `tick(shape)` is one `AtomicU64::fetch_add`, well
+# below the noise floor of the SDL-replay FPS measurement itself. The
+# payoff is that every run emits a calls/sec profile the script can
+# use to retrain `W_*` (see suggested W_* block at the end of the log).
 RUSTFLAGS="-C debuginfo=2" \
-    cargo build --release -p rustboyadvance-sdl2 --features dynarec 2>&1 | tail -3
+    cargo build --release -p rustboyadvance-sdl2 --features dynarec,shape_profile 2>&1 | tail -3
 
 SDL_BIN="$REPO/target/release/rustboyadvance-sdl2"
 
@@ -245,8 +250,12 @@ perf_classify_pcts() {
 
 # Run one SDL replay pass under perf, returning FPS and populating a
 # global assoc array with the per-class self-time. We use globals
-# because bash can't return multiple values cleanly.
+# because bash can't return multiple values cleanly. Also captures
+# shape_profile counter output (when the binary was built
+# --features shape_profile) into SHAPE_COUNT[<rom>:<shape>] =
+# calls/sec, so the measure script can suggest retrained W_* values.
 declare -A CLASS_PCT
+declare -A SHAPE_COUNT
 run_sdl_replay_with_perf() {
     local label="$1"
     local rom="$2"
@@ -304,6 +313,32 @@ run_sdl_replay_with_perf() {
     fps=$(grep -oE "[0-9]+\\.[0-9]+ avg fps" "$log" | tail -1 | awk '{print $1}')
     [[ -z "$fps" ]] && fps="0.0"
     echo "$label: $fps FPS" >&2
+
+    # Pull shape_profile counters from the SDL stdout. Present only when
+    # the binary was built with `--features shape_profile`; silently
+    # ignored otherwise. Divides counter by replay wall seconds to get
+    # calls/sec — the form `W_*` wants.
+    local wall
+    wall=$(grep -oE "^shape_profile:replay_wall_seconds [0-9]+\\.[0-9]+" "$log" \
+           | tail -1 | awk '{print $2}')
+    if [[ -n "$wall" && "$wall" != "0" ]]; then
+        echo "--- $label: shape_profile counters ---" >&2
+        while IFS= read -r line; do
+            # Line format:  shape_profile:<name>  <count>
+            local name count
+            name=$(echo "$line" | awk '{print $1}' | sed 's/^shape_profile://')
+            count=$(echo "$line" | awk '{print $2}')
+            # Skip the wall-seconds line and any non-numeric count.
+            [[ "$name" == "replay_wall_seconds" ]] && continue
+            [[ -z "$count" || ! "$count" =~ ^[0-9]+$ ]] && continue
+            local rate
+            rate=$(awk -v c="$count" -v w="$wall" 'BEGIN { printf "%.0f", c/w }')
+            SHAPE_COUNT["$label:$name"]="$rate"
+            printf "  %-16s %10s calls/s (%s / %ss)\n" \
+                "$name" "$rate" "$count" "$wall" >&2
+        done < <(grep -E "^shape_profile:[a-z_]+\\s+[0-9]+$" "$log")
+    fi
+
     rm -f "$log"
 
     # Populate the classification table from perf data.
@@ -349,3 +384,20 @@ printf "mario_kart_gpu_pct:     %s\n" "$MARIO_KART_GPU"
 printf "mario_kart_bus_pct:     %s\n" "$MARIO_KART_BUS"
 printf "peak_vram_mb:           0.0\n"
 printf "seconds:                %d\n" "$SECONDS_ELAPSED"
+
+# shape_profile retraining suggestions (present only when the SDL binary
+# was built --features shape_profile). Prints a suggested `W_*` block
+# the agent can copy-paste into this script. Uses the arithmetic mean
+# of per-ROM rates (simple, treats both games equally; refine if one
+# ROM dominates real workload).
+if [[ -n "${SHAPE_COUNT[pokeemerald:thumb_dp_chain]:-}" ]]; then
+    echo
+    echo "--- suggested W_* retraining (mean of per-ROM calls/sec) ---"
+    for shape in thumb_mov_imm thumb_add_imm thumb_cmp_imm thumb_dp_chain \
+                  arm_mov_imm arm_cmp_imm shift_pair_sxtb; do
+        pk="${SHAPE_COUNT["pokeemerald:$shape"]:-0}"
+        mk="${SHAPE_COUNT["mario_kart:$shape"]:-0}"
+        avg=$(awk -v p="$pk" -v m="$mk" 'BEGIN { printf "%d", (p+m)/2 }')
+        printf "W_%s=%s\n" "$shape" "$avg"
+    done
+fi

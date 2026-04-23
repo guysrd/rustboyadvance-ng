@@ -126,6 +126,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gba.skip_bios();
     }
 
+    // Turn on the Cranelift dispatcher when the binary was built with
+    // `--features dynarec`. Off by default on master (see core/src/gba.rs
+    // for the rationale). Required for the `shape_profile` counter to
+    // see any compiled blocks execute — without this, every block runs
+    // through the scalar cached interpreter path.
+    #[cfg(feature = "dynarec")]
+    gba.cpu.enable_dynarec();
+
     if opts.gdbserver {
         gba.start_gdbserver(opts.gdbserver_port);
     }
@@ -295,6 +303,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "replay done: {} frames in {:.2}s wall, {:.1} avg fps ({} emulated cycles)",
                     replay_frames, elapsed, fps, now
                 );
+                // Dump the per-shape execution counters. Output is parsed
+                // by scripts/dynarec_measure.sh to retrain `W_*` weights
+                // against real gameplay frequency. No-op on the default
+                // build (the whole module is gated on this feature).
+                #[cfg(feature = "shape_profile")]
+                {
+                    print!(
+                        "{}",
+                        rustboyadvance_core::arm7tdmi::dynarec::shape_profile::dump()
+                    );
+                    println!("shape_profile:replay_wall_seconds {:.3}", elapsed);
+                }
                 break 'running;
             }
         }

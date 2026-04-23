@@ -27,3 +27,8 @@ debugger = ["rustboyadvance-core/debugger"]
 # real ROMs.
 cached_interp = ["rustboyadvance-core/cached_interp"]
 dynarec = ["rustboyadvance-core/dynarec"]
+# Per-shape execution-count profiler, gated through to the arm7tdmi
+# crate. When on, the SDL frontend dumps the counter table at replay
+# exit so the measure harness can retrain `W_*` weights from real
+# gameplay. See docs/dynarec-arm64-program.md.
+shape_profile = ["rustboyadvance-core/shape_profile", "dynarec"]
