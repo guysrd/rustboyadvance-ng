@@ -3,8 +3,9 @@
 #
 # Prints a single scalar `weighted_cycles` per the autoresearch loop in
 # docs/program-shapekarpathy.md. The agent greps this value to decide
-# keep/discard after every commit. Also prints `fps_bench_fps` as the
-# correctness-regression guard.
+# keep/discard after every commit. Also prints a per-ROM FPS sanity pair
+# so regressions that only show up on one game's code paths still fail
+# the keep/discard gate.
 #
 # Weighted cycles =
 #   sum over shapes of (ns_iter[shape] * call_count_weight[shape])
@@ -16,6 +17,13 @@
 # optimizes against a stable target. Retrain weights by hand if the
 # flamegraph drifts significantly.
 #
+# FPS sanity runs the real SDL frontend end-to-end (video render + all
+# GPU/CPU subsystems, `--no-audio` to silence the audio path noise).
+# Two ROMs, both must stay within their regression budget — this is the
+# "each game is a separate measure" half of the gate. fps_bench was
+# fast but headless; the SDL binary catches GPU-side regressions that
+# never show up in a core-only replay.
+#
 # Shape weights (calls / second in real gameplay, rounded):
 #   thumb_mov_imm    8.0M
 #   thumb_add_imm    6.0M
@@ -23,33 +31,35 @@
 #   thumb_dp_chain   3.0M
 #   arm_mov_imm      2.0M
 #   arm_cmp_imm      1.5M
+#   shift_pair_sxtb  2.5M
 #
 # Usage:
 #   bash scripts/dynarec_measure.sh > run.log 2>&1
-#   grep "^weighted_cycles:\\|^fps_bench_fps:" run.log
+#   grep "^weighted_cycles:\\|^pokeemerald_fps:\\|^mario_kart_fps:" run.log
+#
+# Env overrides:
+#   BIOS, POKEEMERALD_ROM, MARIO_KART_ROM, POKEEMERALD_REC, MARIO_KART_REC
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 BIOS="${BIOS:-$REPO/core/benches/roms/normatt_gba_bios.bin}"
-ROM="${ROM:-/home/user/pokeemerlad/pokeemerald/pokeemerald.gba}"
-REC="${REC:-/tmp/rbarec.rec}"
-LOOPS="${LOOPS:-1}"
+POKEEMERALD_ROM="${POKEEMERALD_ROM:-/home/user/pokeemerlad/pokeemerald/pokeemerald.gba}"
+MARIO_KART_ROM="${MARIO_KART_ROM:-/tmp/mks/Mario Kart - Super Circuit (USA).gba}"
+POKEEMERALD_REC="${POKEEMERALD_REC:-/tmp/rbarec.rec}"
+MARIO_KART_REC="${MARIO_KART_REC:-/tmp/mks.rec}"
 
 START_TS=$(date +%s)
 
 # -----------------------------------------------------------------------------
-# 1. Per-shape Criterion micro-bench.
+# 1. Per-shape Criterion micro-bench (unchanged — this is the primary scalar).
 # -----------------------------------------------------------------------------
 echo "--- running cargo bench ---"
 BENCH_LOG=$(mktemp)
 cargo bench -p arm7tdmi --bench dynarec_shapes --features dynarec,bench -- --quiet 2>&1 \
   | tee "$BENCH_LOG"
 
-# Criterion summary lines look like:
-#   thumb_mov_imm           time:   [3.2145 ns 3.2200 ns 3.2260 ns]
-# Parse the median (middle number), in nanoseconds. Handle ps/µs/ms units too.
 parse_bench() {
     # Criterion line looks like:
     #   thumb_mov_imm           time:   [1.7100 ns 1.7225 ns 1.7350 ns]
@@ -104,8 +114,6 @@ W_thumb_cmp_imm=5000000
 W_thumb_dp_chain=3000000
 W_arm_mov_imm=2000000
 W_arm_cmp_imm=1500000
-# Shift-pair sign/zero extend idiom is compiler-generated for every
-# i8/i16 -> i32 widening; pokeemerald trace samples ~2.5M/s.
 W_shift_pair_sxtb=2500000
 
 WEIGHTED=$(awk "BEGIN { printf \"%.0f\", \
@@ -118,27 +126,61 @@ WEIGHTED=$(awk "BEGIN { printf \"%.0f\", \
   + $T_shift_pair_sxtb*$W_shift_pair_sxtb }")
 
 # -----------------------------------------------------------------------------
-# 3. fps_bench replay for correctness + FPS sanity.
+# 3. Per-ROM SDL replay: full frontend, video on, --no-audio.
 # -----------------------------------------------------------------------------
-FPS="0.0"
-if [[ -f "$BIOS" && -f "$ROM" && -f "$REC" ]]; then
-    echo "--- running fps_bench replay ---"
-    FPS_LOG=$(mktemp)
-    # fps_bench on this branch takes: fps_bench --replay <PATH> <BIOS> <ROM>
-    # --loops is on later branches; we accept one pass.
-    cargo run -q --release -p fps_bench -- --replay "$REC" "$BIOS" "$ROM" 2>&1 \
-        | tee "$FPS_LOG"
-    # Accept two reporting styles: "replay done: ... N.N avg fps" (later
-    # branches) and "FPS: N" (this branch's idle mode).
-    FPS=$(grep -oE "[0-9]+\\.[0-9]+ avg fps" "$FPS_LOG" | tail -1 | awk '{print $1}')
-    if [[ -z "$FPS" ]]; then
-        FPS=$(grep -oE "^FPS: [0-9]+" "$FPS_LOG" | tail -1 | awk '{print $2".0"}')
+# Build the SDL binary once (release) so the per-ROM runs share a binary.
+echo "--- building rustboyadvance-sdl2 (release, features dynarec) ---"
+cargo build --release -p rustboyadvance-sdl2 --features dynarec 2>&1 | tail -3
+
+SDL_BIN="$REPO/target/release/rustboyadvance-sdl2"
+
+# Run SDL replay on one (ROM, REC) pair. Prints the avg fps number
+# parsed from the "replay done" summary line, or 0.0 on any failure.
+# Stderr of the binary is captured but not shown on success to keep the
+# log short — interesting signals (error backtraces) still go to the
+# end of the log on failure.
+run_sdl_replay() {
+    local label="$1"
+    local rom="$2"
+    local rec="$3"
+
+    if [[ ! -f "$BIOS" || ! -f "$rom" || ! -f "$rec" ]]; then
+        echo "--- $label skipped (BIOS/ROM/REC not found) ---" >&2
+        echo "0.0"
+        return
     fi
-    [[ -z "$FPS" ]] && FPS="0.0"
-    rm -f "$FPS_LOG"
-else
-    echo "--- fps_bench skipped (BIOS/ROM/REC not found) ---"
-fi
+
+    echo "--- $label: SDL replay ---" >&2
+    local log
+    log=$(mktemp)
+    # --skip-bios so we're not burning wall time on the BIOS animation.
+    # --no-audio so no SDL audio device noise.
+    # --replay drives the keypad and exits when the last edge is past.
+    if ! "$SDL_BIN" \
+            --bios "$BIOS" \
+            --skip-bios \
+            --no-audio \
+            --replay "$rec" \
+            "$rom" > "$log" 2>&1; then
+        echo "--- $label FAILED, tail of log: ---" >&2
+        tail -n 30 "$log" >&2
+        rm -f "$log"
+        echo "0.0"
+        return
+    fi
+
+    # "replay done: N frames in T.TTs wall, F.F avg fps (...)" is printed
+    # to stdout (not stderr) by the SDL frontend's replay exit path.
+    local fps
+    fps=$(grep -oE "[0-9]+\\.[0-9]+ avg fps" "$log" | tail -1 | awk '{print $1}')
+    [[ -z "$fps" ]] && fps="0.0"
+    echo "$label: $fps FPS" >&2
+    rm -f "$log"
+    echo "$fps"
+}
+
+POKEEMERALD_FPS=$(run_sdl_replay pokeemerald "$POKEEMERALD_ROM" "$POKEEMERALD_REC")
+MARIO_KART_FPS=$(run_sdl_replay mario_kart  "$MARIO_KART_ROM"  "$MARIO_KART_REC")
 
 rm -f "$BENCH_LOG"
 END_TS=$(date +%s)
@@ -149,7 +191,8 @@ SECONDS_ELAPSED=$((END_TS - START_TS))
 # -----------------------------------------------------------------------------
 echo
 echo "---"
-printf "weighted_cycles:   %s\n" "$WEIGHTED"
-printf "fps_bench_fps:     %s\n" "$FPS"
-printf "peak_vram_mb:      0.0\n"
-printf "seconds:           %d\n" "$SECONDS_ELAPSED"
+printf "weighted_cycles:    %s\n" "$WEIGHTED"
+printf "pokeemerald_fps:    %s\n" "$POKEEMERALD_FPS"
+printf "mario_kart_fps:     %s\n" "$MARIO_KART_FPS"
+printf "peak_vram_mb:       0.0\n"
+printf "seconds:            %d\n" "$SECONDS_ELAPSED"

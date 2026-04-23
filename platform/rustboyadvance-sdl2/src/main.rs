@@ -21,10 +21,13 @@ mod recorder;
 mod video;
 
 use rustboyadvance_core::prelude::*;
+use rustboyadvance_core::prelude::NullAudio;
 
 use rustboyadvance_utils::FpsCounter;
 
 use rustboyadvance_core::cartridge::loader::{LoadRom, load_from_file};
+
+mod replay;
 
 const LOG_DIR: &str = ".logs";
 
@@ -87,7 +90,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut renderer = video::init(&sdl_context)?;
-    let (audio_interface, mut _sdl_audio_device) = audio::create_audio_player(&sdl_context);
+    // --no-audio routes past the SDL audio device entirely. Useful for
+    // measurement runs where the audio pipeline adds noise and nothing
+    // is listening. Window + video still come up normally.
+    let (audio_interface, mut _sdl_audio_device): (DynAudioInterface, _) = if opts.no_audio {
+        info!("--no-audio: installing NullAudio sink, skipping SDL audio device");
+        (NullAudio::new(), None)
+    } else {
+        audio::create_audio_player(&sdl_context)
+    };
     let rom_name = opts.rom_name();
 
     let bios_bin = load_bios(&opts.bios);
@@ -129,6 +140,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+
+    // Input replayer: created lazily if --replay was passed. Mutually
+    // exclusive with --record-input (enforced by clap). When present, the
+    // replayer drives the keypad from the recorded trace; the SDL event
+    // loop still runs (so the user can Escape out, resize the window,
+    // etc) but per-frame key-state edits from keyboard/controller get
+    // overwritten by `apply_due` right before `gba.frame()`. Emulator
+    // exits once the last recorded edge is consumed AND the emulator's
+    // cycle counter has passed its cycle stamp.
+    let mut replayer = match &opts.replay {
+        Some(path) => {
+            let r = replay::Replayer::load(path)
+                .map_err(|e| format!("failed to load replay {:?}: {}", path, e))?;
+            info!(
+                "Replaying {:?}: {} events, last cycle {}",
+                path,
+                r.len(),
+                r.last_cycle()
+            );
+            Some(r)
+        }
+        None => None,
+    };
+    let replay_start = time::Instant::now();
+    let mut replay_frames: u64 = 0;
 
     let mut vsync = true;
     let mut fps_counter = FpsCounter::default();
@@ -242,10 +278,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = rec.observe(gba.cycles(), *gba.get_key_state());
         }
 
+        // Replay drives the keypad. Apply any edges whose recorded cycle
+        // has already passed; apply_due writes directly into the keypad
+        // bitmask, overwriting whatever the user typed into SDL. Stop
+        // the emulator once the last recorded edge is in the past so
+        // the replay run has a well-defined end (identical across CPU
+        // builds).
+        if let Some(r) = &mut replayer {
+            let now = gba.cycles() as u64;
+            r.apply_due(now, gba.get_key_state_mut());
+            if r.exhausted() && now >= r.last_cycle() {
+                let elapsed = replay_start.elapsed().as_secs_f64();
+                let fps = (replay_frames as f64) / elapsed.max(1e-9);
+                // Stable machine-parseable summary for the measure harness.
+                println!(
+                    "replay done: {} frames in {:.2}s wall, {:.1} avg fps ({} emulated cycles)",
+                    replay_frames, elapsed, fps, now
+                );
+                break 'running;
+            }
+        }
+
         if gba.is_debugger_attached() {
             gba.debugger_run()
         } else {
             gba.frame();
+            if replayer.is_some() {
+                replay_frames += 1;
+            }
         }
         renderer.render(gba.get_frame_buffer());
 
@@ -254,7 +314,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             renderer.set_window_title(&title);
         }
 
-        if vsync {
+        // Replay runs flat out regardless of vsync — the whole point is
+        // to measure wall time against a fixed amount of emulated work.
+        if vsync && replayer.is_none() {
             let time_passed = start_time.elapsed();
             let delay = FRAME_TIME.checked_sub(time_passed);
             match delay {

@@ -33,24 +33,30 @@ agent follows, commit by commit. The plan that spawned it lives at
 4. Verify the measurement harness runs end-to-end:
 
         bash scripts/dynarec_measure.sh > run.log 2>&1
-        grep "^weighted_cycles:\|^fps_bench_fps:" run.log
+        grep "^weighted_cycles:\|^pokeemerald_fps:\|^mario_kart_fps:" run.log
 
-   You should see both keys. If fps_bench can't find the BIOS/ROM/replay,
-   export `BIOS=`, `ROM=`, `REC=` env vars and rerun.
+   You should see all three keys. If the SDL replay can't find the
+   BIOS/ROMs/recordings, export `BIOS=`, `POKEEMERALD_ROM=`,
+   `MARIO_KART_ROM=`, `POKEEMERALD_REC=`, `MARIO_KART_REC=` env vars
+   and rerun. The SDL binary needs a DISPLAY; if you're headless,
+   `Xvfb :99 & export DISPLAY=:99` works.
 5. Initialize `results.tsv` (untracked, never committed):
 
-        printf 'commit\tweighted_cycles\tfps\tstatus\tdescription\n' > results.tsv
+        printf 'commit\tweighted_cycles\tpokeemerald_fps\tmario_kart_fps\tstatus\tdescription\n' > results.tsv
 
 6. Run the baseline and record it:
 
         bash scripts/dynarec_measure.sh > run.log 2>&1
         WC=$(awk '/^weighted_cycles:/  {print $2}' run.log)
-        FP=$(awk '/^fps_bench_fps:/    {print $2}' run.log)
+        PFP=$(awk '/^pokeemerald_fps:/ {print $2}' run.log)
+        MFP=$(awk '/^mario_kart_fps:/  {print $2}' run.log)
         SHA=$(git rev-parse --short=7 HEAD)
-        printf '%s\t%s\t%s\tkeep\tbaseline\n' "$SHA" "$WC" "$FP" >> results.tsv
+        printf '%s\t%s\t%s\t%s\tkeep\tbaseline\n' "$SHA" "$WC" "$PFP" "$MFP" >> results.tsv
 
    Confirm the row looks sensible. This baseline is what every
-   subsequent experiment measures against.
+   subsequent experiment measures against. Two separate FPS numbers
+   because each game catches different regressions — a gain that
+   only helps pokeemerald but costs mario_kart is not a keeper.
 
 ---
 
@@ -74,7 +80,8 @@ What you CANNOT modify:
 - `arm7tdmi/src/dynarec/dump.rs`
 - `arm7tdmi/tests/dynarec_asm_baseline.rs`
 - `arm7tdmi/tests/dynarec_pattern_differential.rs`
-- `fps_bench/` and anything under `platform/`
+- `platform/rustboyadvance-sdl2/` (the SDL frontend the measure script wraps) and anything else under `platform/`
+- `fps_bench/` (kept for perf-record runs, not part of the primary loop)
 - `arm7tdmi/Cargo.toml` (no new crate deps, no new feature gates)
 
 These are the evaluation. Modifying them is cheating on the metric.
@@ -95,7 +102,9 @@ Both must be green after every change. If either fails, the experiment
 is a crash: log it, revert.
 
 Goal: minimize `weighted_cycles` from `scripts/dynarec_measure.sh`.
-`fps_bench_fps` must not regress more than **1%** vs the previous best.
+BOTH `pokeemerald_fps` AND `mario_kart_fps` must not regress more than
+**1%** vs the previous best. Each game is its own regression check —
+gains in one ROM that come at the cost of the other are rejected.
 
 Simplicity criterion (Karpathy's): tiny gains that add ugly code lose.
 Neutral-or-better diffs that delete code always win. If you find yourself
@@ -110,18 +119,20 @@ try a different shape.
 (anything before it is diagnostic noise the agent can ignore):
 
         ---
-        weighted_cycles:   12345678
-        fps_bench_fps:     60.0
-        peak_vram_mb:      0.0
-        seconds:           295.4
+        weighted_cycles:    12345678
+        pokeemerald_fps:    312.4
+        mario_kart_fps:     297.1
+        peak_vram_mb:       0.0
+        seconds:            295.4
 
 Target metric:
 
         grep "^weighted_cycles:" run.log | awk '{print $2}'
 
-Sanity metric:
+Sanity metrics (each game is its own check):
 
-        grep "^fps_bench_fps:" run.log | awk '{print $2}'
+        grep "^pokeemerald_fps:" run.log | awk '{print $2}'
+        grep "^mario_kart_fps:"  run.log | awk '{print $2}'
 
 `peak_vram_mb` is N/A for this dynarec (always 0.0) but kept for
 Karpathy-template parity.
@@ -130,24 +141,25 @@ Karpathy-template parity.
 
 ## Logging results
 
-`results.tsv`, tab-separated, 5 columns, header row mandatory:
+`results.tsv`, tab-separated, 6 columns, header row mandatory:
 
-        commit    weighted_cycles    fps    status    description
+        commit    weighted_cycles    pokeemerald_fps    mario_kart_fps    status    description
 
 - `commit` — 7-char git hash of the experiment commit (HEAD after your
   edit). `HEAD^` on discard/crash.
 - `weighted_cycles` — integer, `0` on crash.
-- `fps` — one decimal, `0.0` on crash.
+- `pokeemerald_fps` — one decimal, `0.0` on crash.
+- `mario_kart_fps` — one decimal, `0.0` on crash.
 - `status` — `keep` | `discard` | `crash`.
 - `description` — one line, human-readable. No tabs.
 
 Example after four rows:
 
-        commit    weighted_cycles    fps    status    description
-        abc1234   12345678   60.0   keep     baseline
-        def5678   11800000   60.0   keep     NZCV held in host I8 vars across block
-        012cafe   12400000   59.9   discard  fused cond_check into each emit_ - icache bloat
-        cafe001   0          0.0    crash    patterns.rs UDIV magic miscompile vs interp
+        commit    weighted_cycles    pokeemerald_fps    mario_kart_fps    status    description
+        abc1234   12345678   312.4   297.1   keep     baseline
+        def5678   11800000   318.8   299.3   keep     NZCV held in host I8 vars across block
+        012cafe   12400000   313.0   289.1   discard  fused cond_check — mario_kart regressed >1%
+        cafe001   0          0.0     0.0     crash    patterns.rs UDIV magic miscompile vs interp
 
 `results.tsv` is untracked. Never commit it.
 
@@ -163,12 +175,15 @@ Example after four rows:
                - must be green. If not, fix or revert and goto 1.
             4. git commit -am "<short description>"
             5. bash scripts/dynarec_measure.sh > run.log 2>&1
-            6. grep "^weighted_cycles:\|^fps_bench_fps:" run.log
-               - empty output => crash. tail -n 50 run.log. Decide
-                 fix-in-place vs discard.
-               - fps regressed > 1% vs previous best => discard.
+            6. grep "^weighted_cycles:\|^pokeemerald_fps:\|^mario_kart_fps:" run.log
+               - empty output on weighted_cycles => crash. tail -n 50
+                 run.log. Decide fix-in-place vs discard.
+               - EITHER pokeemerald_fps OR mario_kart_fps regressed
+                 > 1% vs previous best => discard. Each game is its own
+                 gate.
                - weighted_cycles went up => discard.
-               - weighted_cycles went down AND fps within 1% => keep.
+               - weighted_cycles went down AND BOTH fps numbers within
+                 1% => keep.
             7. Record the row in results.tsv.
             8. keep     => branch advances, continue to 1.
                discard  => git reset --hard HEAD~1, continue to 1.
@@ -228,23 +243,26 @@ are apples-to-apples on the 6-shape bench at commit `ca11be7`; a
   `tests/dynarec_asm_baseline.rs`.
 - `scripts/dynarec_measure.sh` + `benches/dynarec_shapes.rs` — all 7
   shape benches wired; `weighted_cycles` is a single scalar the loop
-  minimises; `fps_bench` run is the correctness-drift guard.
+  minimises; per-ROM SDL-replay FPS (`pokeemerald_fps`, `mario_kart_fps`)
+  is the correctness-drift guard, each game checked separately.
 
 ## Signal-to-noise caveat
 
-On this host the weighted_cycles noise floor is ≈2% run-to-run and
-fps_bench varies ≈5%. Experiments whose true gain is smaller than
-~3% are indistinguishable from noise and show up alternately as keep
-or discard. Run each candidate twice and compare the average; when
-averages are both within the noise floor the experiment is a
-coin-flip, NOT a reliable win.
+On this host the weighted_cycles noise floor is ≈2% run-to-run.
+SDL-replay FPS varies ≈3–5% (more than fps_bench did, because the
+full video pipeline is exercised). Experiments whose true gain is
+smaller than ~3% are indistinguishable from noise and show up
+alternately as keep or discard. Run each candidate twice and compare
+the average; when averages are both within the noise floor the
+experiment is a coin-flip, NOT a reliable win.
 
 ## What to do next (honest backlog, ordered by payoff / complexity)
 
 1. **Wire the shape_profile counter.** The `shape_profile` feature
    flag is in `arm7tdmi/Cargo.toml` but not used anywhere. Plumb it
    through `BlockCache::finish_record` to count actual execution of
-   each compile-path / format. Dump at fps_bench exit. Feed the
+   each compile-path / format. Dump at SDL-replay exit (one pass per
+   ROM). Feed the
    empirical distribution back into `scripts/dynarec_measure.sh`'s
    `W_*` constants. Replaces my hand-picked {8M, 6M, 5M, 3M, 2M,
    1.5M, 2.5M} guesses with real-gameplay weights. ~1 hour. Every

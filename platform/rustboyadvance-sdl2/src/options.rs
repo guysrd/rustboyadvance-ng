@@ -47,6 +47,20 @@ pub struct Options {
     #[arg(long = "record-input", value_name = "PATH")]
     pub record_input: Option<PathBuf>,
 
+    /// Feed a previously-recorded RBAREC01 input trace into the emulator
+    /// in place of live keyboard/controller input. The recording drives
+    /// the GBA keypad bitmask at the exact emulated cycles it was captured
+    /// at, so the run is deterministic across CPU builds. When the last
+    /// recorded event is consumed the emulator exits.
+    #[arg(long = "replay", value_name = "PATH", conflicts_with = "record_input")]
+    pub replay: Option<PathBuf>,
+
+    /// Disable all audio output. Skips opening the SDL audio device and
+    /// installs a NullAudio sink instead. Intended for CI / measurement
+    /// runs where the audio pipeline adds noise and no one's listening.
+    #[arg(long = "no-audio")]
+    pub no_audio: bool,
+
     #[cfg(feature = "debugger")]
     #[arg(long, default_value = None)]
     pub script_file: Option<String>,

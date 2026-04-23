@@ -21,3 +21,9 @@ winres = "0.1"
 [features]
 default = []
 debugger = ["rustboyadvance-core/debugger"]
+# Pass-through so `cargo build -p rustboyadvance-sdl2 --features dynarec`
+# exercises the Cranelift dynarec path. Used by the shape-opt measure
+# harness (scripts/dynarec_measure.sh) to time the SDL frontend against
+# real ROMs.
+cached_interp = ["rustboyadvance-core/cached_interp"]
+dynarec = ["rustboyadvance-core/dynarec"]
