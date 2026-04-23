@@ -390,11 +390,20 @@ printf "seconds:                %d\n" "$SECONDS_ELAPSED"
 # the agent can copy-paste into this script. Uses the arithmetic mean
 # of per-ROM rates (simple, treats both games equally; refine if one
 # ROM dominates real workload).
-if [[ -n "${SHAPE_COUNT[pokeemerald:thumb_dp_chain]:-}" ]]; then
+if [[ -n "${SHAPE_COUNT[pokeemerald:thumb_dp_short_pure]:-}" ]] \
+   || [[ -n "${SHAPE_COUNT[mario_kart:thumb_block_with_mem]:-}" ]]; then
     echo
     echo "--- suggested W_* retraining (mean of per-ROM calls/sec) ---"
-    for shape in thumb_mov_imm thumb_add_imm thumb_cmp_imm thumb_dp_chain \
-                  arm_mov_imm arm_cmp_imm shift_pair_sxtb; do
+    # Order intentionally matches the ShapeId enum in
+    # arm7tdmi/src/dynarec/shape_profile.rs — single-instruction bench
+    # shapes first, then block-structural buckets, then pattern-matched.
+    # When patterns.rs grows a new shape, append its name here and add
+    # a matching bench in arm7tdmi/benches/dynarec_shapes.rs.
+    for shape in thumb_mov_imm thumb_add_imm thumb_cmp_imm \
+                  arm_mov_imm arm_cmp_imm \
+                  thumb_dp_pair_pure thumb_dp_short_pure thumb_dp_long_pure \
+                  thumb_block_with_mem thumb_block_with_branch \
+                  shift_pair_sxtb other; do
         pk="${SHAPE_COUNT["pokeemerald:$shape"]:-0}"
         mk="${SHAPE_COUNT["mario_kart:$shape"]:-0}"
         avg=$(awk -v p="$pk" -v m="$mk" 'BEGIN { printf "%d", (p+m)/2 }')
