@@ -101,7 +101,7 @@ What you CANNOT modify: prepare.py-equivalents here are scripts/dynarec_measure.
 
 Correctness gate: cargo test -p arm7tdmi --features dynarec must still pass after every change. If it fails, the experiment is a crash — log and revert.
 
-Goal: minimize weighted_cycles from dynarec_measure.sh. Both pokeemerald_fps AND mario_kart_fps must not regress more than 1% vs the previous best. Each game is a separate regression check — wins on one ROM that regress another are not kept.
+Goal: minimize weighted_cycles from dynarec_measure.sh. Both pokeemerald_fps AND mario_kart_fps must not regress more than 1% vs the **global best so far** (the min-weighted_cycles across all kept commits, not the previous keep — prevents drift from 10 sequential 0.9% sub-gate regressions). Each game is a separate regression check — wins on one ROM that regress another are not kept. The per-class cpu_pct / gpu_pct / bus_pct fields are diagnostic (interpret the move), not gating.
 
 Simplicity criterion: same as Karpathy's — tiny gains that add ugly code lose; neutral-or-better diffs that delete code win.
 ## Output format
@@ -109,56 +109,75 @@ Simplicity criterion: same as Karpathy's — tiny gains that add ugly code lose;
 scripts/dynarec_measure.sh prints (exact block the agent greps):
 
 ---
-weighted_cycles:    12345678
-pokeemerald_fps:    312.4
-mario_kart_fps:     297.1
-peak_vram_mb:       0.0
-seconds:            295.4
+weighted_cycles:        12345678
+pokeemerald_fps:        312.4
+pokeemerald_cpu_pct:    61.8
+pokeemerald_gpu_pct:    11.5
+pokeemerald_bus_pct:    8.6
+mario_kart_fps:         297.1
+mario_kart_cpu_pct:     62.3
+mario_kart_gpu_pct:     10.9
+mario_kart_bus_pct:     9.1
+peak_vram_mb:           0.0
+seconds:                295.4
 
-Extract the target metric:
+Extract:
 
-grep "^weighted_cycles:" run.log
+grep "^weighted_cycles:" run.log        # target
+grep "^pokeemerald_fps:" run.log        # gate (per-ROM)
+grep "^mario_kart_fps:"  run.log        # gate (per-ROM)
+grep "_cpu_pct:\|_gpu_pct:\|_bus_pct:" run.log   # diagnostic
 
 ## Logging results
 
-results.tsv, tab-separated, 6 columns:
+results.tsv, tab-separated, **10 columns**:
 
-commit	weighted_cycles	pokeemerald_fps	mario_kart_fps	status	description
+commit	weighted_cycles	pokeemerald_fps	pokeemerald_cpu_pct	pokeemerald_gpu_pct	mario_kart_fps	mario_kart_cpu_pct	mario_kart_gpu_pct	status	description
 
     short git hash (7 chars)
     weighted_cycles — integer, 0 on crash
-    pokeemerald_fps — .1f, 0.0 on crash
-    mario_kart_fps — .1f, 0.0 on crash
+    pokeemerald_fps / mario_kart_fps — .1f, 0.0 on crash
+    pokeemerald_cpu_pct / mario_kart_cpu_pct — .1f diagnostic, 0.0 on crash
+    pokeemerald_gpu_pct / mario_kart_gpu_pct — .1f diagnostic, 0.0 on crash
     status: keep | discard | crash
-    short description
+    short description (no tabs)
+
+(bus_pct / audio_pct / other_pct are printed in run.log for debugging
+but left out of results.tsv to keep the table diffable.)
 
 Example:
 
-commit	weighted_cycles	pokeemerald_fps	mario_kart_fps	status	description
-abc1234	12345678	312.4	297.1	keep	baseline
-def5678	11800000	318.8	299.3	keep	NZCV held in host nzcv via icmp+flag-use
-012cafe	12400000	313.0	289.1	discard	fused cond_check — regresses mario_kart >1%
-cafe001	0	0.0	0.0	crash	patterns.rs UDIV magic - miscompile vs interp
+commit	weighted_cycles	pokeemerald_fps	pokeemerald_cpu_pct	pokeemerald_gpu_pct	mario_kart_fps	mario_kart_cpu_pct	mario_kart_gpu_pct	status	description
+abc1234	12345678	312.4	61.8	11.5	297.1	62.3	10.9	keep	baseline
+def5678	11800000	318.8	63.7	11.3	299.3	64.0	10.7	keep	NZCV held in host nzcv via icmp+flag-use
+012cafe	12400000	313.0	61.9	11.5	289.1	62.4	10.8	discard	fused cond_check — mario_kart FPS regressed >1%
+cafe001	0	0.0	0.0	0.0	0.0	0.0	0.0	crash	patterns.rs UDIV magic - miscompile vs interp
 
 Never commit results.tsv.
 ## The experiment loop
 
 LOOP FOREVER:
-1. Note current branch/commit.
+1. Load global best from results.tsv (min weighted_cycles, max each FPS, `status=keep` only).
 2. Pick an experiment idea (menu below). Edit mod.rs / patterns.rs.
 3. `cargo test -p arm7tdmi --features dynarec` - must be green.
 4. `git commit -am "<short desc>"`
 5. `bash scripts/dynarec_measure.sh > run.log 2>&1`
-6. `grep "^weighted_cycles:\|^pokeemerald_fps:\|^mario_kart_fps:" run.log`
-   - Empty output on weighted_cycles => crash. `tail -n 50 run.log`, decide whether to fix or discard.
-   - EITHER pokeemerald_fps OR mario_kart_fps regressed >1% => discard. Each game is a separate check.
-   - weighted_cycles went up => discard.
-   - weighted_cycles went down AND BOTH fps numbers within 1% => keep.
-7. Record row in results.tsv (commit, weighted_cycles, pokeemerald_fps, mario_kart_fps, status, description).
+6. `grep "^weighted_cycles:\|^pokeemerald_\|^mario_kart_" run.log`
+   - Empty output on weighted_cycles => crash. `tail -n 50 run.log`, decide fix-in-place vs discard.
+   - EITHER pokeemerald_fps OR mario_kart_fps regressed >1% vs its global best => discard. Each game is a separate check.
+   - weighted_cycles > global best => discard.
+   - weighted_cycles < global best AND BOTH fps numbers within 1% of their global best => keep.
+   - weighted_cycles inside noise (within 0.5% of global best) AND no class-pct moved > 1pp => re-run ONCE; if still inside noise on the second pass, discard as a coin flip.
+7. Record row in results.tsv (all 10 columns).
 8. keep => branch advances.
    discard/crash => `git reset --hard HEAD~1`.
 
-Timeout: each run ~10–15 minutes (the SDL-replay passes are slower than fps_bench was — two ROMs with full video rendering). >25 min => kill and treat as crash.
+Timeout: each run ~12–15 minutes (cargo bench ~2 min + SDL build ~1 min + two SDL replays with perf ~11 min, dominated by the ~32 min of emulated pokeemerald gameplay captured in the default recording). >25 min => kill and treat as crash.
+
+If you need faster iterations, set `NO_PERF=1` to skip the `perf record` passes — drops the `_cpu_pct`/`_gpu_pct`/`_bus_pct` fields (they come back as 0.0) and saves ~1–2 min per run. Unset it before making a keep/discard decision; those fields help interpret subsystem shifts.
+
+Retraining the per-shape W_* weights in dynarec_measure.sh is allowed every ~10 kept commits (or when shape_profile reveals the hot distribution has shifted). Commit it with `status=keep` and `description=retrain weights (not a code experiment)`. The resulting WC shift is expected.
+
 NEVER STOP: loop indefinitely. If ideas run out, re-read mod.rs, re-read the menu, combine near-misses, try more radical CLIF rewrites or hand-written stencils.
 ## Experiment idea menu
 

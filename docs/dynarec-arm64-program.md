@@ -30,33 +30,78 @@ agent follows, commit by commit. The plan that spawned it lives at
      bench. You don't modify this; you add one fn per new synthesized
      shape when it lands.
    - Skim `scripts/dynarec_measure.sh`. Do not modify it.
-4. Verify the measurement harness runs end-to-end:
+4. Environment checks (each one-liner, all needed):
+
+        # Desktop/WSL2 needs an X display for the SDL window. Headless?
+        # Xvfb :99 -screen 0 1024x768x24 & export DISPLAY=:99
+        echo "DISPLAY=$DISPLAY"
+
+        # PERF_BIN defaults to /usr/lib/linux-tools-6.8.0-110/perf (the
+        # Ubuntu/WSL2 path on this host). On other distros:
+        #   export PERF_BIN=$(which perf)
+        "$PERF_BIN" --version || echo "set PERF_BIN to your perf binary"
+
+        # Fast iteration without perf (drops the CPU/GPU breakdown):
+        #   export NO_PERF=1
+        # Leave unset for the real loop.
+
+5. Verify the measurement harness runs end-to-end:
 
         bash scripts/dynarec_measure.sh > run.log 2>&1
-        grep "^weighted_cycles:\|^pokeemerald_fps:\|^mario_kart_fps:" run.log
+        grep "^weighted_cycles:\|^pokeemerald_\|^mario_kart_" run.log
 
-   You should see all three keys. If the SDL replay can't find the
-   BIOS/ROMs/recordings, export `BIOS=`, `POKEEMERALD_ROM=`,
-   `MARIO_KART_ROM=`, `POKEEMERALD_REC=`, `MARIO_KART_REC=` env vars
-   and rerun. The SDL binary needs a DISPLAY; if you're headless,
-   `Xvfb :99 & export DISPLAY=:99` works.
-5. Initialize `results.tsv` (untracked, never committed):
+   You should see one `weighted_cycles` line plus four lines per ROM
+   (`_fps`, `_cpu_pct`, `_gpu_pct`, `_bus_pct`). If the SDL replay
+   can't find the BIOS/ROMs/recordings, export `BIOS=`,
+   `POKEEMERALD_ROM=`, `MARIO_KART_ROM=`, `POKEEMERALD_REC=`,
+   `MARIO_KART_REC=` env vars and rerun.
 
-        printf 'commit\tweighted_cycles\tpokeemerald_fps\tmario_kart_fps\tstatus\tdescription\n' > results.tsv
+6. Characterize the noise floor on THIS host before trusting the gate.
+   Run the same commit (baseline) five times back-to-back and note the
+   min/max spread on each metric. Rule of thumb on this harness:
+   weighted_cycles jitter is typically ~2%, per-ROM FPS is ~3–5%,
+   per-class % is ~1–2pp. If your host is noisier (busy laptop, WSL2
+   under thermal throttle) the gate thresholds below need scaling up
+   proportionally — don't fight noise.
 
-6. Run the baseline and record it:
+7. Initialize `results.tsv` (untracked, never committed). Ten columns:
+
+        printf 'commit\tweighted_cycles\tpokeemerald_fps\tpokeemerald_cpu_pct\tpokeemerald_gpu_pct\tmario_kart_fps\tmario_kart_cpu_pct\tmario_kart_gpu_pct\tstatus\tdescription\n' > results.tsv
+
+   (bus_pct, audio_pct, other_pct are still printed in run.log for
+   debugging but left out of results.tsv to keep it diffable — they're
+   recoverable from the per-commit run.log if needed.)
+
+8. Run the baseline and record it:
 
         bash scripts/dynarec_measure.sh > run.log 2>&1
-        WC=$(awk '/^weighted_cycles:/  {print $2}' run.log)
-        PFP=$(awk '/^pokeemerald_fps:/ {print $2}' run.log)
-        MFP=$(awk '/^mario_kart_fps:/  {print $2}' run.log)
+        WC=$(awk '/^weighted_cycles:/       {print $2}' run.log)
+        PFP=$(awk '/^pokeemerald_fps:/      {print $2}' run.log)
+        PCPU=$(awk '/^pokeemerald_cpu_pct:/ {print $2}' run.log)
+        PGPU=$(awk '/^pokeemerald_gpu_pct:/ {print $2}' run.log)
+        MFP=$(awk '/^mario_kart_fps:/       {print $2}' run.log)
+        MCPU=$(awk '/^mario_kart_cpu_pct:/  {print $2}' run.log)
+        MGPU=$(awk '/^mario_kart_gpu_pct:/  {print $2}' run.log)
         SHA=$(git rev-parse --short=7 HEAD)
-        printf '%s\t%s\t%s\t%s\tkeep\tbaseline\n' "$SHA" "$WC" "$PFP" "$MFP" >> results.tsv
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tkeep\tbaseline\n' \
+            "$SHA" "$WC" "$PFP" "$PCPU" "$PGPU" "$MFP" "$MCPU" "$MGPU" \
+            >> results.tsv
 
    Confirm the row looks sensible. This baseline is what every
    subsequent experiment measures against. Two separate FPS numbers
    because each game catches different regressions — a gain that
    only helps pokeemerald but costs mario_kart is not a keeper.
+
+9. Recording length note. The default `POKEEMERALD_REC` (`/tmp/rbarec.rec`)
+   is roughly **32 minutes of emulated gameplay** because it was captured
+   while the host was in turbo mode — a single SDL-replay pass of it
+   takes ~10 min wall time. That makes each experiment iteration
+   ~12–15 min end-to-end (cargo bench ~2 min + build ~1 min + two
+   replays ~11 min). If that cadence is too slow, re-record a shorter
+   (~60–90s real-time gameplay) pokeemerald rec and set
+   `POKEEMERALD_REC` to it; mario_kart is already short (~21s at
+   replay speed). Don't shorten by truncating the existing rec — the
+   last recorded edge's cycle stamp drives the exit condition.
 
 ---
 
@@ -103,8 +148,30 @@ is a crash: log it, revert.
 
 Goal: minimize `weighted_cycles` from `scripts/dynarec_measure.sh`.
 BOTH `pokeemerald_fps` AND `mario_kart_fps` must not regress more than
-**1%** vs the previous best. Each game is its own regression check —
-gains in one ROM that come at the cost of the other are rejected.
+**1%** vs the **global best so far** (not the previous keep — using the
+previous keep lets 10 sequential 0.9% regressions sneak through the
+gate and silently drift the branch worse than baseline). Each game is
+its own regression check — gains in one ROM that come at the cost of
+the other are rejected.
+
+The per-class percentages (`cpu_pct`, `gpu_pct`, `bus_pct`) are
+**diagnostic, not gating**. Use them to interpret a keep/discard
+decision, not to drive it. Rules of thumb:
+
+- You modified CPU codegen (mod.rs emit_* / patterns.rs) → expect
+  `cpu_pct` to move. `gpu_pct` and `bus_pct` should stay flat
+  within the per-class noise floor (~1–2 pp). If they don't, the
+  change has a second-order effect you didn't intend — look at
+  what else shifted before keeping.
+- You modified a sysbus fast path (not allowed in this loop, but
+  same logic applies) → `bus_pct` moves, others flat.
+- `weighted_cycles` drops but `cpu_pct` didn't shift → probably
+  noise or a cold-path win that doesn't show in the hot samples.
+  If it repeats on two runs, keep; otherwise treat as coin flip.
+- `weighted_cycles` unchanged but `cpu_pct` shifts ≥3pp at flat
+  FPS → you've moved work between subsystems without changing
+  total cost. Usually not a keeper by itself; it's the setup for
+  a follow-up that exploits the shift.
 
 Simplicity criterion (Karpathy's): tiny gains that add ugly code lose.
 Neutral-or-better diffs that delete code always win. If you find yourself
@@ -119,20 +186,31 @@ try a different shape.
 (anything before it is diagnostic noise the agent can ignore):
 
         ---
-        weighted_cycles:    12345678
-        pokeemerald_fps:    312.4
-        mario_kart_fps:     297.1
-        peak_vram_mb:       0.0
-        seconds:            295.4
+        weighted_cycles:        12345678
+        pokeemerald_fps:        312.4
+        pokeemerald_cpu_pct:    61.8
+        pokeemerald_gpu_pct:    11.5
+        pokeemerald_bus_pct:    8.6
+        mario_kart_fps:         297.1
+        mario_kart_cpu_pct:     62.3
+        mario_kart_gpu_pct:     10.9
+        mario_kart_bus_pct:     9.1
+        peak_vram_mb:           0.0
+        seconds:                295.4
 
 Target metric:
 
         grep "^weighted_cycles:" run.log | awk '{print $2}'
 
-Sanity metrics (each game is its own check):
+Gating sanity metrics (each game is its own check):
 
         grep "^pokeemerald_fps:" run.log | awk '{print $2}'
         grep "^mario_kart_fps:"  run.log | awk '{print $2}'
+
+Diagnostic sanity metrics (interpret a result, don't gate on them):
+
+        grep "^pokeemerald_cpu_pct:\|^pokeemerald_gpu_pct:\|^pokeemerald_bus_pct:" run.log
+        grep "^mario_kart_cpu_pct:\|^mario_kart_gpu_pct:\|^mario_kart_bus_pct:" run.log
 
 `peak_vram_mb` is N/A for this dynarec (always 0.0) but kept for
 Karpathy-template parity.
@@ -141,25 +219,32 @@ Karpathy-template parity.
 
 ## Logging results
 
-`results.tsv`, tab-separated, 6 columns, header row mandatory:
+`results.tsv`, tab-separated, **10 columns**, header row mandatory:
 
-        commit    weighted_cycles    pokeemerald_fps    mario_kart_fps    status    description
+        commit    weighted_cycles    pokeemerald_fps    pokeemerald_cpu_pct    pokeemerald_gpu_pct    mario_kart_fps    mario_kart_cpu_pct    mario_kart_gpu_pct    status    description
 
 - `commit` — 7-char git hash of the experiment commit (HEAD after your
   edit). `HEAD^` on discard/crash.
 - `weighted_cycles` — integer, `0` on crash.
-- `pokeemerald_fps` — one decimal, `0.0` on crash.
-- `mario_kart_fps` — one decimal, `0.0` on crash.
+- `pokeemerald_fps` / `mario_kart_fps` — one decimal, `0.0` on crash.
+- `pokeemerald_cpu_pct` / `mario_kart_cpu_pct` — one decimal, `0.0`
+  on crash. Diagnostic only.
+- `pokeemerald_gpu_pct` / `mario_kart_gpu_pct` — one decimal, `0.0`
+  on crash. Diagnostic only.
 - `status` — `keep` | `discard` | `crash`.
 - `description` — one line, human-readable. No tabs.
 
+(`bus_pct`, `audio_pct`, `other_pct` are printed in run.log but left
+out of results.tsv to keep the table diffable. If a commit's row looks
+off, the full breakdown lives in run.log next to the commit.)
+
 Example after four rows:
 
-        commit    weighted_cycles    pokeemerald_fps    mario_kart_fps    status    description
-        abc1234   12345678   312.4   297.1   keep     baseline
-        def5678   11800000   318.8   299.3   keep     NZCV held in host I8 vars across block
-        012cafe   12400000   313.0   289.1   discard  fused cond_check — mario_kart regressed >1%
-        cafe001   0          0.0     0.0     crash    patterns.rs UDIV magic miscompile vs interp
+        commit    weighted_cycles    pokeemerald_fps    pokeemerald_cpu_pct    pokeemerald_gpu_pct    mario_kart_fps    mario_kart_cpu_pct    mario_kart_gpu_pct    status    description
+        abc1234   12345678   312.4   61.8   11.5   297.1   62.3   10.9   keep     baseline
+        def5678   11800000   318.8   63.7   11.3   299.3   64.0   10.7   keep     NZCV held in host I8 vars across block
+        012cafe   12400000   313.0   61.9   11.5   289.1   62.4   10.8   discard  fused cond_check — mario_kart FPS regressed >1%
+        cafe001   0          0.0    0.0    0.0    0.0    0.0    0.0    crash    patterns.rs UDIV magic miscompile vs interp
 
 `results.tsv` is untracked. Never commit it.
 
@@ -168,29 +253,48 @@ Example after four rows:
 ## The experiment loop
 
         LOOP FOREVER:
-            1. Note current branch/commit.
+            1. Note current branch/commit. Load the global best row:
+               BEST_WC=$(awk -F'\t' 'NR>1 && $9=="keep" {print $2}' results.tsv | sort -n | head -1)
+               BEST_PFP=$(awk -F'\t' 'NR>1 && $9=="keep" {if($3>m)m=$3} END{print m}' results.tsv)
+               BEST_MFP=$(awk -F'\t' 'NR>1 && $9=="keep" {if($6>m)m=$6} END{print m}' results.tsv)
             2. Pick an experiment from the idea menu below.
                Edit mod.rs / patterns.rs only.
             3. cargo test -p arm7tdmi --features dynarec
                - must be green. If not, fix or revert and goto 1.
             4. git commit -am "<short description>"
             5. bash scripts/dynarec_measure.sh > run.log 2>&1
-            6. grep "^weighted_cycles:\|^pokeemerald_fps:\|^mario_kart_fps:" run.log
+            6. grep "^weighted_cycles:\|^pokeemerald_\|^mario_kart_" run.log
                - empty output on weighted_cycles => crash. tail -n 50
                  run.log. Decide fix-in-place vs discard.
                - EITHER pokeemerald_fps OR mario_kart_fps regressed
-                 > 1% vs previous best => discard. Each game is its own
+                 > 1% vs its BEST_*FP => discard. Each game is its own
                  gate.
-               - weighted_cycles went up => discard.
-               - weighted_cycles went down AND BOTH fps numbers within
-                 1% => keep.
-            7. Record the row in results.tsv.
+               - weighted_cycles > BEST_WC => discard.
+               - weighted_cycles < BEST_WC AND BOTH fps numbers within
+                 1% of BEST_*FP => keep.
+               - weighted_cycles between BEST_WC and BEST_WC*1.005 (i.e.
+                 within noise floor) AND cpu_pct / gpu_pct unchanged
+                 within 1pp each ROM => "coin flip": re-run ONCE. If
+                 the second run is also inside the noise floor, discard
+                 (the change is not doing anything signal-bearing).
+            7. Record the row in results.tsv with all 10 columns.
             8. keep     => branch advances, continue to 1.
                discard  => git reset --hard HEAD~1, continue to 1.
                crash    => git reset --hard HEAD~1, continue to 1.
 
-Timeout: each measurement run is ~5 minutes. >10 min => kill and
-treat as crash.
+Typical wall time per iteration on this host:
+  - cargo bench (dynarec_shapes):  ~2 min
+  - cargo build (SDL + debuginfo): ~1 min (cached after first build)
+  - SDL replay + perf (pokeemerald): ~10 min (long rec, see Setup §9)
+  - SDL replay + perf (mario_kart):  ~0.5 min
+  Total: ~13–15 min per experiment. >25 min => kill and treat as crash.
+
+If you want a faster inner loop, set `NO_PERF=1` to skip the perf
+record passes — drops the `_cpu_pct` / `_gpu_pct` / `_bus_pct` fields
+from the output (they'll show 0.0), but FPS + weighted_cycles still
+work and each replay pass becomes ~1 min faster. Use this mode when
+you're iterating on a single change and don't need the subsystem
+breakdown; unset it for the keep/discard gate decision.
 
 ---
 
@@ -243,18 +347,53 @@ are apples-to-apples on the 6-shape bench at commit `ca11be7`; a
   `tests/dynarec_asm_baseline.rs`.
 - `scripts/dynarec_measure.sh` + `benches/dynarec_shapes.rs` — all 7
   shape benches wired; `weighted_cycles` is a single scalar the loop
-  minimises; per-ROM SDL-replay FPS (`pokeemerald_fps`, `mario_kart_fps`)
-  is the correctness-drift guard, each game checked separately.
+  minimises; per-ROM SDL-replay FPS + CPU/GPU/bus classification
+  (via `perf record`) is the correctness-drift + subsystem-shift
+  guard, each game checked separately.
 
 ## Signal-to-noise caveat
 
-On this host the weighted_cycles noise floor is ≈2% run-to-run.
-SDL-replay FPS varies ≈3–5% (more than fps_bench did, because the
-full video pipeline is exercised). Experiments whose true gain is
-smaller than ~3% are indistinguishable from noise and show up
-alternately as keep or discard. Run each candidate twice and compare
-the average; when averages are both within the noise floor the
-experiment is a coin-flip, NOT a reliable win.
+Noise floor on this host (re-measure yours per Setup §6 before
+trusting the gate):
+
+- weighted_cycles: ≈2% run-to-run (pure Criterion micro-bench;
+  relatively quiet because no other subsystems are running).
+- SDL-replay FPS: ≈3–5% per ROM. Full video pipeline is exercised,
+  `perf record` adds ~1%, and the OS scheduler adds the rest.
+- cpu_pct / gpu_pct / bus_pct: ≈1–2 pp per ROM. Anything smaller
+  than 1 pp is almost certainly sampling noise; anything >2 pp is
+  probably a real subsystem shift.
+
+Experiments whose true gain is smaller than ~3% are
+indistinguishable from WC noise and show up alternately as keep or
+discard. The coin-flip rule in the experiment loop handles these:
+re-run once, if both runs stay inside the noise floor AND the
+cpu/gpu/bus breakdown didn't shift > noise either, discard.
+
+## When to retrain weights (W_* constants in dynarec_measure.sh)
+
+The shape call-counts baked into `scripts/dynarec_measure.sh`
+(`W_thumb_mov_imm=8M`, etc.) are from the apr22 baseline
+flamegraph. After you land several experiments that change how
+often each shape compiles, those numbers start lying — a shape
+the agent now rarely hits still has 8M weight, distorting WC.
+
+Retrain when **any** of these fires:
+
+- 10 kept commits have landed since the last retrain.
+- A new synthesized shape gets added to `patterns.rs` (its weight
+  needs to be measured, not guessed).
+- `cpu_pct` shifts > 5 pp on either ROM across consecutive keeps
+  without an obvious cause — the hot distribution moved.
+
+How to retrain: rebuild with `--features shape_profile` (once
+wired, see backlog §1), run one pass per ROM, dump the counter
+table, scale to calls/sec based on the replay length, update
+`W_*` in the script. Label the commit `measure: retrain shape
+weights against <ROM> <date>` and record it in `results.tsv`
+with `status=keep` and `description="retrain weights (not a
+code experiment)"`. It shifts WC because the weights moved,
+not because a shape got faster — that's expected and fine.
 
 ## What to do next (honest backlog, ordered by payoff / complexity)
 
@@ -360,24 +499,48 @@ Each is dozens of ARM/Thumb instructions but lowers to one or two
 native instructions on arm64. The block-level matcher in `patterns.rs`
 recognizes the trigger sequence and emits a tight stencil.
 
+Each entry tagged with **[pokeemerald]** / **[mario_kart]** /
+**[both]** = which replay ROM surfaces this shape in the perf
+flamegraph, so the gate doesn't silently veto a real win because
+the change didn't move the ROM it wasn't targeting. Unmarked =
+compiler-generated idiom, both games hit it.
+
 1. **MUL-by-constant** → shift-add tree or `madd`. Trigger: `MOV Rtmp,
-   #imm ; MUL Rd, Rs, Rtmp` where `imm` is small/power-of-2.
+   #imm ; MUL Rd, Rs, Rtmp` where `imm` is small/power-of-2. **[both]**
+   Thumb MUL not yet a decoded shape; first add `Thumb4Op::Mul`.
 2. **UDIV/SDIV-by-constant via Granlund–Montgomery.** Magic
    `M = ceil(2^(32+k)/d)` → arm64 `umulh ; lsr`. Trigger: the standard
    magic-multiply sequence, or BIOS `SWI 0x06` preceded by `MOV r1, #imm`.
+   **[pokeemerald]** — emerald computes a lot of 1/60 and 1/240 via
+   this idiom; Mario Kart is largely 2D/3D fixed-point and rarely
+   divides by constants.
 3. **Branchless abs**: `(x ^ (x>>31)) - (x>>31)` → `cmp ; cneg`.
+   **[both]**
 4. **CLZ polyfill** (de Bruijn 0x077CB531 table, Stanford binary search)
-   → arm64 `clz`.
+   → arm64 `clz`. **[pokeemerald]** — RNG code.
 5. **popcount SWAR** (0x55555555 / 0x33333333 / 0x0f0f0f0f / 0x01010101)
-   → arm64 NEON `cnt ; addv`.
+   → arm64 NEON `cnt ; addv`. **[pokeemerald]** — Pokemon-count /
+   flag-check paths.
 6. **Branchless MIN/MAX**: `b + ((a-b) & -(a<b))` → `cmp ; csel`.
+   **[both]**
 7. **Shift-pair sign/zero extend** `LSL #24 ; ASR #24` (and 16-bit) →
-   `sxtb` / `sxth` / `uxtb` / `uxth`.
-8. **Byte-swap idiom** → `rev`.
+   `sxtb` / `sxth` / `uxtb` / `uxth`. **[both]** — already landed.
+8. **Byte-swap idiom** → `rev`. **[pokeemerald]** — save serialization.
 9. **GBA BIOS CpuSet / CpuFastSet fold** (`SWI 0x0B` / `0x0C` + known
-   `r2` mode bits) → inlined memcpy/memset stencil.
+   `r2` mode bits) → inlined memcpy/memset stencil. **[mario_kart]** —
+   3D track geometry upload uses CpuFastSet heavily per frame.
 10. **Dead DP chain DCE**: drop register-write chains whose results
     are all overwritten before block exit without being observed.
+    **[both]**
+
+When an experiment targets a ROM-specific pattern, expect:
+
+- The non-targeted ROM's FPS and per-class % to stay within noise
+  (if they don't, you've hit an unrelated hot path — investigate).
+- The targeted ROM's cpu_pct to drop; its FPS to rise; weighted_cycles
+  to drop only if the pattern fires often enough. If WC stays flat,
+  the shape isn't hot in the bench-weighted sense yet — wait for
+  shape_profile to confirm before ripping the pattern out.
 
 Each new synthesized shape lands with:
 
