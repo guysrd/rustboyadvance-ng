@@ -3700,15 +3700,14 @@ fn emit_flag_update(
     // we keep bits 29/28 (C/V) in place, so we only clear bits 31/30
     // (0x3fff_ffff) and OR in the new N/Z only.
     let cpsr = builder.use_var(cpsr_var);
-    let mask = builder.ins().iconst(
-        types::I32,
-        if preserve_cv {
-            0x3fff_ffff
-        } else {
-            0x0fff_ffff
-        },
-    );
-    let cleared = builder.ins().band(cpsr, mask);
+    // band_imm folds the mask into a single arm64 `and` with an encoded
+    // immediate, vs the two-op iconst+band sequence that previously
+    // forced the mask into a register first. Semantics identical.
+    let cleared = if preserve_cv {
+        builder.ins().band_imm(cpsr, 0x3fff_ffffi64)
+    } else {
+        builder.ins().band_imm(cpsr, 0x0fff_ffffi64)
+    };
     let nz = builder.ins().bor(n_shifted, z_shifted);
     if preserve_cv {
         builder.ins().bor(cleared, nz)
