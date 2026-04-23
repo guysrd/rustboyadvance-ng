@@ -1837,6 +1837,22 @@ impl DynarecCompiler {
             match &tail {
                 Tail::Body(b) => {
                     emit_body(&mut builder, b);
+                    // Mirror scalar's `CpuAction::AdvancePC(NonSeq)` for the
+                    // post-block fetch: when the tail body item is a STORE
+                    // (STR/STRB/PUSH), scalar STR returns NonSeq, so the
+                    // NEXT block's first fetch should be charged NonSeq.
+                    // thumb_fetch_n set `next_fetch_access = Seq` at block
+                    // entry for this block's fetches, but the POST-block
+                    // fetch is paid by the cached-interp loop out of
+                    // `cpu.next_fetch_access`, so we need to flip it to
+                    // NonSeq here if the last instruction was a store.
+                    let tail_is_store = body_item_is_store(b);
+                    if tail_is_store {
+                        let nonseq_ref = self
+                            .module
+                            .declare_func_in_func(imports.set_next_fetch_nonseq, builder.func);
+                        builder.ins().call(nonseq_ref, &[cpu_ctx]);
+                    }
                 }
                 Tail::Bx(bx) => {
                     let target = builder.ins().load(

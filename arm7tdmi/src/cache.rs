@@ -175,6 +175,10 @@ struct DynarecDebug {
     off: bool,
     no_mem: bool,
     no_branch: bool,
+    no_cond_branch: bool, // skip only format-16 Bcc
+    no_uncond_branch: bool, // skip only format-18 B
+    no_bx: bool, // skip only format-5 BX
+    no_pop_pc: bool, // skip only POP{PC}
     no_dp_long: bool,
     max_len: Option<usize>,
 }
@@ -191,6 +195,10 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "off" => d.off = true,
                     "no-mem" => d.no_mem = true,
                     "no-branch" => d.no_branch = true,
+                    "no-cond-branch" => d.no_cond_branch = true,
+                    "no-uncond-branch" => d.no_uncond_branch = true,
+                    "no-bx" => d.no_bx = true,
+                    "no-pop-pc" => d.no_pop_pc = true,
                     "no-dp-long" => d.no_dp_long = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
@@ -248,6 +256,26 @@ fn try_compile_thumb<I: MemoryInterface>(
             .unwrap_or(false)
     {
         return None;
+    }
+    if let Some(&last) = raws.last() {
+        let top4 = last >> 12;
+        // Bcc: 0b1101 xxxx (format 16). Also masks out SWI 0b1101_1111 at runtime,
+        // but classify_tail handles that.
+        if dbg.no_cond_branch && top4 == 0b1101 {
+            return None;
+        }
+        // Unconditional B (format 18): 0b11100 xxx (mask 0xF800 == 0xE000)
+        if dbg.no_uncond_branch && (last & 0xF800) == 0xE000 {
+            return None;
+        }
+        // BX (format 5): 0b0100_0111_xxxx
+        if dbg.no_bx && (last & 0xFF00) == 0x4700 {
+            return None;
+        }
+        // POP{PC}: 0b1011_1101_xxxx_xxxx (format 14 with R=1 and PC set)
+        if dbg.no_pop_pc && (last & 0xFF00) == 0xBD00 {
+            return None;
+        }
     }
     if dbg.no_dp_long
         && raws.len() >= 6
