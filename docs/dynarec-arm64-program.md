@@ -177,6 +177,107 @@ Example after four rows:
 Timeout: each measurement run is ~5 minutes. >10 min => kill and
 treat as crash.
 
+---
+
+## Findings from the apr22 run (what's already in HEAD)
+
+This branch landed 10 kept experiments from 16 attempts. Numbers below
+are apples-to-apples on the 6-shape bench at commit `ca11be7`; a
+`shift_pair_sxtb` shape joins the metric at `772d381` so WC bumps
+~+3M from that point on without being a regression.
+
+**Top wins measured:**
+- `thumb_dp_chain` 4.19 → 1.78 ns  (−58%) via exp 10: Thumb-block
+  dead-flag-write pre-pass (items whose NZCV write is covered by the
+  next unconditional flag-setter get their flag update skipped
+  entirely).
+- `thumb_mov_imm`  ~1.70 → 1.05 ns (−38%) via exp 5: Thumb3 MOV #imm8
+  inline fast path — skips rd load + N compute; since imm8 ∈ [0,255]
+  and N is always 0, the flag update collapses to a single
+  `cpsr_masked | (imm8==0 ? 0x4000_0000 : 0)`.
+- `arm_mov_imm`    1.20 → 1.04 ns (−13%) via exp 8: skip cpsr load +
+  store when no instr in block reads or writes flags.
+
+**Don't-bother list (I tried these, they regress or are noise on x86_64):**
+- `select(cond, mask_imm, 0)` in place of `icmp + uextend + ishl_imm`
+  — lowers WORSE on x86_64 than the three-op sequence (exp 4, +8.8%
+  regression).
+- `opt_level = speed` on Cranelift — runtime-level regression on short
+  JITted blocks (exp 6, +16% regression). Alias-analysis needed it
+  enabled but the compile-time cost wasn't offset by execution gain
+  on our shapes.
+- Lazy-extract each flag in `emit_cond_check` (exp 2, within noise).
+  Cranelift already DCEs unused flag extracts when only some are
+  needed.
+- Explicit skip of the `rd_val` load in `emit_thumb_format3` MOV (exp
+  3, within noise). Cranelift already DCEs the unused value.
+
+**Structural scaffolding already in place (don't re-invent):**
+- `patterns::ShiftPairSignExtendByte/Half` and
+  `ShiftPairZeroExtendByte/Half` — first real block-level pattern
+  stencil. Matches two-instruction LSL+ASR / LSL+LSR Thumb blocks,
+  emits `ireduce + sextend/uextend` which Cranelift lowers to a single
+  `sxtb/sxth/uxtb/uxth` on arm64 (`movsx` on x86_64). Proven
+  bit-exact against interpreter via 4 differential tests.
+- Dead-flag-write pre-pass in `try_compile_thumb_block` AND
+  `try_compile_imm_block`. Both analyse flag-write coverage and skip
+  the cpsr pack when observably dead.
+- `arm7tdmi::dynarec::dump` (capstone-based host-asm dumper, gated by
+  `dynarec_asm_dump` feature). Use it to inspect what Cranelift emits
+  for any existing or new shape; per-shape tests in
+  `tests/dynarec_asm_baseline.rs`.
+- `scripts/dynarec_measure.sh` + `benches/dynarec_shapes.rs` — all 7
+  shape benches wired; `weighted_cycles` is a single scalar the loop
+  minimises; `fps_bench` run is the correctness-drift guard.
+
+## Signal-to-noise caveat
+
+On this host the weighted_cycles noise floor is ≈2% run-to-run and
+fps_bench varies ≈5%. Experiments whose true gain is smaller than
+~3% are indistinguishable from noise and show up alternately as keep
+or discard. Run each candidate twice and compare the average; when
+averages are both within the noise floor the experiment is a
+coin-flip, NOT a reliable win.
+
+## What to do next (honest backlog, ordered by payoff / complexity)
+
+1. **Wire the shape_profile counter.** The `shape_profile` feature
+   flag is in `arm7tdmi/Cargo.toml` but not used anywhere. Plumb it
+   through `BlockCache::finish_record` to count actual execution of
+   each compile-path / format. Dump at fps_bench exit. Feed the
+   empirical distribution back into `scripts/dynarec_measure.sh`'s
+   `W_*` constants. Replaces my hand-picked {8M, 6M, 5M, 3M, 2M,
+   1.5M, 2.5M} guesses with real-gameplay weights. ~1 hour. Every
+   subsequent experiment's WC signal becomes meaningful.
+
+2. **Pattern: MUL-by-constant.** Matches `MOV Rtmp, #imm ;
+   MUL Rd, Rs` → `Rd = imm * Rs`. Requires first adding
+   `Thumb4Op::Mul` as a decoded shape (currently Thumb MUL falls
+   through so the 2-instr block doesn't compile). ~2 hours.
+
+3. **Pattern: branchless abs** `(x ^ (x>>31)) - (x>>31)`.
+   Three-instruction Thumb sequence; lowers to arm64 `cmp + cneg`.
+   ~1 hour.
+
+4. **Part A1 lazy NZCV.** Hold N/Z/C/V in four Cranelift Variables
+   across a block; unpack cpsr once at entry, pack once at exit.
+   Large refactor touching every `emit_*`. Only pays off when blocks
+   have ≥2 flag-setters AND have a conditional mid-block. Guard
+   with shape_profile data before committing to this; otherwise
+   it's a coin-flip against the host-level noise.
+
+5. **CLZ polyfill / popcount SWAR patterns.** Real but rarer shapes;
+   each is a 10+-instruction recognizer + a 1-instruction stencil.
+   ~3 hours each. Skip unless shape_profile shows them hot.
+
+Blockers/discovered caveats:
+- Thumb MUL (format 4, op=1101) is not currently a dynarec-supported
+  shape; blocks containing it fall through to the interpreter. Any
+  pattern involving MUL needs decoder work first.
+- SWI (BIOS call intercept, e.g. CpuSet) is deliberately scalar-only
+  per the base dynarec design. BIOS CpuSet-fold patterns require
+  lifting that restriction first.
+
 NEVER STOP: loop indefinitely. If ideas run out, re-read `mod.rs` cold,
 re-read the idea menu, combine near-misses, try a more radical Cranelift
 IR rewrite, or try a hand-written stencil via `patterns.rs`.
