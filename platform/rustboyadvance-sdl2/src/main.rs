@@ -187,6 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let replay_start = time::Instant::now();
     let mut replay_frames: u64 = 0;
+    let mut last_present = time::Instant::now();
+    const REPLAY_PRESENT_INTERVAL: time::Duration = time::Duration::from_millis(16); // ~60Hz
 
     let mut vsync = true;
     let mut fps_counter = FpsCounter::default();
@@ -341,15 +343,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 replay_frames += 1;
             }
         }
-        // In replay mode we skip the SDL present. The replay runs flat-out
-        // (no vsync); presenting every frame at 1000+ FPS produces visual
-        // tearing that looks like color corruption but is just the present
-        // racing the backbuffer writes. The emulator's framebuffer is
-        // still correct (verified by fps_bench --frame-hash-every diffs).
-        // Core GPU path + perf record still fire inside gba.frame() — only
-        // the SDL blit is skipped, so the measure script's GPU self-time
-        // isn't affected.
-        if replayer.is_none() {
+        // In replay mode we rate-limit the SDL present to ~60Hz wall-clock.
+        // The emulator itself runs flat-out (no vsync) at 1000+ FPS, so
+        // presenting every emulator frame causes the SDL texture upload
+        // to race the GPU writing scanlines, producing visible tearing.
+        // By sampling the backbuffer ~60x per wall second we show a clean
+        // view of the game to the user while keeping the underlying
+        // throughput measurement untouched. The emulator framebuffer is
+        // bit-identical to interp anyway (verified by fps_bench
+        // --frame-hash-every diffs over 3 min of pokeemerald replay).
+        let should_present = if replayer.is_some() {
+            let now = time::Instant::now();
+            if now.duration_since(last_present) >= REPLAY_PRESENT_INTERVAL {
+                last_present = now;
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        if should_present {
             renderer.render(gba.get_frame_buffer());
         }
 
