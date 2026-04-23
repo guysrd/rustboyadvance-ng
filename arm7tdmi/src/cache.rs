@@ -153,6 +153,60 @@ pub struct BlockCache<I: MemoryInterface> {
 #[cfg(feature = "dynarec")]
 const DYNAREC_MIN_BLOCK_LEN: usize = 4;
 
+/// Debug knob for bisecting dynarec correctness bugs. Reads the env
+/// var once at first use and caches the parse. Supported values:
+///
+///   DYNAREC_DEBUG=off           disable ALL dynarec compilation
+///                               (effectively cached_interp-only)
+///   DYNAREC_DEBUG=max=N         compile blocks only if length <= N
+///   DYNAREC_DEBUG=no-mem        skip compilation of blocks containing
+///                               any memory op (F7/F8/F9/F10/F11/F14)
+///   DYNAREC_DEBUG=no-branch     skip blocks whose last instr is Bcc/B/BL/BX
+///   DYNAREC_DEBUG=no-dp-long    skip blocks with 6+ pure-DP instructions
+///
+/// Multiple tokens can be combined with commas (evaluated as AND):
+///   DYNAREC_DEBUG=no-mem,no-branch
+///
+/// Unset (default): compile everything the unified compiler supports.
+/// Used to narrow down which compile path miscompiles pokeemerald.
+#[cfg(feature = "dynarec")]
+#[derive(Default, Debug)]
+struct DynarecDebug {
+    off: bool,
+    no_mem: bool,
+    no_branch: bool,
+    no_dp_long: bool,
+    max_len: Option<usize>,
+}
+
+#[cfg(feature = "dynarec")]
+fn dynarec_debug() -> &'static DynarecDebug {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<DynarecDebug> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut d = DynarecDebug::default();
+        if let Ok(s) = std::env::var("DYNAREC_DEBUG") {
+            for tok in s.split(',').map(str::trim) {
+                match tok {
+                    "off" => d.off = true,
+                    "no-mem" => d.no_mem = true,
+                    "no-branch" => d.no_branch = true,
+                    "no-dp-long" => d.no_dp_long = true,
+                    t if t.starts_with("max=") => {
+                        if let Ok(n) = t[4..].parse() {
+                            d.max_len = Some(n);
+                        }
+                    }
+                    "" => {}
+                    other => eprintln!("DYNAREC_DEBUG: unknown token {:?}", other),
+                }
+            }
+            eprintln!("DYNAREC_DEBUG active: {:?}", d);
+        }
+        d
+    })
+}
+
 #[cfg(feature = "dynarec")]
 fn try_compile_thumb<I: MemoryInterface>(
     compiler: &mut DynarecCompiler,
@@ -161,8 +215,17 @@ fn try_compile_thumb<I: MemoryInterface>(
     if !compiler.has_bus() {
         return None;
     }
+    let dbg = dynarec_debug();
+    if dbg.off {
+        return None;
+    }
     if block.instrs.len() < DYNAREC_MIN_BLOCK_LEN {
         return None;
+    }
+    if let Some(max) = dbg.max_len {
+        if block.instrs.len() > max {
+            return None;
+        }
     }
     let mut raws: Vec<u16> = Vec::with_capacity(block.instrs.len());
     for instr in &block.instrs {
@@ -174,6 +237,28 @@ fn try_compile_thumb<I: MemoryInterface>(
     if raws.is_empty() {
         return None;
     }
+    // Debug knobs: skip blocks whose shape matches a suspect classifier.
+    if dbg.no_mem && raws.iter().any(|&op| is_thumb_mem_opcode(op)) {
+        return None;
+    }
+    if dbg.no_branch
+        && raws
+            .last()
+            .map(|&op| is_thumb_branch_opcode(op))
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    if dbg.no_dp_long
+        && raws.len() >= 6
+        && !raws.iter().any(|&op| is_thumb_mem_opcode(op))
+        && !raws
+            .last()
+            .map(|&op| is_thumb_branch_opcode(op))
+            .unwrap_or(false)
+    {
+        return None;
+    }
     // block.entry_pc is self.pc at step_block entry with the Thumb bit
     // OR'd into bit 0. Masking off that bit gives the pipeline-head pc,
     // which equals block_start_addr + 4 per Thumb pipeline convention.
@@ -181,6 +266,32 @@ fn try_compile_thumb<I: MemoryInterface>(
     // the unit tests use), so subtract 4 to match.
     let block_start_addr = (block.entry_pc & !1).wrapping_sub(4);
     compiler.try_compile_thumb_mem_block_with_branch(&raws, block_start_addr)
+}
+
+/// Cheap detectors that mirror the block-level classifier rules in
+/// `dynarec::shape_profile`. Kept here so the DYNAREC_DEBUG gate can
+/// filter without pulling in shape_profile (which is an independent
+/// feature and not always compiled in).
+#[cfg(feature = "dynarec")]
+fn is_thumb_mem_opcode(op: u16) -> bool {
+    let top4 = op >> 12;
+    match top4 {
+        0b0101 | 0b0110 | 0b0111 | 0b1000 | 0b1001 => true,
+        0b1011 => (op & 0x0600) == 0x0400,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "dynarec")]
+fn is_thumb_branch_opcode(op: u16) -> bool {
+    let top4 = op >> 12;
+    match top4 {
+        0b1101 => true,
+        0b1110 => (op & 0xF800) == 0xE000,
+        0b1111 => true,
+        0b0100 => (op & 0xFF00) == 0x4700,
+        _ => false,
+    }
 }
 
 /// Classify a guest PC by memory region for the block-cache split.

@@ -126,13 +126,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gba.skip_bios();
     }
 
-    // Turn on the Cranelift dispatcher when the binary was built with
-    // `--features dynarec`. Off by default on master (see core/src/gba.rs
-    // for the rationale). Required for the `shape_profile` counter to
-    // see any compiled blocks execute — without this, every block runs
-    // through the scalar cached interpreter path.
-    #[cfg(feature = "dynarec")]
-    gba.cpu.enable_dynarec();
+    // Dynarec dispatcher control. Two independent triggers, either
+    // turns it on:
+    //   1. --jit CLI flag (runtime choice, any --features dynarec build)
+    //   2. --features shape_profile (implies the counter needs
+    //      compiled blocks to fire — pointless without dynarec on)
+    //
+    // Off by default because dynarec has latent correctness issues
+    // (pokeemerald palette corruption observed when enabled under
+    // --features dynarec alone). Keep the SDL frontend playable on
+    // default `--features dynarec` builds; opt into the possibly-buggy
+    // JIT dispatch with --jit when measuring or testing the JIT itself.
+    let want_dynarec = opts.jit || cfg!(feature = "shape_profile");
+    if want_dynarec {
+        info!("Enabling Cranelift dynarec dispatcher");
+        #[cfg(feature = "dynarec")]
+        gba.cpu.enable_dynarec();
+        #[cfg(not(feature = "dynarec"))]
+        log::warn!(
+            "--jit requested but this binary was built without --features dynarec; ignoring"
+        );
+    }
 
     if opts.gdbserver {
         gba.start_gdbserver(opts.gdbserver_port);

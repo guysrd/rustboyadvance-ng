@@ -228,7 +228,7 @@ perf_classify_pcts() {
                 sym = sym ($i)
                 if (i < NF) sym = sym " "
             }
-            # Strip surrounding brackets like [.] that AWK's $3 consumed.
+            # Strip surrounding brackets like [.] that awk $3 consumed.
             gsub("%", "", self_pct)
             print self_pct "\t" sym
         }
@@ -248,29 +248,33 @@ perf_classify_pcts() {
     '
 }
 
-# Run one SDL replay pass under perf, returning FPS and populating a
-# global assoc array with the per-class self-time. We use globals
-# because bash can't return multiple values cleanly. Also captures
-# shape_profile counter output (when the binary was built
-# --features shape_profile) into SHAPE_COUNT[<rom>:<shape>] =
-# calls/sec, so the measure script can suggest retrained W_* values.
-declare -A CLASS_PCT
+# Run one SDL replay pass under perf, writing FPS and per-class self
+# time to a temp file the caller sources. The tempfile indirection is
+# there because bash subshells from $(cmd) don't propagate associative
+# array writes to the parent — we want the caller to see the CLASS_PCT
+# values alongside the captured FPS. Shape_profile counts still go via
+# the SHAPE_COUNT assoc array populated in the parent shell (we parse
+# the SDL binary's stdout directly from the shared `$log` file).
 declare -A SHAPE_COUNT
 run_sdl_replay_with_perf() {
     local label="$1"
     local rom="$2"
     local rec="$3"
+    # Side-channel file the caller sources; see the block comment below.
+    local out_file="$4"
 
-    # Reset the class table for this call.
-    CLASS_PCT[cpu]=0.0
-    CLASS_PCT[gpu]=0.0
-    CLASS_PCT[bus]=0.0
-    CLASS_PCT[audio]=0.0
-    CLASS_PCT[other]=0.0
+    : > "$out_file"
+    {
+        echo "FPS=0.0"
+        echo "CPU_PCT=0.0"
+        echo "GPU_PCT=0.0"
+        echo "BUS_PCT=0.0"
+        echo "AUDIO_PCT=0.0"
+        echo "OTHER_PCT=0.0"
+    } >> "$out_file"
 
     if [[ ! -f "$BIOS" || ! -f "$rom" || ! -f "$rec" ]]; then
         echo "--- $label skipped (BIOS/ROM/REC not found) ---" >&2
-        echo "0.0"
         return
     fi
 
@@ -284,12 +288,11 @@ run_sdl_replay_with_perf() {
     # dev iterations that don't need the subsystem breakdown).
     if [[ "${NO_PERF:-0}" == "1" ]] || [[ ! -x "$PERF_BIN" ]]; then
         if ! "$SDL_BIN" \
-                --bios "$BIOS" --skip-bios --no-audio \
+                --bios "$BIOS" --skip-bios --no-audio --jit \
                 --replay "$rec" "$rom" > "$log" 2>&1; then
             echo "--- $label FAILED, tail of log: ---" >&2
             tail -n 30 "$log" >&2
             rm -f "$log"
-            echo "0.0"
             return
         fi
     else
@@ -299,12 +302,11 @@ run_sdl_replay_with_perf() {
         if ! "$PERF_BIN" record -F 997 -g --call-graph dwarf -q \
                 -o "$perf_data" -- \
                 "$SDL_BIN" \
-                --bios "$BIOS" --skip-bios --no-audio \
+                --bios "$BIOS" --skip-bios --no-audio --jit \
                 --replay "$rec" "$rom" > "$log" 2>&1; then
             echo "--- $label FAILED, tail of log: ---" >&2
             tail -n 30 "$log" >&2
             rm -f "$log" "$perf_data"
-            echo "0.0"
             return
         fi
     fi
@@ -313,6 +315,8 @@ run_sdl_replay_with_perf() {
     fps=$(grep -oE "[0-9]+\\.[0-9]+ avg fps" "$log" | tail -1 | awk '{print $1}')
     [[ -z "$fps" ]] && fps="0.0"
     echo "$label: $fps FPS" >&2
+    # Overwrite the default FPS with the real value.
+    sed -i "s/^FPS=.*/FPS=${fps}/" "$out_file"
 
     # Pull shape_profile counters from the SDL stdout. Present only when
     # the binary was built with `--features shape_profile`; silently
@@ -341,28 +345,48 @@ run_sdl_replay_with_perf() {
 
     rm -f "$log"
 
-    # Populate the classification table from perf data.
+    # Populate the classification table from perf data. Writes into
+    # the caller's out_file so the parent shell can read per-ROM pcts
+    # without fighting subshell variable scoping.
     if [[ -f "$perf_data" ]]; then
         echo "--- $label: perf subsystem breakdown ---" >&2
         while read -r class pct; do
-            CLASS_PCT[$class]="$pct"
             printf "  %-6s %s%%\n" "$class" "$pct" >&2
+            # Map class name → env var name the canonical block uses.
+            local key
+            case "$class" in
+                cpu)   key=CPU_PCT ;;
+                gpu)   key=GPU_PCT ;;
+                bus)   key=BUS_PCT ;;
+                audio) key=AUDIO_PCT ;;
+                other) key=OTHER_PCT ;;
+                *) continue ;;
+            esac
+            sed -i "s/^${key}=.*/${key}=${pct}/" "$out_file"
         done < <(perf_classify_pcts "$perf_data")
         rm -f "$perf_data"
     fi
-
-    echo "$fps"
 }
 
-POKEEMERALD_FPS=$(run_sdl_replay_with_perf pokeemerald "$POKEEMERALD_ROM" "$POKEEMERALD_REC")
-POKEEMERALD_CPU=${CLASS_PCT[cpu]:-0.0}
-POKEEMERALD_GPU=${CLASS_PCT[gpu]:-0.0}
-POKEEMERALD_BUS=${CLASS_PCT[bus]:-0.0}
+POKE_OUT=$(mktemp)
+run_sdl_replay_with_perf pokeemerald "$POKEEMERALD_ROM" "$POKEEMERALD_REC" "$POKE_OUT"
+# shellcheck source=/dev/null
+source "$POKE_OUT"
+POKEEMERALD_FPS="$FPS"
+POKEEMERALD_CPU="$CPU_PCT"
+POKEEMERALD_GPU="$GPU_PCT"
+POKEEMERALD_BUS="$BUS_PCT"
+rm -f "$POKE_OUT"
 
-MARIO_KART_FPS=$(run_sdl_replay_with_perf mario_kart "$MARIO_KART_ROM" "$MARIO_KART_REC")
-MARIO_KART_CPU=${CLASS_PCT[cpu]:-0.0}
-MARIO_KART_GPU=${CLASS_PCT[gpu]:-0.0}
-MARIO_KART_BUS=${CLASS_PCT[bus]:-0.0}
+MK_OUT=$(mktemp)
+run_sdl_replay_with_perf mario_kart "$MARIO_KART_ROM" "$MARIO_KART_REC" "$MK_OUT"
+# shellcheck source=/dev/null
+source "$MK_OUT"
+MARIO_KART_FPS="$FPS"
+MARIO_KART_CPU="$CPU_PCT"
+MARIO_KART_GPU="$GPU_PCT"
+MARIO_KART_BUS="$BUS_PCT"
+rm -f "$MK_OUT"
 
 rm -f "$BENCH_LOG"
 END_TS=$(date +%s)

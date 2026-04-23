@@ -24,6 +24,26 @@ struct Options {
     /// original "how fast is idle gameplay" benchmark).
     #[arg(long = "replay", value_name = "PATH")]
     replay: Option<PathBuf>,
+
+    /// Enable the Cranelift dynarec dispatch path (off by default; see
+    /// core/src/gba.rs:108 for the rationale). Requires a --features dynarec
+    /// build of this binary.
+    #[arg(long = "jit")]
+    jit: bool,
+
+    /// Run the full BIOS boot animation instead of skipping it. Matches
+    /// what the SDL frontend does by default — useful when comparing
+    /// fps_bench against SDL under dynarec because skip_bios leaves
+    /// some games in a state they don't reach during normal play.
+    #[arg(long = "full-bios")]
+    full_bios: bool,
+
+    /// Print a 64-bit hash of the framebuffer every N frames to stdout,
+    /// prefixed "fb_hash: frame=N cycle=C hash=HHHHHHHH". Used to diff
+    /// interpreter vs dynarec output: run twice (with and without --jit)
+    /// and the first diverging line narrows the mis-compiled cycle range.
+    #[arg(long = "frame-hash-every", value_name = "N")]
+    frame_hash_every: Option<u64>,
 }
 
 fn main() {
@@ -40,12 +60,37 @@ fn main() {
         .unwrap();
 
     let mut gba = GameBoyAdvance::new(bios.into_boxed_slice(), gamepak, NullAudio::new());
-    gba.skip_bios();
+    if !opts.full_bios {
+        gba.skip_bios();
+    }
+
+    if opts.jit {
+        #[cfg(feature = "dynarec")]
+        {
+            eprintln!("--jit: enabling Cranelift dynarec dispatch");
+            gba.cpu.enable_dynarec();
+        }
+        #[cfg(not(feature = "dynarec"))]
+        eprintln!("--jit requested but binary built without --features dynarec; ignoring");
+    }
 
     match opts.replay {
-        Some(path) => run_replay(&mut gba, &path),
+        Some(path) => run_replay(&mut gba, &path, opts.frame_hash_every),
         None => run_idle(&mut gba),
     }
+}
+
+/// Small non-crypto hash suitable for spotting framebuffer divergence.
+/// FNV-1a over u32 pixels; 64-bit output. Avoids pulling in sha2.
+fn hash_framebuffer(fb: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &px in fb {
+        for b in px.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
 }
 
 /// Original benchmark loop: run forever, print FPS once per second.
@@ -62,7 +107,11 @@ fn run_idle(gba: &mut GameBoyAdvance) {
 /// Replay loop: drive the emulator with recorded keypad edges until the
 /// recording runs out of events AND the emulator's cycle counter passes the
 /// last recorded edge, then report aggregate timing.
-fn run_replay(gba: &mut GameBoyAdvance, path: &std::path::Path) {
+fn run_replay(
+    gba: &mut GameBoyAdvance,
+    path: &std::path::Path,
+    frame_hash_every: Option<u64>,
+) {
     let mut replayer = replay::Replayer::load(path).expect("failed to load recording");
     let last_cycle = replayer.last_cycle();
     eprintln!(
@@ -84,6 +133,18 @@ fn run_replay(gba: &mut GameBoyAdvance, path: &std::path::Path) {
 
         gba.frame();
         frames += 1;
+
+        if let Some(n) = frame_hash_every {
+            if n > 0 && frames % n == 0 {
+                let h = hash_framebuffer(gba.get_frame_buffer());
+                println!(
+                    "fb_hash: frame={} cycle={} hash={:016x}",
+                    frames,
+                    gba.cycles(),
+                    h
+                );
+            }
+        }
 
         if let Some(fps) = fps_counter.tick() {
             println!("FPS: {}", fps);
