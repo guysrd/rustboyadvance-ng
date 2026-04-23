@@ -92,6 +92,9 @@ pub type BusSetNextFetchNonSeqFn = unsafe extern "C" fn(*mut u8);
 /// passing the PC of the next fetch (the one that would have been
 /// NonSeq in scalar but was pre-paid as Seq by `thumb_fetch_n`).
 pub type BusPayThumbFetchExtraNonSeqFn = unsafe extern "C" fn(*mut u8, u32);
+/// Standalone +1I idle cycle — scalar POP/POP{PC} add this at the end
+/// of the whole multi-load (see exec_thumb_push_pop comment "Idle 1 cycle").
+pub type BusIdleCycleFn = unsafe extern "C" fn(*mut u8);
 /// Pay scheduler cycles for N Thumb fetches and update CPU pipeline/pc.
 /// Called once at each compiled Thumb block's entry so cycle accounting
 /// stays parity-correct with the interpreter.
@@ -153,6 +156,15 @@ pub mod trampolines {
     pub unsafe extern "C" fn set_next_fetch_nonseq<I: MemoryInterface>(ctx: *mut u8) {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.next_fetch_access = MemoryAccess::NonSeq;
+    }
+
+    /// Standalone +1I idle cycle. Used by codegen for POP and POP{PC}
+    /// which in scalar add a single idle cycle at the end of the
+    /// multi-load (not per-register, unlike LDR which pairs with
+    /// load_with_idle_32).
+    pub unsafe extern "C" fn idle_cycle<I: MemoryInterface>(ctx: *mut u8) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.idle_cycle();
     }
 
     /// Compensation trampoline for the in-block STORE-followed-by-X
@@ -233,6 +245,7 @@ pub mod trampolines {
             load_with_idle_8: load_with_idle_8::<I>,
             set_next_fetch_nonseq: set_next_fetch_nonseq::<I>,
             pay_thumb_fetch_extra_nonseq: pay_thumb_fetch_extra_nonseq::<I>,
+            idle_cycle: idle_cycle::<I>,
             thumb_fetch_n: thumb_fetch_n::<I>,
         }
     }
@@ -255,6 +268,8 @@ pub struct BusTrampolines {
     /// Pay the `n - s` cycle delta for a single intermediate STORE's
     /// next fetch.
     pub pay_thumb_fetch_extra_nonseq: BusPayThumbFetchExtraNonSeqFn,
+    /// Standalone +1I idle cycle for POP/POP{PC} end-of-load idle.
+    pub idle_cycle: BusIdleCycleFn,
     pub thumb_fetch_n: BusThumbFetchNFn,
 }
 
@@ -286,6 +301,7 @@ struct BusImports {
     load_with_idle_8: FuncId,
     set_next_fetch_nonseq: FuncId,
     pay_thumb_fetch_extra_nonseq: FuncId,
+    idle_cycle: FuncId,
     thumb_fetch_n: FuncId,
 }
 
@@ -332,6 +348,7 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_set_next_fetch_nonseq",  b.set_next_fetch_nonseq as *const u8);
             jit_builder.symbol("rba_pay_thumb_fetch_extra_nonseq",
                                                               b.pay_thumb_fetch_extra_nonseq as *const u8);
+            jit_builder.symbol("rba_idle_cycle",             b.idle_cycle           as *const u8);
             jit_builder.symbol("rba_thumb_fetch_n",          b.thumb_fetch_n        as *const u8);
         }
 
@@ -413,6 +430,13 @@ impl DynarecCompiler {
                 )
                 .expect("declare pay_thumb_fetch_extra_nonseq failed");
 
+            // idle_cycle: extern "C" fn(*mut u8)
+            let mut sig_idle = module.make_signature();
+            sig_idle.params.push(AbiParam::new(ptr_ty));
+            let idle_cycle = module
+                .declare_function("rba_idle_cycle", Linkage::Import, &sig_idle)
+                .expect("declare idle_cycle failed");
+
             // thumb_fetch_n: extern "C" fn(*mut u8, u32, u32)
             let mut sig_fetch_n = module.make_signature();
             sig_fetch_n.params.push(AbiParam::new(ptr_ty));
@@ -431,6 +455,7 @@ impl DynarecCompiler {
                 load_with_idle_8,
                 set_next_fetch_nonseq,
                 pay_thumb_fetch_extra_nonseq,
+                idle_cycle,
                 thumb_fetch_n,
             }
         });
@@ -1273,6 +1298,8 @@ impl DynarecCompiler {
                 self.module.declare_func_in_func(imports.store_32, builder.func);
             let store_8_ref =
                 self.module.declare_func_in_func(imports.store_8, builder.func);
+            let idle_cycle_ref =
+                self.module.declare_func_in_func(imports.idle_cycle, builder.func);
 
             for item in &items {
                 match item {
@@ -1293,7 +1320,7 @@ impl DynarecCompiler {
                     ),
                     MemItem::F14(d) => emit_thumb_format14(
                         &mut builder, gpr_ptr, cpu_ctx,
-                        load_32_ref, store_32_ref,
+                        load_32_ref, store_32_ref, idle_cycle_ref,
                         *d,
                     ),
                 }
@@ -1777,6 +1804,10 @@ impl DynarecCompiler {
             let pay_extra_nonseq_ref = self
                 .module
                 .declare_func_in_func(imports.pay_thumb_fetch_extra_nonseq, builder.func);
+            // +1I idle helper for POP / POP{PC} end-of-load pad.
+            let idle_cycle_ref = self
+                .module
+                .declare_func_in_func(imports.idle_cycle, builder.func);
             let entry_pc_val = builder.ins().iconst(types::I32, entry_pc as i64);
 
             // Pay fetch cycles for the whole block up front and let the
@@ -1809,7 +1840,7 @@ impl DynarecCompiler {
                     ),
                     Body::F14(d) => emit_thumb_format14(
                         builder, gpr_ptr, cpu_ctx,
-                        load_32_ref, store_32_ref, *d,
+                        load_32_ref, store_32_ref, idle_cycle_ref, *d,
                     ),
                 }
             };
@@ -1910,6 +1941,10 @@ impl DynarecCompiler {
                     builder.ins().store(
                         MemFlags::trusted(), new_sp, gpr_ptr, Offset32::new(13 * 4),
                     );
+                    // Scalar POP{PC} adds +1I at the end of the load
+                    // sequence (see exec_thumb_push_pop "// Idle 1 cycle").
+                    // Mirror for parity.
+                    builder.ins().call(idle_cycle_ref, &[cpu_ctx]);
                     let one = builder.ins().iconst(types::I32, 1);
                     builder.def_var(took_var, one);
                 }
@@ -2818,6 +2853,7 @@ fn emit_thumb_format14(
     cpu_ctx: Value,
     load_32_ref: cranelift::codegen::ir::FuncRef,
     store_32_ref: cranelift::codegen::ir::FuncRef,
+    idle_cycle_ref: cranelift::codegen::ir::FuncRef,
     dec: DecodedThumb14,
 ) {
     let count = dec.count();
@@ -2875,6 +2911,14 @@ fn emit_thumb_format14(
     builder.ins().store(
         MemFlags::trusted(), new_sp, gpr_ptr, Offset32::new(13 * 4),
     );
+
+    // Scalar POP (format 14, non-PC) adds a single idle cycle at the
+    // end of the whole multi-load (see thumb/exec.rs:exec_thumb_push_pop
+    // "// Idle 1 cycle"). Mirror that here so cycle accounting matches.
+    // PUSH has no trailing idle cycle.
+    if !dec.push {
+        builder.ins().call(idle_cycle_ref, &[cpu_ctx]);
+    }
 }
 
 /// Emit a Thumb format 11 SP relative LDR/STR (word). Base register is
@@ -4297,6 +4341,8 @@ mod tests {
     /// No-op stand-in. SimpleMemory / TestBus have uniform fetch cost
     /// (no LUT), so the SysBus override doesn't apply here.
     unsafe extern "C" fn test_pay_thumb_fetch_extra_nonseq(_ctx: *mut u8, _pc: u32) {}
+    /// No-op idle trampoline stub; these tests don't observe scheduler state.
+    unsafe extern "C" fn test_idle_cycle(_ctx: *mut u8) {}
 
     fn test_trampolines() -> BusTrampolines {
         BusTrampolines {
@@ -4308,6 +4354,7 @@ mod tests {
             load_with_idle_8: test_load_with_idle_8,
             set_next_fetch_nonseq: test_set_next_fetch_nonseq,
             pay_thumb_fetch_extra_nonseq: test_pay_thumb_fetch_extra_nonseq,
+            idle_cycle: test_idle_cycle,
             thumb_fetch_n: test_thumb_fetch_n,
         }
     }
