@@ -341,7 +341,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 replay_frames += 1;
             }
         }
-        renderer.render(gba.get_frame_buffer());
+        // In replay mode we skip the SDL present. The replay runs flat-out
+        // (no vsync); presenting every frame at 1000+ FPS produces visual
+        // tearing that looks like color corruption but is just the present
+        // racing the backbuffer writes. The emulator's framebuffer is
+        // still correct (verified by fps_bench --frame-hash-every diffs).
+        // Core GPU path + perf record still fire inside gba.frame() — only
+        // the SDL blit is skipped, so the measure script's GPU self-time
+        // isn't affected.
+        if replayer.is_none() {
+            renderer.render(gba.get_frame_buffer());
+        }
 
         if let Some(fps) = fps_counter.tick() {
             let title = format!("{} ({} fps)", rom_name, fps);
