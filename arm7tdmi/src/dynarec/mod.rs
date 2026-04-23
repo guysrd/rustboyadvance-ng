@@ -127,15 +127,25 @@ pub mod trampolines {
     }
 
     /// LDR data-load trampoline: load_32 + the "+1I" idle cycle every
-    /// scalar LDR / LDRH / LDRB charges after the data access.
+    /// scalar LDR / LDRH / LDRB charges after the data access. Applies
+    /// the unaligned-rotate scalar `ldr_word` does: if addr & 3 != 0,
+    /// the returned word is rotated right by `(addr & 3) * 8` bits so
+    /// the byte at `addr` ends up in the low lane, matching what the
+    /// ARM7TDMI actually returns for misaligned LDR.
     pub unsafe extern "C" fn load_with_idle_32<I: MemoryInterface>(
         ctx: *mut u8,
         addr: u32,
     ) -> u32 {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         let v = cpu.load_32(addr, MemoryAccess::NonSeq);
+        let rotated = if addr & 3 != 0 {
+            let rotation = (addr & 3) << 3;
+            v.rotate_right(rotation)
+        } else {
+            v
+        };
         cpu.idle_cycle();
-        v
+        rotated
     }
     pub unsafe extern "C" fn load_with_idle_8<I: MemoryInterface>(
         ctx: *mut u8,
