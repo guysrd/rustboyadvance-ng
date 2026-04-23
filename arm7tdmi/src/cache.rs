@@ -153,6 +153,18 @@ pub struct BlockCache<I: MemoryInterface> {
 #[cfg(feature = "dynarec")]
 const DYNAREC_MIN_BLOCK_LEN: usize = 4;
 
+/// Maximum block length to attempt compilation. Longer blocks suffer
+/// from abort-latency: scalar replay_cached_block checks for IRQ/DMA/
+/// RAM-dirty every-other-instruction and can bail out; a compiled
+/// block runs to completion. On mario-kart this caused measurable
+/// framebuffer divergence from scalar that scaled with block length
+/// (9 diverging fb_hash frames at max=4, 21 at max=8, 20 at max=16+).
+/// Capping at 4 sacrifices some of the JIT's amortization win but
+/// keeps `--jit` visually closer to scalar output. Tunable via
+/// DYNAREC_DEBUG=max=N.
+#[cfg(feature = "dynarec")]
+const DYNAREC_MAX_BLOCK_LEN: usize = 4;
+
 /// Debug knob for bisecting dynarec correctness bugs. Reads the env
 /// var once at first use and caches the parse. Supported values:
 ///
@@ -228,6 +240,9 @@ fn try_compile_thumb<I: MemoryInterface>(
         return None;
     }
     if block.instrs.len() < DYNAREC_MIN_BLOCK_LEN {
+        return None;
+    }
+    if block.instrs.len() > DYNAREC_MAX_BLOCK_LEN {
         return None;
     }
     if let Some(max) = dbg.max_len {
