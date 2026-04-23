@@ -3709,22 +3709,13 @@ fn emit_flag_update(
         },
     );
     let cleared = builder.ins().band(cpsr, mask);
+    let nz = builder.ins().bor(n_shifted, z_shifted);
     if preserve_cv {
-        // Merge cleared | n | z in a left-associative chain. Cranelift
-        // on both x86_64 and arm64 emits an `or; or` sequence either
-        // way, but the reduced tree depth can free a register for the
-        // later block body.
-        let step1 = builder.ins().bor(cleared, n_shifted);
-        builder.ins().bor(step1, z_shifted)
+        builder.ins().bor(cleared, nz)
     } else {
-        // Left-associative OR chain across all four flags. Four
-        // consecutive `or`s map cleanly onto the host register file
-        // vs the prior two-tree `or; or; or; or` which Cranelift may
-        // re-schedule differently.
-        let step1 = builder.ins().bor(cleared, n_shifted);
-        let step2 = builder.ins().bor(step1, z_shifted);
-        let step3 = builder.ins().bor(step2, c_shifted);
-        builder.ins().bor(step3, v_shifted)
+        let cv = builder.ins().bor(c_shifted, v_shifted);
+        let flags = builder.ins().bor(nz, cv);
+        builder.ins().bor(cleared, flags)
     }
 }
 
