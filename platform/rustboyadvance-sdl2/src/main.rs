@@ -348,6 +348,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "dispatch: {} total, {} compiled ({:.2}%), {} interp",
                         total_d, cc, cc_pct, ic,
                     );
+                    let fn_ns = rustboyadvance_core::arm7tdmi::dynarec::trampolines::FETCH_N_TOTAL_NS
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let fn_calls = rustboyadvance_core::arm7tdmi::dynarec::trampolines::FETCH_N_CALLS
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if fn_calls > 0 {
+                        let avg_ns = fn_ns as f64 / fn_calls as f64;
+                        let pct_of_wall = (fn_ns as f64 / 1e9) / elapsed * 100.0;
+                        println!(
+                            "thumb_fetch_n: {} calls, {:.1}ms total ({:.2}% wall), {:.1} ns/call avg",
+                            fn_calls, fn_ns as f64 / 1e6, pct_of_wall, avg_ns,
+                        );
+                    }
                 }
                 // Dump the per-shape execution counters. Output is parsed
                 // by scripts/dynarec_measure.sh to retrain `W_*` weights

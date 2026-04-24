@@ -225,6 +225,16 @@ pub mod trampolines {
     /// The first fetch uses whatever access mode the CPU had on entry
     /// (typically Seq mid-run, NonSeq right after a pipeline flush);
     /// subsequent fetches are all Seq, matching the interpreter.
+    /// Global counters for thumb_fetch_n — gated on the
+    /// DYNAREC_TIME_FETCH_N env var being set at dump time. Using
+    /// relaxed atomic counters (one u64 of ns accumulated + one u64
+    /// of call count) so we can report avg-ns-per-call at replay end
+    /// and decide if thumb_fetch_n is the bottleneck.
+    pub static FETCH_N_TOTAL_NS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub static FETCH_N_CALLS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     pub unsafe extern "C" fn thumb_fetch_n<I: MemoryInterface>(
         ctx: *mut u8,
         first_fetch_pc: u32,
@@ -233,6 +243,8 @@ pub mod trampolines {
         if count == 0 {
             return;
         }
+        let time_it = std::env::var_os("DYNAREC_TIME_FETCH_N").is_some();
+        let t0 = if time_it { Some(std::time::Instant::now()) } else { None };
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         let mut access = cpu.next_fetch_access;
         let mut prev_fetched: u32 = cpu.pipeline[1];
@@ -250,6 +262,11 @@ pub mod trampolines {
         cpu.pipeline[1] = last_fetched;
         cpu.next_fetch_access = MemoryAccess::Seq;
         cpu.pc = first_fetch_pc.wrapping_add(2 * count);
+        if let Some(t0) = t0 {
+            let ns = t0.elapsed().as_nanos() as u64;
+            FETCH_N_TOTAL_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            FETCH_N_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Chain-abort check called from the compiled-block epilogue right
@@ -1927,11 +1944,91 @@ impl DynarecCompiler {
             let count_val = builder.ins().iconst(types::I32, total_count as i64);
             builder.ins().call(fetch_n_ref, &[cpu_ctx, first_fetch_pc_val, count_val]);
 
-            let emit_body = |builder: &mut FunctionBuilder, item: &Body| {
+            // NZCV bitmask: N=8, Z=4, C=2, V=1. Mirrors the table
+            // in the `try_compile_thumb_block` dead-flag pass.
+            fn flag_write_mask_body(item: &Body) -> u8 {
+                match item {
+                    Body::F1(_) => 0b1110, // NZC (shifter carry; V preserved)
+                    Body::F2(_) => 0b1111, // ADD/SUB reg: NZCV
+                    Body::F3(d) => match d.op {
+                        Thumb3Op::Mov => 0b1100, // NZ; preserves CV
+                        _ => 0b1111,
+                    },
+                    Body::F4(d) => match d.op {
+                        Thumb4Op::Tst | Thumb4Op::Cmp | Thumb4Op::Cmn => 0b1111,
+                        _ => 0b1100, // logical ops: NZ
+                    },
+                    Body::F5(d) => match d.op {
+                        Thumb5Op::Cmp => 0b1111,
+                        _ => 0, // MOV/ADD high-reg don't write flags
+                    },
+                    // Memory ops don't write flags.
+                    Body::F9(_) | Body::F11(_) | Body::F14(_) => 0,
+                }
+            }
+            // Dead-flag-write pass. Thumb data-proc instrs always
+            // update flags (there's no optional S-bit); the cost of
+            // emitting the full NZCV computation is ~20 host
+            // instructions per data-proc on x86_64 (per the ASM
+            // dump). If body[k]'s flag writes are all overwritten by
+            // body[k+1] before anything reads them, the write is
+            // dead and we can emit the _no_flags variant (which
+            // just skips the flag math). AL-cond Thumb has no flag
+            // reads between items, so the analysis is a simple
+            // next-writes-superset check per position. Only F2 and
+            // F3 have _no_flags emitters today; other shapes fall
+            // back to full emission even when dead.
+            let body_len = body.len();
+            let mut skip_flags: Vec<bool> = vec![false; body_len];
+            if body_len > 0 {
+                // Tail is always Tail::Body today (branch-terminator
+                // filter in the cache rejects everything else). If
+                // that filter is lifted, the tail's flag read/write
+                // analysis needs extending.
+                let tail_mask = match &tail {
+                    Tail::Body(b) => flag_write_mask_body(b),
+                    Tail::Bx(_) | Tail::PopPc(_) => 0, // don't write NZCV
+                    Tail::PcBranch(_) => 0, // B/Bcc don't write flags
+                };
+                let tail_reads_flags = match &tail {
+                    Tail::PcBranch(br) => br.cond != ArmCond::Al,
+                    _ => false,
+                };
+                for k in 0..body_len {
+                    let cur = flag_write_mask_body(&body[k]);
+                    if cur == 0 {
+                        continue; // mem op; nothing to skip
+                    }
+                    let next = if k + 1 < body_len {
+                        flag_write_mask_body(&body[k + 1])
+                    } else if tail_reads_flags {
+                        0 // live — Bcc will read them
+                    } else {
+                        tail_mask
+                    };
+                    if (cur & !next) == 0 {
+                        skip_flags[k] = true;
+                    }
+                }
+            }
+
+            let emit_body = |builder: &mut FunctionBuilder, item: &Body, skip_flag_write: bool| {
                 match item {
                     Body::F1(d) => emit_thumb_format1(builder, gpr_ptr, cpsr_var, *d),
-                    Body::F2(d) => emit_thumb_format2(builder, gpr_ptr, cpsr_var, *d),
-                    Body::F3(d) => emit_thumb_format3(builder, gpr_ptr, cpsr_var, *d),
+                    Body::F2(d) => {
+                        if skip_flag_write {
+                            emit_thumb_format2_no_flags(builder, gpr_ptr, *d);
+                        } else {
+                            emit_thumb_format2(builder, gpr_ptr, cpsr_var, *d);
+                        }
+                    }
+                    Body::F3(d) => {
+                        if skip_flag_write {
+                            emit_thumb_format3_no_flags(builder, gpr_ptr, *d);
+                        } else {
+                            emit_thumb_format3(builder, gpr_ptr, cpsr_var, *d);
+                        }
+                    }
                     Body::F4(d) => emit_thumb_format4_logical(builder, gpr_ptr, cpsr_var, *d),
                     Body::F5(d) => emit_thumb_format5_non_branch(builder, gpr_ptr, cpsr_var, *d),
                     Body::F9(d) => emit_thumb_format9(
@@ -1949,8 +2046,8 @@ impl DynarecCompiler {
                 }
             };
 
-            for item in &body {
-                emit_body(&mut builder, item);
+            for (k, item) in body.iter().enumerate() {
+                emit_body(&mut builder, item, skip_flags[k]);
                 // Compensate for the under-counted next fetch when this
                 // body item is a STORE: scalar would have charged NonSeq
                 // for the fetch that follows, but `thumb_fetch_n` paid
@@ -1971,7 +2068,11 @@ impl DynarecCompiler {
 
             match &tail {
                 Tail::Body(b) => {
-                    emit_body(&mut builder, b);
+                    // Tail body is the LAST flag-writer in the block;
+                    // the caller (dispatcher, next block's cpsr load)
+                    // sees whatever flags it writes, so we never skip
+                    // its flag update.
+                    emit_body(&mut builder, b, false);
                     // Mirror scalar's `CpuAction::AdvancePC(NonSeq)` for the
                     // post-block fetch: when the tail body item is a STORE
                     // (STR/STRB/PUSH), scalar STR returns NonSeq, so the

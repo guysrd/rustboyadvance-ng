@@ -98,3 +98,37 @@ pub fn dump_arm_imm_block(opcodes: &[u32]) -> Result<String, String> {
         .ok_or("try_compile_imm_block returned None")?;
     disasm_at(func as *const u8)
 }
+
+/// Dump the disassembly for the UNIFIED Thumb compile path (the one
+/// the block cache actually uses in production). Uses stub bus
+/// trampolines, so the disassembly shows real calls into the Rust
+/// trampoline table — useful for seeing what thumb_fetch_n / the
+/// load/store helpers look like in the generated code.
+pub fn dump_thumb_unified_block(opcodes: &[u16], entry_pc: u32) -> Result<String, String> {
+    use crate::cpu::Arm7tdmiCore;
+    use crate::memory::{MemoryAccess, MemoryInterface};
+    // Stub bus where every trampoline is a no-op. We only care about
+    // the emitted code shape, not its runtime behavior.
+    unsafe extern "C" fn stub1(_ctx: *mut u8, _a: u32) -> u32 { 0 }
+    unsafe extern "C" fn stub2(_ctx: *mut u8, _a: u32, _b: u32) {}
+    unsafe extern "C" fn stub_ctx(_ctx: *mut u8) {}
+    unsafe extern "C" fn stub_ctx_r(_ctx: *mut u8) -> u32 { 0 }
+    unsafe extern "C" fn stub_ctx_pc(_ctx: *mut u8, _pc: u32) {}
+    unsafe extern "C" fn stub_fetch_n(_ctx: *mut u8, _pc: u32, _count: u32) {}
+    let trampolines = super::BusTrampolines {
+        load_32: stub1, store_32: stub2, load_8: stub1, store_8: stub2,
+        load_with_idle_32: stub1, load_with_idle_8: stub1,
+        set_next_fetch_nonseq: stub_ctx,
+        pay_thumb_fetch_extra_nonseq: stub_ctx_pc,
+        idle_cycle: stub_ctx,
+        thumb_fetch_n: stub_fetch_n,
+        chain_abort_check: stub_ctx_r,
+    };
+    let _ = std::marker::PhantomData::<(Arm7tdmiCore<crate::SimpleMemory>, MemoryAccess)>;
+    let _ = std::any::type_name::<dyn MemoryInterface>;
+    let mut compiler = DynarecCompiler::new_with_bus(trampolines);
+    let func = compiler
+        .try_compile_thumb_mem_block_with_branch(opcodes, entry_pc, None)
+        .ok_or("try_compile_thumb_mem_block_with_branch returned None")?;
+    disasm_at(func as *const u8)
+}

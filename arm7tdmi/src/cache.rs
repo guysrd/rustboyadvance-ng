@@ -333,16 +333,17 @@ fn try_compile_thumb<I: MemoryInterface>(
     if raws.is_empty() {
         return None;
     }
-    // Reject branch-terminated blocks in production. Latest attempt
-    // at lifting this filter (2026-04-24): got compile rate 0%→3%,
-    // 2.2% of dispatches went compiled on pokeemerald, but overall
-    // fps regressed 4.5%. Dispatch-count diagnostic showed compiled
-    // dispatch is ~3x slower than interp dispatch per-call, so even
-    // at 2% of dispatches the compiled path loses. Chain-linking
-    // can't save this — the per-dispatch cost is the bottleneck.
-    // Fix the compiled-block speed first (thumb_fetch_n trampoline
-    // overhead + I-cache spread across 800 JIT fns is the leading
-    // suspect), then re-try lifting this filter.
+    // Reject branch-terminated blocks in production. Filter-lift
+    // attempts have consistently net-regressed fps because compiled
+    // blocks are ~3× slower per-dispatch than scalar cached-interp
+    // replay (measured 2026-04-24 via the dispatch-count diagnostic:
+    // raising compile rate 0→3% costs 4.5% fps). Chaining can't
+    // recover this — even with chain emission active and compile
+    // rate at 3%, interleaved runs show chain ≈ no-chain within
+    // noise because chain-link rate stays ~2% of compiled blocks,
+    // too low to amortize the per-compiled-block slowdown. Fix the
+    // compiled-block codegen speed first (see `dynarec_compile_rate`
+    // memory for the ordered unlocks), then re-try this.
     if raws
         .last()
         .map(|&op| is_thumb_branch_opcode(op))
