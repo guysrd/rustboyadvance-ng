@@ -538,10 +538,13 @@ impl<I: MemoryInterface> BlockCache<I> {
     #[inline]
     pub fn record_instr(&mut self, instr: DecodedInstr<I>) {
         if let Some((_, block)) = &mut self.recording {
-            // Cap block length to avoid runaway recordings on pathological code
-            // paths (long loops that never pipeline-flush would just trace forever).
-            // 64 is arbitrary but comfortably larger than typical basic blocks.
-            if block.instrs.len() < 64 {
+            // Recording length cap — prevents runaway recordings on
+            // pathological code (a tight loop with no pipeline flush
+            // would otherwise trace forever). Raised from 64 to 16864
+            // per user directive so `DYNAREC_MAX_BLOCK_LEN = 16834` is
+            // actually reachable: previously the 64-cap here was the
+            // *real* limit regardless of what MAX was set to.
+            if block.instrs.len() < 16864 {
                 block.instrs.push(instr);
             }
         }
