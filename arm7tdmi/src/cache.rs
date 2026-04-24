@@ -329,11 +329,18 @@ fn try_compile_thumb<I: MemoryInterface>(
         return None;
     }
     let mut raws: Vec<u16> = Vec::with_capacity(block.instrs.len());
+    let mut has_arm = false;
     for instr in &block.instrs {
         match instr {
             DecodedInstr::Thumb { raw, .. } => raws.push(*raw),
-            DecodedInstr::Arm { .. } => return None,
+            DecodedInstr::Arm { .. } => { has_arm = true; break; }
         }
+    }
+    if has_arm {
+        if std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
+            eprintln!("REJECT_ARM entry_pc=0x{:x} len={}", block.entry_pc, block.instrs.len());
+        }
+        return None;
     }
     if raws.is_empty() {
         return None;
@@ -424,11 +431,22 @@ fn try_compile_thumb<I: MemoryInterface>(
     } else {
         Some(Rc::new(AtomicUsize::new(0)))
     };
-    let func = compiler.try_compile_thumb_mem_block_with_branch(
+    let func_opt = compiler.try_compile_thumb_mem_block_with_branch(
         &raws,
         block_start_addr,
         chain_slot.as_deref(),
-    )?;
+    );
+    if func_opt.is_none() && std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
+        let last = raws.last().copied().unwrap_or(0);
+        eprintln!(
+            "REJECT_COMPILE entry_pc=0x{:x} len={} last={:04x} raws=[{}]",
+            block.entry_pc,
+            raws.len(),
+            last,
+            raws.iter().map(|o| format!("{:04x}", o)).collect::<Vec<_>>().join(","),
+        );
+    }
+    let func = func_opt?;
     Some(CompileResult { func, chain_slot })
 }
 

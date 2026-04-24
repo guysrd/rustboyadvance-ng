@@ -2115,6 +2115,10 @@ impl DynarecCompiler {
         }
         enum Tail {
             Bx(DecodedThumbBx),
+            /// Thumb format 5 MOV PC, Rm / ADD PC, Rm. Register-
+            /// indirect branch that stays in Thumb mode (scalar
+            /// doesn't mask bit 0 or touch CPSR.state).
+            MovPc { op: Thumb5Op, rs: i32, rd_is_pc: bool, rd: i32, hi_pc: u32 },
             PcBranch(DecodedThumbPcBranch),
             PopPc(DecodedThumb14),
             /// BL pair — the last TWO opcodes together form the long
@@ -2197,9 +2201,19 @@ impl DynarecCompiler {
                 None
             }
         }
-        fn classify_tail(op: u16) -> Option<Tail> {
+        fn classify_tail(op: u16, tail_pc: u32) -> Option<Tail> {
             if let Some(d) = DynarecCompiler::decode_thumb_bx(op) {
                 Some(Tail::Bx(d))
+            } else if let Some((mnemonic, rd, rs)) =
+                DynarecCompiler::decode_thumb_format5_pc_branch(op)
+            {
+                Some(Tail::MovPc {
+                    op: mnemonic,
+                    rs,
+                    rd_is_pc: true,
+                    rd,
+                    hi_pc: tail_pc,
+                })
             } else if let Some(d) = DynarecCompiler::decode_thumb_format18(op) {
                 Some(Tail::PcBranch(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format16(op) {
@@ -2234,7 +2248,8 @@ impl DynarecCompiler {
             (&opcodes[..body_end], Tail::BlPair { hi, lo, hi_pc, lo_pc })
         } else {
             let (bo, tail_slot) = opcodes.split_at(opcodes.len() - 1);
-            (bo, classify_tail(tail_slot[0])?)
+            let tail_pc = entry_pc.wrapping_add((2 * bo.len()) as u32);
+            (bo, classify_tail(tail_slot[0], tail_pc)?)
         };
         let mut body: Vec<Body> = Vec::with_capacity(body_opcodes.len());
         for &op in body_opcodes {
@@ -2394,6 +2409,7 @@ impl DynarecCompiler {
                     Tail::Bx(_) | Tail::PopPc(_) => 0, // don't write NZCV
                     Tail::PcBranch(_) => 0, // B/Bcc don't write flags
                     Tail::BlPair { .. } => 0, // BL writes LR/PC, not NZCV
+                    Tail::MovPc { .. } => 0, // MOV/ADD PC,Rm write PC, not NZCV
                 };
                 let tail_reads_flags = match &tail {
                     Tail::PcBranch(br) => br.cond != ArmCond::Al,
@@ -2808,6 +2824,36 @@ impl DynarecCompiler {
                     let one = builder.ins().iconst(types::I32, 1);
                     builder.def_var(took_var, one);
                 }
+                Tail::MovPc { op: mop, rs, rd_is_pc: _, rd: _, hi_pc } => {
+                    // Scalar MOV PC: self.pc = op2. Scalar ADD PC:
+                    //   op1 = gpr[PC = 15] (which reads pc_thumb + 4 semantics).
+                    //   self.pc = op1 + op2.
+                    // We don't support Rs=R15 (rejected at decode) — so op2
+                    // is a normal gpr load. For ADD PC, scalar reads
+                    // gpr[REG_PC] which is self.pc = instr_addr + 4
+                    // (pipeline-head). At codegen, instr_addr = hi_pc.
+                    // Fold pc_value = hi_pc + 4 for ADD's Rd-as-PC read.
+                    let op2 = builder.ins().load(
+                        types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(rs * 4),
+                    );
+                    let pc_before = match mop {
+                        Thumb5Op::Add => {
+                            let pc_const = builder
+                                .ins()
+                                .iconst(types::I32, (hi_pc.wrapping_add(4)) as i64);
+                            builder.ins().iadd(pc_const, op2)
+                        }
+                        Thumb5Op::Mov => op2,
+                        Thumb5Op::Cmp => unreachable!(),
+                    };
+                    // Force Thumb bit so caller's thumb_bit check stays in
+                    // Thumb. Scalar stores pc unmodified; caller's reload
+                    // uses self.pc & !1 via our thumb_bit path.
+                    let pc_thumb = builder.ins().bor_imm(pc_before, 1);
+                    builder.ins().store(MemFlags::trusted(), pc_thumb, pc_out, 0);
+                    let one = builder.ins().iconst(types::I32, 1);
+                    builder.def_var(took_var, one);
+                }
                 Tail::BlPair { hi, lo, hi_pc, lo_pc } => {
                     // Scalar first-half: LR = (hi_pc + 4) + hi.lr_delta.
                     //   (pc at first-half exec = hi_pc + 4 in Thumb pipeline-head.)
@@ -3103,6 +3149,41 @@ impl DynarecCompiler {
             _ => unreachable!(),
         };
         Some(DecodedThumb5 { op: mnemonic, rd, rs })
+    }
+
+    /// Thumb format 5 MOV PC,Rm / ADD PC,Rm — register-indirect
+    /// branches that stay in Thumb mode (scalar `set_reg(15, …)` +
+    /// `reload_pipeline16()`). CMP with Rd=15 doesn't exist
+    /// semantically (flag op), so only Add/Mov with Rd=R15.
+    fn decode_thumb_format5_pc_branch(op: u16) -> Option<(Thumb5Op, i32, i32)> {
+        if (op >> 10) & 0b111111 != 0b010001 {
+            return None;
+        }
+        let oo = (op >> 8) & 0b11;
+        if oo == 0b11 {
+            return None; // BX handled elsewhere
+        }
+        let h1 = (op >> 7) & 1;
+        let h2 = (op >> 6) & 1;
+        let rd_raw = op & 0b111;
+        let rs_raw = (op >> 3) & 0b111;
+        let rd = (rd_raw | (h1 << 3)) as i32;
+        let rs = (rs_raw | (h2 << 3)) as i32;
+        if rd != 15 {
+            return None;
+        }
+        // Rs=15 would mean reading from PC; scalar handles via pc_thumb().
+        // Reject for now (uncommon — typically Rs=0..14).
+        if rs == 15 {
+            return None;
+        }
+        let mnemonic = match oo {
+            0b00 => Thumb5Op::Add,
+            0b01 => return None, // CMP PC is a no-op flag op we don't branch on
+            0b10 => Thumb5Op::Mov,
+            _ => unreachable!(),
+        };
+        Some((mnemonic, rd, rs))
     }
 
     /// Classify a Thumb 16 bit opcode as format 1 (LSL/LSR/ASR Rd, Rs,
