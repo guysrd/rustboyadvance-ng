@@ -2521,7 +2521,7 @@ impl DynarecCompiler {
                         _ => 0b1111,
                     },
                     Body::F4(d) => match d.op {
-                        Thumb4Op::Tst | Thumb4Op::Cmp | Thumb4Op::Cmn => 0b1111,
+                        Thumb4Op::Tst | Thumb4Op::Cmp | Thumb4Op::Cmn | Thumb4Op::Neg => 0b1111,
                         _ => 0b1100, // logical ops: NZ
                     },
                     Body::F5(d) => match d.op {
@@ -3694,8 +3694,9 @@ impl DynarecCompiler {
             0b1100 => Thumb4Op::Orr,
             0b1110 => Thumb4Op::Bic,
             0b1111 => Thumb4Op::Mvn,
-            // Unsupported: 0010 LSL, 0011 LSR, 0100 ASR, 0101 ADC,
-            // 0110 SBC, 0111 ROR, 1001 NEG, 1101 MUL.
+            0b1001 => Thumb4Op::Neg,
+            // Still unsupported: 0010 LSL, 0011 LSR, 0100 ASR,
+            // 0101 ADC, 0110 SBC, 0111 ROR, 1101 MUL.
             _ => return None,
         };
         Some(DecodedThumb4 { op: mnemonic, rd, rs })
@@ -4013,7 +4014,7 @@ struct DecodedThumb2 {
 
 /// Thumb format 4 logical subset mnemonic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Thumb4Op { And, Eor, Orr, Bic, Mvn, Tst, Cmp, Cmn }
+enum Thumb4Op { And, Eor, Orr, Bic, Mvn, Tst, Cmp, Cmn, Neg }
 
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb4 {
@@ -5127,6 +5128,14 @@ fn emit_thumb_format4_logical(
         Thumb4Op::Tst => (builder.ins().band(rd_val, rs_val), DpOp::Tst, false),
         Thumb4Op::Cmp => (builder.ins().isub(rd_val, rs_val), DpOp::Cmp, false),
         Thumb4Op::Cmn => (builder.ins().iadd(rd_val, rs_val), DpOp::Cmn, false),
+        Thumb4Op::Neg => {
+            // Rd = 0 - Rs. Flags computed with rn=0, op2=Rs, result.
+            // Note: emit_flag_update reads rd_val captured above as
+            // rn, but NEG's "rn" is 0 — handle via special-case below.
+            let zero = builder.ins().iconst(types::I32, 0);
+            let r = builder.ins().isub(zero, rs_val);
+            (r, DpOp::Sub, true)
+        }
     };
 
     if writeback {
@@ -5138,7 +5147,13 @@ fn emit_thumb_format4_logical(
         );
     }
 
-    let new_cpsr = emit_flag_update(builder, cpsr_var, dp_equivalent, rd_val, rs_val, result);
+    // For NEG, rn for flag computation is 0 (not rd_val). Everything
+    // else uses rd_val as the left operand.
+    let rn_for_flags = match dec.op {
+        Thumb4Op::Neg => builder.ins().iconst(types::I32, 0),
+        _ => rd_val,
+    };
+    let new_cpsr = emit_flag_update(builder, cpsr_var, dp_equivalent, rn_for_flags, rs_val, result);
     builder.def_var(cpsr_var, new_cpsr);
 }
 
