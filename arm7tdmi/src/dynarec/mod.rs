@@ -1645,12 +1645,12 @@ impl DynarecCompiler {
                     MemItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F9(d) => emit_thumb_format9(
-                        &mut builder, gpr_ptr, cpu_ctx,
+                        &mut builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref,
                         *d,
                     ),
                     MemItem::F11(d) => emit_thumb_format11(
-                        &mut builder, gpr_ptr, cpu_ctx,
+                        &mut builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_32_ref, store_32_ref,
                         *d,
                     ),
@@ -2571,16 +2571,16 @@ impl DynarecCompiler {
                         builder, gpr_ptr, cpu_ctx, load_idle_32_ref, *d, instr_pc,
                     ),
                     Body::F7(d) => emit_thumb_format7(
-                        builder, gpr_ptr, cpu_ctx,
+                        builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
                     ),
                     Body::F8(d) => emit_thumb_format8(
-                        builder, gpr_ptr, cpu_ctx,
+                        builder, gpr_ptr, cpu_ctx, cpsr_var,
                         store_16_ref, load_idle_16_ref, load_idle_8_ref, load_idle_sh_ref,
                         *d,
                     ),
                     Body::F9(d) => emit_thumb_format9(
-                        builder, gpr_ptr, cpu_ctx,
+                        builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
                     ),
                     Body::F10(d) => emit_thumb_format10(
@@ -2588,7 +2588,7 @@ impl DynarecCompiler {
                         load_idle_16_ref, store_16_ref, *d,
                     ),
                     Body::F11(d) => emit_thumb_format11(
-                        builder, gpr_ptr, cpu_ctx,
+                        builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_32_ref, store_32_ref, *d,
                     ),
                     Body::F12(d) => emit_thumb_format12(builder, gpr_ptr, *d, instr_pc),
@@ -4303,6 +4303,7 @@ fn emit_thumb_format11(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
     cpu_ctx: Value,
+    cpsr_var: Variable,
     load_idle_32_ref: cranelift::codegen::ir::FuncRef,
     store_32_ref: cranelift::codegen::ir::FuncRef,
     dec: DecodedThumb11,
@@ -4319,6 +4320,7 @@ fn emit_thumb_format11(
         let call = builder.ins().call(load_idle_32_ref, &[cpu_ctx, addr]);
         let v = builder.inst_results(call)[0];
         builder.ins().store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+        emit_ldr_word_cpsr_c_update(builder, cpsr_var, addr, v);
     } else {
         let rd_val = builder.ins().load(
             types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
@@ -4369,6 +4371,7 @@ fn emit_thumb_format8(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
     cpu_ctx: Value,
+    cpsr_var: Variable,
     store_16_ref: cranelift::codegen::ir::FuncRef,
     load_idle_16_ref: cranelift::codegen::ir::FuncRef,
     load_idle_8_ref: cranelift::codegen::ir::FuncRef,
@@ -4401,12 +4404,15 @@ fn emit_thumb_format8(
                 .store(MemFlags::trusted(), signed, gpr_ptr, Offset32::new(dec.rd * 4));
         }
         0b10 => {
-            // LDRH
+            // LDRH — same misaligned-ROR CPSR.C update as F10 LDRH
+            // (scalar `ldr_half` sets CPSR.C from ROR carry-out when
+            // addr is odd).
             let call = builder.ins().call(load_idle_16_ref, &[cpu_ctx, addr]);
             let v = builder.inst_results(call)[0];
             builder
                 .ins()
                 .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+            emit_ldr_half_cpsr_c_update(builder, cpsr_var, addr, v);
         }
         0b11 => {
             // LDSH — trampoline handles the aligned/misaligned
@@ -4449,6 +4455,55 @@ fn emit_thumb_format8_ldsb(
 }
 
 /// Thumb format 10 halfword LDRH/STRH imm. Address = Rs + offset.
+/// Shared CPSR.C update for misaligned word LDR (F6/F7/F9/F11) —
+/// scalar `ldr_word` rotates the loaded value by `(addr & 3) << 3`
+/// and writes the ROR carry-out (bit 31 of the rotated result) into
+/// CPSR.C. The load_with_idle_32 trampoline did the rotation; this
+/// helper emits the conditional CPSR.C IR update on the misaligned
+/// path (addr & 3 != 0), leaving cpsr_var unchanged on aligned.
+fn emit_ldr_word_cpsr_c_update(
+    builder: &mut FunctionBuilder,
+    cpsr_var: Variable,
+    addr: Value,
+    rotated_val: Value,
+) {
+    let addr_misaligned = builder.ins().band_imm(addr, 3);
+    let mis_nz = builder.ins().icmp_imm(IntCC::NotEqual, addr_misaligned, 0);
+    let old_cpsr = builder.use_var(cpsr_var);
+    let new_c_bit = builder.ins().ushr_imm(rotated_val, 31);
+    let new_c_shifted = builder.ins().ishl_imm(new_c_bit, 29);
+    let cpsr_c_cleared = builder
+        .ins()
+        .band_imm(old_cpsr, !(1i64 << 29));
+    let new_cpsr = builder.ins().bor(cpsr_c_cleared, new_c_shifted);
+    let final_cpsr = builder.ins().select(mis_nz, new_cpsr, old_cpsr);
+    builder.def_var(cpsr_var, final_cpsr);
+}
+
+/// Shared CPSR.C update for misaligned halfword LDR (F8 LDRH / F10
+/// LDRH) — scalar `ldr_half` rotates by 8 on odd addr and writes
+/// the ROR carry-out (bit 31 of rotated = bit 7 of loaded u16) to
+/// CPSR.C. Analogous to `emit_ldr_word_cpsr_c_update` but with
+/// `addr & 1 != 0` as the misaligned check.
+fn emit_ldr_half_cpsr_c_update(
+    builder: &mut FunctionBuilder,
+    cpsr_var: Variable,
+    addr: Value,
+    rotated_val: Value,
+) {
+    let addr_odd = builder.ins().band_imm(addr, 1);
+    let odd_nz = builder.ins().icmp_imm(IntCC::NotEqual, addr_odd, 0);
+    let old_cpsr = builder.use_var(cpsr_var);
+    let new_c_bit = builder.ins().ushr_imm(rotated_val, 31);
+    let new_c_shifted = builder.ins().ishl_imm(new_c_bit, 29);
+    let cpsr_c_cleared = builder
+        .ins()
+        .band_imm(old_cpsr, !(1i64 << 29));
+    let new_cpsr = builder.ins().bor(cpsr_c_cleared, new_c_shifted);
+    let final_cpsr = builder.ins().select(odd_nz, new_cpsr, old_cpsr);
+    builder.def_var(cpsr_var, final_cpsr);
+}
+
 fn emit_thumb_format10(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
@@ -4472,25 +4527,7 @@ fn emit_thumb_format10(
         builder
             .ins()
             .store(nontrusted, v, gpr_ptr, Offset32::new(dec.rd * 4));
-        // Scalar `ldr_half` on misaligned addr rotates the loaded
-        // halfword right by 8 AND writes the ROR carry-out (which
-        // equals bit 31 of the rotated result) to CPSR.C. The
-        // trampoline already did the rotation; mirror the CPSR.C
-        // update here so flags match scalar exactly. cpsr stays in
-        // the block's SSA variable throughout (the trampoline can't
-        // touch it — any mutation of cpu.cpsr there gets clobbered
-        // by the block-exit flush of cpsr_var).
-        let addr_odd = builder.ins().band_imm(addr, 1);
-        let odd_nz = builder.ins().icmp_imm(IntCC::NotEqual, addr_odd, 0);
-        let old_cpsr = builder.use_var(cpsr_var);
-        let new_c_bit = builder.ins().ushr_imm(v, 31);
-        let new_c_shifted = builder.ins().ishl_imm(new_c_bit, 29);
-        let cpsr_c_cleared = builder
-            .ins()
-            .band_imm(old_cpsr, !(1i64 << 29));
-        let new_cpsr = builder.ins().bor(cpsr_c_cleared, new_c_shifted);
-        let final_cpsr = builder.ins().select(odd_nz, new_cpsr, old_cpsr);
-        builder.def_var(cpsr_var, final_cpsr);
+        emit_ldr_half_cpsr_c_update(builder, cpsr_var, addr, v);
     } else {
         let rd_val = builder.ins().load(
             types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
@@ -4573,6 +4610,7 @@ fn emit_thumb_format7(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
     cpu_ctx: Value,
+    cpsr_var: Variable,
     load_idle_32_ref: cranelift::codegen::ir::FuncRef,
     store_32_ref: cranelift::codegen::ir::FuncRef,
     load_idle_8_ref: cranelift::codegen::ir::FuncRef,
@@ -4599,6 +4637,12 @@ fn emit_thumb_format7(
             builder
                 .ins()
                 .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+            // Scalar `ldr_word` on misaligned addr rotates by
+            // (addr & 3) << 3 and writes the ROR carry-out (bit 31
+            // of the rotated result) to CPSR.C. The load_with_idle_32
+            // trampoline did the rotation; mirror the CPSR.C update
+            // here since the trampoline can't touch cpsr_var.
+            emit_ldr_word_cpsr_c_update(builder, cpsr_var, addr, v);
         }
         (true, true) => {
             let call = builder.ins().call(load_idle_8_ref, &[cpu_ctx, addr]);
@@ -4678,6 +4722,7 @@ fn emit_thumb_format9(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
     cpu_ctx: Value,
+    cpsr_var: Variable,
     load_idle_32_ref: cranelift::codegen::ir::FuncRef,
     store_32_ref: cranelift::codegen::ir::FuncRef,
     load_idle_8_ref: cranelift::codegen::ir::FuncRef,
@@ -4698,6 +4743,7 @@ fn emit_thumb_format9(
             let call = builder.ins().call(load_idle_32_ref, &[cpu_ctx, addr]);
             let v = builder.inst_results(call)[0];
             builder.ins().store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+            emit_ldr_word_cpsr_c_update(builder, cpsr_var, addr, v);
         }
         (true, true) => {
             let call = builder.ins().call(load_idle_8_ref, &[cpu_ctx, addr]);
