@@ -642,10 +642,14 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         //     `pay_thumb_fetch_extra_nonseq` trampoline call per body
         //     STORE, charging the missing `(n - s)` cycles for the next
         //     fetch. Address is `entry_pc` (page-invariant within a block).
+        // ARM blocks compile too (single-instruction B/Bcc only as of
+        // this change; more shapes follow). Compiled-block dispatch is
+        // mode-agnostic — the took bit-0 path uses pc_out[0] as the
+        // next-state Thumb flag, which works for ARM (target bit 0
+        // clear → ARM) and Thumb (Thumb bit set on PC writes) alike.
         #[cfg(feature = "dynarec")]
         if self.dynarec_dispatch_enabled
             && let Some(compiled) = block.compiled
-            && entry_thumb
         {
             self.dispatch_compiled_count = self.dispatch_compiled_count.wrapping_add(1);
             // Bump the per-shape execution counter under `shape_profile`

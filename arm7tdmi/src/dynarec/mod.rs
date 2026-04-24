@@ -3534,18 +3534,158 @@ impl DynarecCompiler {
         })
     }
 
-    /// ARM-mode block compile entry point. Placeholder until per-iter
-    /// ARM codegen lands. Returning `None` makes cache.rs treat the
-    /// block exactly like the old REJECT_ARM path (interpreter
-    /// fallback), so wiring the route doesn't change behavior.
+    /// ARM-mode block compile entry point. First-cut: handles only
+    /// single-instruction blocks ending in `B` / `Bcc` (no `BL`). Body
+    /// shapes, `BX`, and multi-instr blocks land in follow-ups.
+    ///
+    /// `entry_pc` is the address of the first ARM instruction in the
+    /// block (caller in cache.rs has subtracted the pipeline-head 8).
+    /// Branch-target folding uses `entry_pc + 8 + signed_offset` per
+    /// ARM pipeline convention (PC-as-operand reads as +8 ahead).
     pub fn try_compile_arm_block(
         &mut self,
-        _raws: &[u32],
-        _entry_pc: u32,
+        raws: &[u32],
+        entry_pc: u32,
         _chain_slot: Option<&crate::cache::ChainSlot>,
     ) -> Option<extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u8) -> u32>
     {
-        None
+        if raws.len() != 1 {
+            return None;
+        }
+        let imports = self.bus_imports?;
+
+        let insn = raws[0];
+        let cond_bits = ((insn >> 28) & 0xF) as u8;
+        // Cond NV (0xF) is `unpredictable` on ARMv4 — reject.
+        if cond_bits == 0xF {
+            return None;
+        }
+        // Match B / Bcc encoding: bits[27:25] = 0b101, bit[24] = 0 (B),
+        // bit[24] = 1 would be BL (writes LR; not supported here yet).
+        if (insn >> 25) & 0x7 != 0b101 || (insn >> 24) & 0x1 != 0 {
+            return None;
+        }
+        let cond = ArmCond::from_bits(cond_bits);
+        // Sign-extend imm24, shift left 2 to get a byte offset.
+        let imm24 = insn & 0x00FF_FFFF;
+        let signed = (((imm24 as i32) << 8) >> 8) << 2;
+        let target_pc = (entry_pc as i64 + 8 + signed as i64) as u32;
+
+        let ptr_type = self.module.isa().pointer_type();
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(ptr_type)); // gpr
+        sig.params.push(AbiParam::new(ptr_type)); // cpsr
+        sig.params.push(AbiParam::new(ptr_type)); // pc_out
+        sig.params.push(AbiParam::new(ptr_type)); // cpu_ctx
+        sig.returns.push(AbiParam::new(types::I32));
+
+        self.next_id += 1;
+        let name = format!("dynarec_arm_block_{}", self.next_id);
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .expect("declare arm block fn failed");
+        self.ctx.func.signature = sig;
+
+        {
+            let mut builder =
+                FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+
+            let cpsr_ptr = builder.block_params(entry)[1];
+            let pc_out = builder.block_params(entry)[2];
+            let cpu_ctx = builder.block_params(entry)[3];
+
+            let cpsr_var = builder.declare_var(types::I32);
+            let cpsr_initial = builder.ins().load(
+                types::I32, MemFlags::trusted(), cpsr_ptr, 0,
+            );
+            builder.def_var(cpsr_var, cpsr_initial);
+
+            let took_var = builder.declare_var(types::I32);
+            let zero_i32 = builder.ins().iconst(types::I32, 0);
+            builder.def_var(took_var, zero_i32);
+
+            // Per-iter fetch (1 iter): addr = entry_pc + 8 (2 ARM
+            // instructions ahead of the about-to-execute branch).
+            // hint = 2 → trampoline reads cpu.next_fetch_access.
+            let arm_fetch_ref = self
+                .module
+                .declare_func_in_func(imports.arm_fetch_charge_shift, builder.func);
+            let fetch_addr = builder
+                .ins()
+                .iconst(types::I32, entry_pc.wrapping_add(8) as i64);
+            let hint = builder.ins().iconst(types::I32, 2);
+            builder.ins().call(arm_fetch_ref, &[cpu_ctx, fetch_addr, hint]);
+
+            if cond == ArmCond::Al {
+                // Unconditional B: always taken. Dispatcher reload at
+                // pc_out handles the post-branch pipeline + access state.
+                let target_val = builder.ins().iconst(types::I32, target_pc as i64);
+                builder.ins().store(MemFlags::trusted(), target_val, pc_out, 0);
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.def_var(took_var, one);
+            } else {
+                // Bcc: cond check at runtime (cond may differ from
+                // record-time outcome).
+                let cond_pass = emit_cond_check(&mut builder, cpsr_var, cond);
+                let taken_blk = builder.create_block();
+                let fallthrough_blk = builder.create_block();
+                let merge_blk = builder.create_block();
+                builder.ins().brif(cond_pass, taken_blk, &[], fallthrough_blk, &[]);
+
+                builder.switch_to_block(taken_blk);
+                builder.seal_block(taken_blk);
+                let target_val = builder.ins().iconst(types::I32, target_pc as i64);
+                builder.ins().store(MemFlags::trusted(), target_val, pc_out, 0);
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.def_var(took_var, one);
+                builder.ins().jump(merge_blk, &[]);
+
+                // Cond-false fall-through: scalar's Bcc handler returns
+                // AdvancePC(Seq). took stays 0 (no dispatcher reload),
+                // pc was already advanced by the per-iter fetch.
+                builder.switch_to_block(fallthrough_blk);
+                builder.seal_block(fallthrough_blk);
+                let set_access_ref = self
+                    .module
+                    .declare_func_in_func(imports.set_next_fetch_access, builder.func);
+                let seq_hint = builder.ins().iconst(types::I32, 1);
+                builder.ins().call(set_access_ref, &[cpu_ctx, seq_hint]);
+                builder.ins().jump(merge_blk, &[]);
+
+                builder.switch_to_block(merge_blk);
+                builder.seal_block(merge_blk);
+            }
+
+            // CPSR not modified by B/Bcc; round-trip preserves bits.
+            let cpsr_final = builder.use_var(cpsr_var);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), cpsr_final, cpsr_ptr, 0);
+
+            let took = builder.use_var(took_var);
+            builder.ins().return_(&[took]);
+            builder.finalize();
+        }
+
+        self.module
+            .define_function(func_id, &mut self.ctx)
+            .expect("define arm block fn failed");
+        self.module.clear_context(&mut self.ctx);
+        self.module
+            .finalize_definitions()
+            .expect("finalize_definitions failed");
+        let code = self.module.get_finalized_function(func_id);
+        Some(unsafe {
+            std::mem::transmute::<
+                *const u8,
+                extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u8) -> u32,
+            >(code)
+        })
     }
 
     /// Classify a POP {regs, pc} (format 14 with L=1, R=1). This is a

@@ -419,7 +419,10 @@ fn try_compile_thumb<I: MemoryInterface>(
         } else {
             Some(Rc::new(ChainSlot::default()))
         };
-        let block_start_addr = block.entry_pc & !3;
+        // ARM: block.entry_pc = first_instr_addr + 8 (pipeline-head pc).
+        // The compile fn wants first_instr_addr so PC-relative branch
+        // targets fold correctly (`target = entry_pc + 8 + offset`).
+        let block_start_addr = block.entry_pc.wrapping_sub(8);
         let func_opt = compiler.try_compile_arm_block(
             &arm_raws,
             block_start_addr,
