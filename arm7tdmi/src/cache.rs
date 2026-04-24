@@ -341,6 +341,19 @@ fn try_compile_thumb<I: MemoryInterface>(
     // better perf) but that regressed both divergence (0->4) and FPS
     // (471->455) — the `no-branch` filter is strictly better here.
     //
+    // Tried again 2026-04-24 with chain-linking infrastructure in
+    // place, expecting compiled Bcc/B blocks to win via chain
+    // amortization. Result: got compile rate 0% → 2.4% pokeemerald /
+    // 3.3% MK, but fps REGRESSED 558→534 (pokeemerald) / 396→374 (MK)
+    // on real SDL. Chain-link rate on those compiled blocks stayed
+    // ~1.4-2.3%, too low to amortize the per-compiled-block dispatch
+    // overhead. Root cause: compiled blocks as currently emitted
+    // are slower than scalar cached-interp replay for this class of
+    // blocks, likely because thumb_fetch_n + compiled body doesn't
+    // beat scalar's inlined per-instr load_16 + LUT dispatch. Until
+    // compiled blocks are faster per-block, lifting the filter is
+    // net-negative.
+    //
     // DYNAREC_DEBUG=no-branch is a superset of this filter, kept for
     // bisection.
     if raws
