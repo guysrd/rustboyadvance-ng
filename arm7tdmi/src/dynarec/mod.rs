@@ -1644,6 +1644,33 @@ impl DynarecCompiler {
         })
     }
 
+    /// Thumb format 15: LDM / STM IA base-write-back register list.
+    /// Encoding: `1100_L_Rb_rlist`. L=1 LDMIA, L=0 STMIA. Address
+    /// starts at Rb & !3. Each listed R0..R7 is load/stored in
+    /// ascending order, base Rb incremented by 4 per register.
+    /// Empty rlist is a special case (loads/stores PC, Rb += 0x40);
+    /// the classifier rejects those so the common case stays simple.
+    /// STM with Rb in the list + NOT first writes `addr + 4*(count-1)`
+    /// to memory for THAT reg (idiosyncratic ARMv4 behavior) — also
+    /// rejected from compilation to keep codegen tractable.
+    fn decode_thumb_format15(op: u16) -> Option<DecodedThumb15> {
+        if (op >> 12) & 0xF != 0b1100 {
+            return None;
+        }
+        let load = (op >> 11) & 1 != 0;
+        let rb = ((op >> 8) & 0b111) as i32;
+        let rlist = (op & 0xFF) as u8;
+        if rlist == 0 {
+            return None; // empty-rlist edge case
+        }
+        // STM with Rb in rlist: 3 ARM sub-cases (first=store addr,
+        // later=store addr+4*(count-1)). Reject to keep it simple.
+        if !load && (rlist & (1 << rb)) != 0 {
+            return None;
+        }
+        Some(DecodedThumb15 { load, rb, rlist })
+    }
+
     /// Thumb format 7: LDR/STR register offset (word/byte).
     /// Encoding: `0101_L_B_0_Ro_Rb_Rd` — bit 9 must be 0 to
     /// distinguish from F8 (bit 9 = 1, sign-extended).
@@ -1946,6 +1973,7 @@ impl DynarecCompiler {
             F12(DecodedThumb12),
             F13(DecodedThumb13),
             F14(DecodedThumb14),
+            F15(DecodedThumb15),
         }
         enum Tail {
             Bx(DecodedThumbBx),
@@ -1967,6 +1995,8 @@ impl DynarecCompiler {
                 Body::F7(d) => !d.load,
                 Body::F9(d) => !d.load,
                 Body::F11(d) => !d.load,
+                // F15 LDM: AdvancePC(NonSeq). STM: AdvancePC(NonSeq). Always NonSeq.
+                Body::F15(_) => true,
                 // F14 PUSH and POP BOTH return AdvancePC(NonSeq) in
                 // scalar (exec_thumb_push_pop initializes `result =
                 // CpuAction::AdvancePC(NonSeq)` before the direction
@@ -1984,7 +2014,9 @@ impl DynarecCompiler {
             // F13 must come BEFORE F14 because both have top4==0b1011
             // but F13 uses middle=0b0000 while F14 uses middle=0b010x
             // / 0b110x. Try F14 first to narrow then F13.
-            if let Some(d) = DynarecCompiler::decode_thumb_format14_non_pc(op) {
+            if let Some(d) = DynarecCompiler::decode_thumb_format15(op) {
+                Some(Body::F15(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format14_non_pc(op) {
                 Some(Body::F14(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format13(op) {
                 Some(Body::F13(d))
@@ -2149,7 +2181,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F6(_) | Body::F7(_) | Body::F9(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) => 0,
+                    Body::F6(_) | Body::F7(_) | Body::F9(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) | Body::F15(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2235,6 +2267,12 @@ impl DynarecCompiler {
                     Body::F12(d) => emit_thumb_format12(builder, gpr_ptr, *d, instr_pc),
                     Body::F13(d) => emit_thumb_format13(builder, gpr_ptr, *d),
                     Body::F14(d) => emit_thumb_format14(
+                        builder, gpr_ptr, cpu_ctx,
+                        load_32_ref, store_32_ref,
+                        load_32_seq_ref, store_32_seq_ref,
+                        idle_cycle_ref, *d,
+                    ),
+                    Body::F15(d) => emit_thumb_format15(
                         builder, gpr_ptr, cpu_ctx,
                         load_32_ref, store_32_ref,
                         load_32_seq_ref, store_32_seq_ref,
@@ -3234,6 +3272,14 @@ struct DecodedThumb6 {
     imm8: u32,
 }
 
+/// Thumb format 15 LDM/STM (base write-back).
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb15 {
+    load: bool,
+    rb: i32,
+    rlist: u8,
+}
+
 /// Thumb format 7 register-offset LDR/STR (word/byte).
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb7 {
@@ -3656,6 +3702,72 @@ fn emit_thumb_format6(
     builder
         .ins()
         .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+}
+
+/// Thumb format 15 LDM/STM register list. First access NonSeq, rest
+/// Seq. LDM: +1I at end, NO base write-back if Rb in rlist. STM: no
+/// idle cycle. Base write-back happens AFTER the multi-access, with
+/// `align_preserve = Rb & 3` reapplied. Empty rlist + STM-with-Rb-in-
+/// rlist are filtered out by `decode_thumb_format15`.
+fn emit_thumb_format15(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    cpu_ctx: Value,
+    load_32_ref: cranelift::codegen::ir::FuncRef,
+    store_32_ref: cranelift::codegen::ir::FuncRef,
+    load_32_seq_ref: cranelift::codegen::ir::FuncRef,
+    store_32_seq_ref: cranelift::codegen::ir::FuncRef,
+    idle_cycle_ref: cranelift::codegen::ir::FuncRef,
+    dec: DecodedThumb15,
+) {
+    let rb_val = builder.ins().load(
+        types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rb * 4),
+    );
+    let align_preserve = builder.ins().band_imm(rb_val, 3);
+    // addr starts at Rb & !3.
+    let addr0 = builder.ins().band_imm(rb_val, !3i64);
+    let mut byte_offset: i64 = 0;
+    let mut access_count = 0u32;
+    for i in 0..8 {
+        if dec.rlist & (1 << i) != 0 {
+            let addr = builder.ins().iadd_imm(addr0, byte_offset);
+            if dec.load {
+                let ref_fn = if access_count == 0 { load_32_ref } else { load_32_seq_ref };
+                let call = builder.ins().call(ref_fn, &[cpu_ctx, addr]);
+                let v = builder.inst_results(call)[0];
+                builder.ins().store(
+                    MemFlags::trusted(), v, gpr_ptr, Offset32::new(i * 4),
+                );
+            } else {
+                let v = builder.ins().load(
+                    types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(i * 4),
+                );
+                let ref_fn = if access_count == 0 { store_32_ref } else { store_32_seq_ref };
+                builder.ins().call(ref_fn, &[cpu_ctx, addr, v]);
+            }
+            byte_offset += 4;
+            access_count += 1;
+        }
+    }
+    // LDM: +1I at end.
+    if dec.load {
+        builder.ins().call(idle_cycle_ref, &[cpu_ctx]);
+    }
+    // Base write-back: addr + 4*count + align_preserve.
+    //   LDM case: only write back if Rb NOT in rlist. Scalar skips
+    //   the update when the register it loaded was Rb itself.
+    //   STM case: classifier rejected Rb-in-rlist, so always update.
+    let skip_writeback = dec.load && (dec.rlist & (1 << dec.rb)) != 0;
+    if !skip_writeback {
+        let new_base = builder.ins().iadd_imm(addr0, byte_offset);
+        let new_base_preserved = builder.ins().iadd(new_base, align_preserve);
+        builder.ins().store(
+            MemFlags::trusted(),
+            new_base_preserved,
+            gpr_ptr,
+            Offset32::new(dec.rb * 4),
+        );
+    }
 }
 
 /// Thumb format 7 register-offset LDR/STR.  Address = Rb + Ro.
