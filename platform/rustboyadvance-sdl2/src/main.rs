@@ -319,6 +319,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "replay done: {} frames in {:.2}s wall, {:.1} avg fps ({} emulated cycles)",
                     replay_frames, elapsed, fps, now
                 );
+                #[cfg(feature = "dynarec")]
+                {
+                    let (total, compiled, linked) = gba.cpu.block_cache.compile_stats();
+                    let pct = if total > 0 {
+                        100.0 * compiled as f64 / total as f64
+                    } else {
+                        0.0
+                    };
+                    let link_pct = if compiled > 0 {
+                        100.0 * linked as f64 / compiled as f64
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "block cache: {} rom blocks, {} compiled ({:.1}%), {} chain-linked ({:.1}% of compiled)",
+                        total, compiled, pct, linked, link_pct,
+                    );
+                }
                 // Dump the per-shape execution counters. Output is parsed
                 // by scripts/dynarec_measure.sh to retrain `W_*` weights
                 // against real gameplay frequency. No-op on the default
