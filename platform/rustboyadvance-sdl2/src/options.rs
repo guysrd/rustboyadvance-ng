@@ -72,6 +72,13 @@ pub struct Options {
     #[arg(long = "jit")]
     pub jit: bool,
 
+    /// Print an FNV-1a hash of the framebuffer every N frames while
+    /// replaying (format: `fb_hash: frame=N cycle=C hash=HHHHHHHH`).
+    /// Used to diff scalar vs jit output on real SDL without going
+    /// through fps_bench. Only meaningful in --replay mode.
+    #[arg(long = "frame-hash-every", value_name = "N")]
+    pub frame_hash_every: Option<u64>,
+
     #[cfg(feature = "debugger")]
     #[arg(long, default_value = None)]
     pub script_file: Option<String>,

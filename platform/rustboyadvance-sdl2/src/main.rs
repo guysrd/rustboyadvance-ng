@@ -383,6 +383,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gba.frame();
             if replayer.is_some() {
                 replay_frames += 1;
+                if let Some(n) = opts.frame_hash_every {
+                    if n > 0 && replay_frames % n == 0 {
+                        let fb = gba.get_frame_buffer();
+                        // FNV-1a over the u32 pixels, matching
+                        // fps_bench's hash scheme so output is
+                        // cross-comparable.
+                        let mut h: u64 = 0xcbf29ce484222325;
+                        for &px in fb {
+                            for b in px.to_le_bytes() {
+                                h ^= b as u64;
+                                h = h.wrapping_mul(0x100000001b3);
+                            }
+                        }
+                        println!(
+                            "fb_hash: frame={} cycle={} hash={:016x}",
+                            replay_frames,
+                            gba.cycles(),
+                            h,
+                        );
+                    }
+                }
             }
         }
         // In replay mode we rate-limit the SDL present to ~60Hz wall-clock.
