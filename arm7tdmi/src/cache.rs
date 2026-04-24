@@ -259,6 +259,18 @@ struct DynarecDebug {
     no_pop_pc: bool, // skip only POP{PC}
     no_dp_long: bool,
     no_chain: bool,
+    no_f10: bool, // skip blocks containing format-10 halfword LDR/STR imm
+    no_f10_ldrh: bool, // skip blocks containing format-10 LDRH (load=1)
+    no_f10_strh: bool, // skip blocks containing format-10 STRH (load=0)
+    no_bl_pair: bool, // skip F19 BL long-branch pair tails
+    no_mov_pc: bool, // skip F5 MOV/ADD PC,Rm tails
+    no_f8: bool, // skip blocks containing format-8 reg-offset halfword/signed
+    no_f6: bool, // skip blocks containing F6 PC-rel LDR
+    no_f12: bool, // skip blocks containing F12 load address
+    no_f15: bool, // skip blocks containing F15 LDM/STM
+    no_f13: bool, // skip blocks containing F13 ADD/SUB SP imm
+    no_alu: bool, // skip blocks where ANY opcode is F1-F4 ALU (bisect)
+    no_f5: bool, // skip blocks containing F5 non-PC high-reg ops
     max_len: Option<usize>,
 }
 
@@ -280,6 +292,18 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "no-pop-pc" => d.no_pop_pc = true,
                     "no-dp-long" => d.no_dp_long = true,
                     "no-chain" => d.no_chain = true,
+                    "no-f10" => d.no_f10 = true,
+                    "no-f10-ldrh" => d.no_f10_ldrh = true,
+                    "no-f10-strh" => d.no_f10_strh = true,
+                    "no-bl-pair" => d.no_bl_pair = true,
+                    "no-mov-pc" => d.no_mov_pc = true,
+                    "no-f8" => d.no_f8 = true,
+                    "no-f6" => d.no_f6 = true,
+                    "no-f12" => d.no_f12 = true,
+                    "no-f15" => d.no_f15 = true,
+                    "no-f13" => d.no_f13 = true,
+                    "no-alu" => d.no_alu = true,
+                    "no-f5" => d.no_f5 = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
                             d.max_len = Some(n);
@@ -414,6 +438,73 @@ fn try_compile_thumb<I: MemoryInterface>(
             .map(|&op| is_thumb_branch_opcode(op))
             .unwrap_or(false)
     {
+        return None;
+    }
+    // F10 halfword LDR/STR imm: top4 == 0b1000
+    if dbg.no_f10 && raws.iter().any(|&op| (op >> 12) == 0b1000) {
+        return None;
+    }
+    // F10 LDRH: top5 == 0b10001 (load bit set)
+    if dbg.no_f10_ldrh && raws.iter().any(|&op| (op & 0xF800) == 0x8800) {
+        return None;
+    }
+    // F10 STRH: top5 == 0b10000 (load bit clear)
+    if dbg.no_f10_strh && raws.iter().any(|&op| (op & 0xF800) == 0x8000) {
+        return None;
+    }
+    // F8 reg-offset halfword/signed: (op & 0xF200) == 0x5200
+    if dbg.no_f8 && raws.iter().any(|&op| (op & 0xF200) == 0x5200) {
+        return None;
+    }
+    // BL pair F19: last two halves are hi (0xF000-0xF7FF) + lo (0xF800-0xFFFF).
+    if dbg.no_bl_pair && raws.len() >= 2 {
+        let hi = raws[raws.len() - 2];
+        let lo = raws[raws.len() - 1];
+        if (hi & 0xF800) == 0xF000 && (lo & 0xF800) == 0xF800 {
+            return None;
+        }
+    }
+    // F5 MOV PC: last opcode is 0b0100_0100_SDBx_x111 with Rd=PC(7).
+    // Catches both MOV PC,Rm (0x46) and ADD PC,Rm (0x44).
+    if dbg.no_mov_pc {
+        if let Some(&last) = raws.last() {
+            // Format-5 prefix 0b0100_01_xx and Rd low-3 bits == 0b111 and H1=1 (high Rd).
+            if (last & 0xFC00) == 0x4400 && (last & 0x0087) == 0x0087 {
+                return None;
+            }
+        }
+    }
+    // F6 PC-rel LDR: 0b01001xxx_xxxxxxxx → (op & 0xF800) == 0x4800
+    if dbg.no_f6 && raws.iter().any(|&op| (op & 0xF800) == 0x4800) {
+        return None;
+    }
+    // F12 load address: 0b1010_xxxx_xxxxxxxx → (op & 0xF000) == 0xA000
+    if dbg.no_f12 && raws.iter().any(|&op| (op & 0xF000) == 0xA000) {
+        return None;
+    }
+    // F15 LDM/STM IA: 0b1100_xxxx_xxxxxxxx → (op & 0xF000) == 0xC000
+    if dbg.no_f15 && raws.iter().any(|&op| (op & 0xF000) == 0xC000) {
+        return None;
+    }
+    // F13 ADD/SUB SP imm: 0b1011_0000_xxxx_xxxx → (op & 0xFF00) == 0xB000
+    if dbg.no_f13 && raws.iter().any(|&op| (op & 0xFF00) == 0xB000) {
+        return None;
+    }
+    // F1-F4 ALU (rough): top3=0b000 (F1 shift imm), top4=0b0001 (F2 add/sub),
+    // top3=0b001 (F3 imm), top6=0b010000 (F4 alu).
+    if dbg.no_alu
+        && raws.iter().any(|&op| {
+            let t3 = op >> 13;
+            let t4 = op >> 12;
+            let t6 = op >> 10;
+            t3 == 0b000 || t4 == 0b0001 || t3 == 0b001 || t6 == 0b010000
+        })
+    {
+        return None;
+    }
+    // F5 non-PC high-register ops: 0b0100_01_xx (except MOV PC variants
+    // which are picked up by no_mov_pc).
+    if dbg.no_f5 && raws.iter().any(|&op| (op & 0xFC00) == 0x4400) {
         return None;
     }
     // block.entry_pc is self.pc at step_block entry with the Thumb bit

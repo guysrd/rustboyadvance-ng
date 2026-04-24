@@ -2469,7 +2469,7 @@ impl DynarecCompiler {
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
                     ),
                     Body::F10(d) => emit_thumb_format10(
-                        builder, gpr_ptr, cpu_ctx,
+                        builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_16_ref, store_16_ref, *d,
                     ),
                     Body::F11(d) => emit_thumb_format11(
@@ -4148,12 +4148,17 @@ fn emit_thumb_format10(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
     cpu_ctx: Value,
+    cpsr_var: Variable,
     load_idle_16_ref: cranelift::codegen::ir::FuncRef,
     store_16_ref: cranelift::codegen::ir::FuncRef,
     dec: DecodedThumb10,
 ) {
+    // Use explicit volatile-ish flags (no `notrap`/`aliased` assumption)
+    // so Cranelift doesn't reorder this load past unrelated trusted
+    // stores earlier in the block.
+    let nontrusted = MemFlags::new();
     let rs_val = builder.ins().load(
-        types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rs * 4),
+        types::I32, nontrusted, gpr_ptr, Offset32::new(dec.rs * 4),
     );
     let addr = builder.ins().iadd_imm(rs_val, dec.offset as i64);
     if dec.load {
@@ -4161,7 +4166,26 @@ fn emit_thumb_format10(
         let v = builder.inst_results(call)[0];
         builder
             .ins()
-            .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+            .store(nontrusted, v, gpr_ptr, Offset32::new(dec.rd * 4));
+        // Scalar `ldr_half` on misaligned addr rotates the loaded
+        // halfword right by 8 AND writes the ROR carry-out (which
+        // equals bit 31 of the rotated result) to CPSR.C. The
+        // trampoline already did the rotation; mirror the CPSR.C
+        // update here so flags match scalar exactly. cpsr stays in
+        // the block's SSA variable throughout (the trampoline can't
+        // touch it — any mutation of cpu.cpsr there gets clobbered
+        // by the block-exit flush of cpsr_var).
+        let addr_odd = builder.ins().band_imm(addr, 1);
+        let odd_nz = builder.ins().icmp_imm(IntCC::NotEqual, addr_odd, 0);
+        let old_cpsr = builder.use_var(cpsr_var);
+        let new_c_bit = builder.ins().ushr_imm(v, 31);
+        let new_c_shifted = builder.ins().ishl_imm(new_c_bit, 29);
+        let cpsr_c_cleared = builder
+            .ins()
+            .band_imm(old_cpsr, !(1i64 << 29));
+        let new_cpsr = builder.ins().bor(cpsr_c_cleared, new_c_shifted);
+        let final_cpsr = builder.ins().select(odd_nz, new_cpsr, old_cpsr);
+        builder.def_var(cpsr_var, final_cpsr);
     } else {
         let rd_val = builder.ins().load(
             types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
