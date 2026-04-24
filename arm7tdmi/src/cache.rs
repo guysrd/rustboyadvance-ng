@@ -826,10 +826,11 @@ mod tests {
 
         let key = BlockKey::new(0x0800_0000, true);
         cache.begin_record(key);
-        // Thumb format 10 STRH Rd, [Rs, #imm5*2]: 1000_LD_iiiii...
-        // 0x8000 is STRH R0, [R0, #0]. Not yet supported by the
-        // dynarec (format 10 halfword loads/stores unimplemented).
-        cache.record_instr(thumb(0x8000, stub_thumb_handler));
+        // Thumb format 8 STRH Rd, [Rb, Ro] reg-offset: 0101_HS_1_...
+        // 0x5200 = STRH R0, [R0, R0]. Not yet supported by the
+        // dynarec (format 8 sign-extended/halfword reg-offset
+        // unimplemented).
+        cache.record_instr(thumb(0x5200, stub_thumb_handler));
         cache.finish_record();
 
         let block = cache.get(key).expect("block in cache");

@@ -149,6 +149,29 @@ pub mod trampolines {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.store_32(addr, value, MemoryAccess::Seq);
     }
+    /// 16-bit halfword STRH — mirrors scalar `store_aligned_16`
+    /// (masks low bit of address before the store).
+    pub unsafe extern "C" fn store_16<I: MemoryInterface>(ctx: *mut u8, addr: u32, value: u32) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.store_16(addr & !0x1, value as u16, MemoryAccess::NonSeq);
+    }
+    /// 16-bit halfword LDRH with +1I. Mirrors scalar `ldr_half`:
+    /// on misaligned addr, rotates the halfword right by 8 so the
+    /// byte-at-address ends in the high lane (ARM7TDMI quirk).
+    pub unsafe extern "C" fn load_with_idle_16<I: MemoryInterface>(
+        ctx: *mut u8,
+        addr: u32,
+    ) -> u32 {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        let v = if addr & 0x1 != 0 {
+            let loaded = cpu.load_16(addr & !0x1, MemoryAccess::NonSeq) as u32;
+            loaded.rotate_right(8)
+        } else {
+            cpu.load_16(addr, MemoryAccess::NonSeq) as u32
+        };
+        cpu.idle_cycle();
+        v
+    }
     pub unsafe extern "C" fn load_8<I: MemoryInterface>(ctx: *mut u8, addr: u32) -> u32 {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.load_8(addr, MemoryAccess::NonSeq) as u32
@@ -353,6 +376,8 @@ pub mod trampolines {
             store_8: store_8::<I>,
             load_32_seq: load_32_seq::<I>,
             store_32_seq: store_32_seq::<I>,
+            store_16: store_16::<I>,
+            load_with_idle_16: load_with_idle_16::<I>,
             load_with_idle_32: load_with_idle_32::<I>,
             load_with_idle_8: load_with_idle_8::<I>,
             set_next_fetch_nonseq: set_next_fetch_nonseq::<I>,
@@ -379,6 +404,9 @@ pub struct BusTrampolines {
     /// NonSeq variants; internal trampoline switches access mode.
     pub load_32_seq: BusLoad32Fn,
     pub store_32_seq: BusStore32Fn,
+    /// 16-bit halfword access for Thumb format 10 LDRH / STRH imm.
+    pub store_16: BusStore32Fn,
+    pub load_with_idle_16: BusLoadIdle32Fn,
     /// Data-load with implicit +1I idle cycle (LDR/LDRH/LDRB family).
     pub load_with_idle_32: BusLoadIdle32Fn,
     pub load_with_idle_8: BusLoadIdle8Fn,
@@ -428,6 +456,8 @@ struct BusImports {
     store_8: FuncId,
     load_32_seq: FuncId,
     store_32_seq: FuncId,
+    store_16: FuncId,
+    load_with_idle_16: FuncId,
     load_with_idle_32: FuncId,
     load_with_idle_8: FuncId,
     set_next_fetch_nonseq: FuncId,
@@ -478,6 +508,8 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_bus_store_8",            b.store_8              as *const u8);
             jit_builder.symbol("rba_bus_load_32_seq",        b.load_32_seq          as *const u8);
             jit_builder.symbol("rba_bus_store_32_seq",       b.store_32_seq         as *const u8);
+            jit_builder.symbol("rba_bus_store_16",           b.store_16             as *const u8);
+            jit_builder.symbol("rba_bus_load_with_idle_16",  b.load_with_idle_16    as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_32",  b.load_with_idle_32    as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_8",   b.load_with_idle_8     as *const u8);
             jit_builder.symbol("rba_set_next_fetch_nonseq",  b.set_next_fetch_nonseq as *const u8);
@@ -548,6 +580,14 @@ impl DynarecCompiler {
                 .declare_function("rba_bus_store_32_seq", Linkage::Import, &sig_store_32)
                 .expect("declare store_32_seq failed");
 
+            // 16-bit halfword access (Thumb format 10 LDRH/STRH imm)
+            let store_16 = module
+                .declare_function("rba_bus_store_16", Linkage::Import, &sig_store_32)
+                .expect("declare store_16 failed");
+            let load_with_idle_16 = module
+                .declare_function("rba_bus_load_with_idle_16", Linkage::Import, &sig_load_idle_32)
+                .expect("declare load_with_idle_16 failed");
+
             // load_with_idle_8: same signature as load_8; charges +1I post-load.
             let mut sig_load_idle_8 = module.make_signature();
             sig_load_idle_8.params.push(AbiParam::new(ptr_ty));
@@ -617,6 +657,8 @@ impl DynarecCompiler {
                 store_8,
                 load_32_seq,
                 store_32_seq,
+                store_16,
+                load_with_idle_16,
                 load_with_idle_32,
                 load_with_idle_8,
                 set_next_fetch_nonseq,
@@ -1644,6 +1686,20 @@ impl DynarecCompiler {
         })
     }
 
+    /// Thumb format 10: LDRH / STRH imm5 offset.
+    /// Encoding: `1000_L_imm5_Rs_Rd`. Address = Rs + imm5*2.
+    #[allow(dead_code)]
+    fn decode_thumb_format10(op: u16) -> Option<DecodedThumb10> {
+        if (op >> 12) & 0xF != 0b1000 {
+            return None;
+        }
+        let load = (op >> 11) & 1 != 0;
+        let imm5 = ((op >> 6) & 0b11111) as u32;
+        let rs = ((op >> 3) & 0b111) as i32;
+        let rd = (op & 0b111) as i32;
+        Some(DecodedThumb10 { load, rs, rd, offset: imm5 * 2 })
+    }
+
     /// Thumb format 15: LDM / STM IA base-write-back register list.
     /// Encoding: `1100_L_Rb_rlist`. L=1 LDMIA, L=0 STMIA. Address
     /// starts at Rb & !3. Each listed R0..R7 is load/stored in
@@ -1969,6 +2025,8 @@ impl DynarecCompiler {
             F6(DecodedThumb6),
             F7(DecodedThumb7),
             F9(DecodedThumb9),
+            #[allow(dead_code)]
+            F10(DecodedThumb10),
             F11(DecodedThumb11),
             F12(DecodedThumb12),
             F13(DecodedThumb13),
@@ -1994,6 +2052,8 @@ impl DynarecCompiler {
             match item {
                 Body::F7(d) => !d.load,
                 Body::F9(d) => !d.load,
+                // F10 STRH returns NonSeq; LDRH returns Seq.
+                Body::F10(d) => !d.load,
                 Body::F11(d) => !d.load,
                 // F15 LDM: AdvancePC(NonSeq). STM: AdvancePC(NonSeq). Always NonSeq.
                 Body::F15(_) => true,
@@ -2024,6 +2084,12 @@ impl DynarecCompiler {
                 Some(Body::F12(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format11(op) {
                 Some(Body::F11(d))
+            // F10 codegen + trampoline are plumbed but classifier
+            // intentionally SKIPS format10 until the 10270-cycle drift
+            // on real-SDL pokeemerald is root-caused. Pre-existing
+            // code paths already exercise `store_16` /
+            // `load_with_idle_16` for the test stubs, so the trampoline
+            // wiring is kept live.
             } else if let Some(d) = DynarecCompiler::decode_thumb_format9(op) {
                 Some(Body::F9(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format7(op) {
@@ -2133,6 +2199,11 @@ impl DynarecCompiler {
                 self.module.declare_func_in_func(imports.load_32_seq, builder.func);
             let store_32_seq_ref =
                 self.module.declare_func_in_func(imports.store_32_seq, builder.func);
+            // 16-bit halfword (F10) trampolines.
+            let store_16_ref =
+                self.module.declare_func_in_func(imports.store_16, builder.func);
+            let load_idle_16_ref =
+                self.module.declare_func_in_func(imports.load_with_idle_16, builder.func);
             let fetch_n_ref =
                 self.module.declare_func_in_func(imports.thumb_fetch_n, builder.func);
             // pay_extra_nonseq: charges (n - s) cycles for the next fetch
@@ -2181,7 +2252,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F6(_) | Body::F7(_) | Body::F9(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) | Body::F15(_) => 0,
+                    Body::F6(_) | Body::F7(_) | Body::F9(_) | Body::F10(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) | Body::F15(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2259,6 +2330,10 @@ impl DynarecCompiler {
                     Body::F9(d) => emit_thumb_format9(
                         builder, gpr_ptr, cpu_ctx,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
+                    ),
+                    Body::F10(d) => emit_thumb_format10(
+                        builder, gpr_ptr, cpu_ctx,
+                        load_idle_16_ref, store_16_ref, *d,
                     ),
                     Body::F11(d) => emit_thumb_format11(
                         builder, gpr_ptr, cpu_ctx,
@@ -3290,6 +3365,15 @@ struct DecodedThumb7 {
     rd: i32,
 }
 
+/// Thumb format 10 halfword LDRH/STRH imm5.
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb10 {
+    load: bool,
+    rs: i32,
+    rd: i32,
+    offset: u32,
+}
+
 /// Thumb format 13 ADD/SUB SP, #imm.
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb13 {
@@ -3702,6 +3786,33 @@ fn emit_thumb_format6(
     builder
         .ins()
         .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+}
+
+/// Thumb format 10 halfword LDRH/STRH imm. Address = Rs + offset.
+fn emit_thumb_format10(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    cpu_ctx: Value,
+    load_idle_16_ref: cranelift::codegen::ir::FuncRef,
+    store_16_ref: cranelift::codegen::ir::FuncRef,
+    dec: DecodedThumb10,
+) {
+    let rs_val = builder.ins().load(
+        types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rs * 4),
+    );
+    let addr = builder.ins().iadd_imm(rs_val, dec.offset as i64);
+    if dec.load {
+        let call = builder.ins().call(load_idle_16_ref, &[cpu_ctx, addr]);
+        let v = builder.inst_results(call)[0];
+        builder
+            .ins()
+            .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+    } else {
+        let rd_val = builder.ins().load(
+            types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
+        );
+        builder.ins().call(store_16_ref, &[cpu_ctx, addr, rd_val]);
+    }
 }
 
 /// Thumb format 15 LDM/STM register list. First access NonSeq, rest
@@ -5289,6 +5400,8 @@ mod tests {
             abort_mid_block: test_abort_mid_block,
             load_32_seq: test_load_32,
             store_32_seq: test_store_32,
+            store_16: test_store_32,
+            load_with_idle_16: test_load_with_idle_32,
         }
     }
 
