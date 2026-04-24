@@ -665,7 +665,15 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             let taken = compiled(gpr_ptr, &mut cpsr_word, &mut pc_out, cpu_ctx);
             // Rebuild CPSR from the possibly-updated word.
             self.cpsr = super::psr::RegPSR::new(cpsr_word);
-            if taken != 0 {
+            // Return-value bits:
+            //   bit 0 = branch taken (pc_out populated, reload pipeline).
+            //   bit 1 = mid-block abort (abort_mid_block trampoline has
+            //           already set pc / pipeline[0/1] / next_fetch_access;
+            //           caller must not chain past this, just yield).
+            if taken & 0b10 != 0 {
+                return false; // step_block breaks the chain
+            }
+            if taken & 0b01 != 0 {
                 // Branch fired. Apply the mode bit and set pc. The Thumb
                 // bit in pc_out[0] selects the next CPU state; the rest
                 // is the aligned target address. reload_pipeline* on the

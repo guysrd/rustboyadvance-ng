@@ -2170,9 +2170,59 @@ impl DynarecCompiler {
                 }
             };
 
+            // Mid-block abort-check setup. Declared up-front so every
+            // abort point in the body loop can share the same FuncRefs.
+            let abort_chain_ref = self
+                .module
+                .declare_func_in_func(imports.chain_abort_check, builder.func);
+            let abort_mid_ref = self
+                .module
+                .declare_func_in_func(imports.abort_mid_block, builder.func);
+
             for (k, item) in body.iter().enumerate() {
                 let instr_pc = entry_pc.wrapping_add((2 * k) as u32);
                 emit_body(&mut builder, item, skip_flags[k], instr_pc);
+                // Mid-block abort check — match scalar's
+                // `instr_idx != 0 && instr_idx & 1 == 1` cadence:
+                // scalar checks AT THE START of iters 1, 3, 5, ...
+                // which is AFTER iters 0, 2, 4, ... finish. Mirror
+                // by checking after body[k] at even k. Skip if
+                // pipeline[1] at the abort point would be past the
+                // block (k+2 >= opcodes.len()) — we'd need a bus
+                // fetch to reconstruct it. Minor drift residue at
+                // the last abort-eligible position; catches the
+                // bulk of the inter-event drift.
+                if k % 2 == 0 && k + 2 < opcodes.len() {
+                    let abort_call = builder.ins().call(abort_chain_ref, &[cpu_ctx]);
+                    let abort = builder.inst_results(abort_call)[0];
+                    let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
+                    let do_abort_blk = builder.create_block();
+                    let cont_blk = builder.create_block();
+                    builder.ins().brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
+
+                    builder.switch_to_block(do_abort_blk);
+                    builder.seal_block(do_abort_blk);
+                    // Abort point: pc points at body[k+1]'s pipeline-head.
+                    let abort_pc = entry_pc.wrapping_add((2 * (k + 1)) as u32).wrapping_add(4);
+                    let pipe0 = opcodes[k + 1] as u32;
+                    let pipe1 = opcodes[k + 2] as u32;
+                    let pc_val = builder.ins().iconst(types::I32, abort_pc as i64);
+                    let p0 = builder.ins().iconst(types::I32, pipe0 as i64);
+                    let p1 = builder.ins().iconst(types::I32, pipe1 as i64);
+                    builder
+                        .ins()
+                        .call(abort_mid_ref, &[cpu_ctx, pc_val, p0, p1]);
+                    // Flush cpsr_var, set abort-signal return (bit 1 = 2).
+                    let cpsr_cur = builder.use_var(cpsr_var);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), cpsr_cur, cpsr_ptr, 0);
+                    let abort_ret = builder.ins().iconst(types::I32, 2);
+                    builder.ins().return_(&[abort_ret]);
+
+                    builder.switch_to_block(cont_blk);
+                    builder.seal_block(cont_blk);
+                }
                 // Compensate for the under-counted next fetch when this
                 // body item is a STORE: scalar would have charged NonSeq
                 // for the fetch that follows, but `thumb_fetch_n` paid
@@ -4892,11 +4942,14 @@ mod tests {
     unsafe extern "C" fn test_pay_thumb_fetch_extra_nonseq(_ctx: *mut u8, _pc: u32) {}
     /// No-op idle trampoline stub; these tests don't observe scheduler state.
     unsafe extern "C" fn test_idle_cycle(_ctx: *mut u8) {}
-    /// Chain-abort stub. Tests don't exercise chaining (no real
-    /// Arm7tdmiCore behind ctx), so the stub returns 1 — "always
-    /// abort" — which prevents codegen-emitted chain checks from
-    /// tail-calling through a (deliberately null) chain slot.
-    unsafe extern "C" fn test_chain_abort_check(_ctx: *mut u8) -> u32 { 1 }
+    /// Chain-abort stub. Tests pass `chain_slot: None` so no chain
+    /// tail-call gets emitted (the null-check short-circuits); but
+    /// the trampoline is ALSO called by the mid-block-abort codegen
+    /// at every even body position. Returning 0 ("no abort") lets
+    /// compiled test blocks run to completion. The old "return 1"
+    /// was fine before the mid-block-abort codegen existed and now
+    /// short-circuits everything.
+    unsafe extern "C" fn test_chain_abort_check(_ctx: *mut u8) -> u32 { 0 }
     unsafe extern "C" fn test_abort_mid_block(
         _ctx: *mut u8, _pc: u32, _p0: u32, _p1: u32,
     ) {}
