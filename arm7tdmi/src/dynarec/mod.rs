@@ -3486,6 +3486,20 @@ impl DynarecCompiler {
         })
     }
 
+    /// ARM-mode block compile entry point. Placeholder until per-iter
+    /// ARM codegen lands. Returning `None` makes cache.rs treat the
+    /// block exactly like the old REJECT_ARM path (interpreter
+    /// fallback), so wiring the route doesn't change behavior.
+    pub fn try_compile_arm_block(
+        &mut self,
+        _raws: &[u32],
+        _entry_pc: u32,
+        _chain_slot: Option<&crate::cache::ChainSlot>,
+    ) -> Option<extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u8) -> u32>
+    {
+        None
+    }
+
     /// Classify a POP {regs, pc} (format 14 with L=1, R=1). This is a
     /// block terminator: the popped PC value becomes the new program
     /// counter, so control flow leaves the compiled block.

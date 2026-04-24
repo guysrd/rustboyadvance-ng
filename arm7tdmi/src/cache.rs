@@ -276,6 +276,11 @@ struct DynarecDebug {
     /// Per-iter fetch is the default (0 divs); this knob is for
     /// bisecting any future regressions back to the legacy model.
     pub no_per_iter_fetch: bool,
+    /// If set, ARM blocks fall back to the REJECT_ARM behavior
+    /// (interpreted via cached_interp). Per-block ARM JIT codegen
+    /// is gated here for regression bisection while ARM support is
+    /// being rolled out.
+    pub no_arm_jit: bool,
     max_len: Option<usize>,
 }
 
@@ -285,6 +290,14 @@ struct DynarecDebug {
 #[cfg(feature = "dynarec")]
 pub(crate) fn dynarec_no_per_iter_fetch() -> bool {
     dynarec_debug().no_per_iter_fetch
+}
+
+/// Accessor for `no-arm-jit`. When true, ARM blocks fall back to
+/// interpreter (the pre-ARM-JIT behavior). For regression bisection
+/// of ARM codegen issues.
+#[cfg(feature = "dynarec")]
+fn dynarec_no_arm_jit() -> bool {
+    dynarec_debug().no_arm_jit
 }
 
 #[cfg(feature = "dynarec")]
@@ -318,6 +331,7 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "no-alu" => d.no_alu = true,
                     "no-f5" => d.no_f5 = true,
                     "no-per-iter-fetch" => d.no_per_iter_fetch = true,
+                    "no-arm-jit" => d.no_arm_jit = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
                             d.max_len = Some(n);
@@ -366,19 +380,74 @@ fn try_compile_thumb<I: MemoryInterface>(
     {
         return None;
     }
+    // Classify block mode from first instruction. Scalar aborts on
+    // ARM<->Thumb state flip mid-block (cpu.rs:711), so every block
+    // is single-mode by construction.
+    let arm_block = matches!(block.instrs.first(), Some(DecodedInstr::Arm { .. }));
+    if arm_block {
+        // ARM blocks route to a separate codegen path. Gated behind
+        // DYNAREC_DEBUG=no-arm-jit for regression bisection.
+        if dynarec_no_arm_jit() {
+            if std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
+                eprintln!(
+                    "REJECT_ARM entry_pc=0x{:x} len={} (no-arm-jit)",
+                    block.entry_pc, block.instrs.len()
+                );
+            }
+            return None;
+        }
+        let arm_raws: Vec<u32> = block
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                DecodedInstr::Arm { raw, .. } => Some(*raw),
+                DecodedInstr::Thumb { .. } => None, // shouldn't happen per scalar invariant
+            })
+            .collect();
+        // Defensive: if block is not pure-ARM (shouldn't happen), reject.
+        if arm_raws.len() != block.instrs.len() {
+            if std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
+                eprintln!(
+                    "REJECT_MIXED_MODE entry_pc=0x{:x}",
+                    block.entry_pc
+                );
+            }
+            return None;
+        }
+        let chain_slot: Option<Rc<ChainSlot>> = if dbg.no_chain {
+            None
+        } else {
+            Some(Rc::new(ChainSlot::default()))
+        };
+        let block_start_addr = block.entry_pc & !3;
+        let func_opt = compiler.try_compile_arm_block(
+            &arm_raws,
+            block_start_addr,
+            chain_slot.as_deref(),
+        );
+        if func_opt.is_none() && std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
+            let last = arm_raws.last().copied().unwrap_or(0);
+            eprintln!(
+                "REJECT_ARM_COMPILE entry_pc=0x{:x} len={} last={:08x} raws=[{}]",
+                block.entry_pc,
+                arm_raws.len(),
+                last,
+                arm_raws
+                    .iter()
+                    .map(|o| format!("{:08x}", o))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        let func = func_opt?;
+        return Some(CompileResult { func, chain_slot });
+    }
     let mut raws: Vec<u16> = Vec::with_capacity(block.instrs.len());
-    let mut has_arm = false;
     for instr in &block.instrs {
         match instr {
             DecodedInstr::Thumb { raw, .. } => raws.push(*raw),
-            DecodedInstr::Arm { .. } => { has_arm = true; break; }
+            DecodedInstr::Arm { .. } => unreachable!("arm_block handled above"),
         }
-    }
-    if has_arm {
-        if std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
-            eprintln!("REJECT_ARM entry_pc=0x{:x} len={}", block.entry_pc, block.instrs.len());
-        }
-        return None;
     }
     if raws.is_empty() {
         return None;
