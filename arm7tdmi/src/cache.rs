@@ -196,17 +196,14 @@ pub struct BlockCache<I: MemoryInterface> {
 /// instruction per block the dynarec is ~25% slower than the cached
 /// interpreter on pokeemerald; at >=4 instructions it pulls even or
 /// ahead. Gate compilation until we cross that line.
-/// Chain-linking did NOT make MIN=2 viable — pokeemerald and mario
-/// kart both regressed when the cap dropped. And MIN=1 (measured
-/// 2026-04-24 with PC-branch fall-through chain + lifted filter)
-/// regressed fps severely (pe 558→462 -17%, mk 390→274 -30%) despite
-/// jumping compile rate to 26.5%/34% and chain-link rate to 23%.
-/// Reason: compiled dispatch is ~3× slower than interp dispatch;
-/// putting more dispatches on the compiled path loses more than
-/// chaining saves. Staying at 4 until the compiled-path speed is
-/// fixed (see `dynarec_compile_rate` memory).
+/// Set to 1 per user directive (2026-04-24): reach high compilation
+/// rate first, optimize per-dispatch speed later. This compiles
+/// every block the back-end shape-decoder supports, regardless of
+/// length. Expect initial fps regression (compiled dispatch is
+/// ~3× slower than interp today) but a much larger surface for
+/// follow-up codegen optimizations to claim.
 #[cfg(feature = "dynarec")]
-const DYNAREC_MIN_BLOCK_LEN: usize = 4;
+const DYNAREC_MIN_BLOCK_LEN: usize = 1;
 
 /// Maximum block length to attempt compilation. Longer blocks suffer
 /// from abort-latency: scalar `replay_cached_block` checks for IRQ /
