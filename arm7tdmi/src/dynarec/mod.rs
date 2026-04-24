@@ -3010,6 +3010,15 @@ impl DynarecCompiler {
                     // to the dispatcher.
                     builder.switch_to_block(fallthrough_blk);
                     builder.seal_block(fallthrough_blk);
+                    // Scalar's Bcc handler returns AdvancePC(Seq) on
+                    // cond-false. Mirror that on the per-iter path so
+                    // the next block (or chain target)'s first fetch
+                    // uses Seq access. (Fetch_n legacy path also
+                    // left cpu.next_fetch_access as Seq via fetch_n's
+                    // end-set, so this is a per-iter-only fix.)
+                    if per_iter_fetch {
+                        emit_set_access(&mut builder, 1);
+                    }
                     if let Some(slot_addr) = chain_slot_addr {
                         let chain_abort_ref = self
                             .module
