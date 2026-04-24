@@ -196,6 +196,16 @@ pub struct BlockCache<I: MemoryInterface> {
 /// instruction per block the dynarec is ~25% slower than the cached
 /// interpreter on pokeemerald; at >=4 instructions it pulls even or
 /// ahead. Gate compilation until we cross that line.
+/// Chain-linking did NOT make MIN=2 viable — pokeemerald and mario
+/// kart both regressed when the cap dropped (fps-measure 2026-04-24:
+/// MK 464→440, pokeemerald 912→906). Root cause: the link rate on
+/// len=2/3 compiled blocks stays very low (~4-9%) because those
+/// blocks' fall-through targets are usually themselves branch-
+/// terminated or len=1, neither of which compiles. So short blocks
+/// end up running through the dispatcher-return path most of the
+/// time, losing to the cached interpreter. Staying at 4 until chain
+/// coverage itself improves (branch-terminator support, more
+/// supported tail shapes).
 #[cfg(feature = "dynarec")]
 const DYNAREC_MIN_BLOCK_LEN: usize = 4;
 
