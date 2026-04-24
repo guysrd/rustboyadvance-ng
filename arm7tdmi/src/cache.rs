@@ -23,6 +23,8 @@
 //!     writable memory regions (see `SysBus::write_*`).
 
 use std::rc::Rc;
+#[cfg(feature = "dynarec")]
+use std::sync::atomic::AtomicUsize;
 
 use rustc_hash::FxHashMap;
 
@@ -31,6 +33,20 @@ use crate::memory::MemoryInterface;
 
 #[cfg(feature = "dynarec")]
 use crate::dynarec::DynarecCompiler;
+
+/// Per-block link-time chain slot. Compiled blocks whose tail is a known
+/// fall-through (`Tail::Body`) bake in the address of this slot and, on
+/// exit, atomically load it. If non-null, the value is a
+/// `CompiledThumbFn` pointer for the immediately-following block — the
+/// compiled code direct-calls it instead of returning to the dispatcher.
+/// Stored as `AtomicUsize` so codegen can treat it as a plain 64-bit
+/// load without any type casting concerns. Null until the successor
+/// block is itself compiled and the cache links them.
+///
+/// Heap-allocated behind `Rc` so the waiters table can hold a clone
+/// without outliving the owning Block.
+#[cfg(feature = "dynarec")]
+pub type ChainSlot = AtomicUsize;
 
 #[cfg(feature = "shape_profile")]
 use crate::dynarec::shape_profile::{self, ShapeId};
@@ -87,6 +103,21 @@ pub struct Block<I: MemoryInterface> {
     /// blocks that contain any shape the dynarec doesn't yet support.
     #[cfg(feature = "dynarec")]
     pub compiled: Option<CompiledThumbFn>,
+    /// Link-time block-chaining slot. Allocated before compile so the
+    /// codegen can bake in its address and emit a load-and-tail-call at
+    /// the block epilogue. `None` when the block didn't compile, or
+    /// when the compiled tail isn't chain-eligible (e.g. the compile
+    /// path opted out). Remains `AtomicUsize(0)` until the successor
+    /// block is linked in by `finish_record` or by the waiters drain.
+    #[cfg(feature = "dynarec")]
+    pub chain_slot: Option<Rc<ChainSlot>>,
+    /// BlockKey-format key of the block that follows this one on the
+    /// fall-through path: `(entry_pc & !1) + 2*len | thumb_bit`. Only
+    /// populated when the compiled block's tail is a known fall-through
+    /// (`Tail::Body` today). Used by `finish_record` to resolve the
+    /// chain target and to register this block with the waiters map.
+    #[cfg(feature = "dynarec")]
+    pub fallthrough_key: Option<BlockKey>,
     /// Shape classification (only under `shape_profile` feature). Set
     /// alongside `compiled` in `finish_record` so the dispatcher can
     /// `shape_profile::tick` the right counter on every replay.
@@ -103,6 +134,10 @@ impl<I: MemoryInterface> Block<I> {
             entry_pc,
             #[cfg(feature = "dynarec")]
             compiled: None,
+            #[cfg(feature = "dynarec")]
+            chain_slot: None,
+            #[cfg(feature = "dynarec")]
+            fallthrough_key: None,
             #[cfg(feature = "shape_profile")]
             shape: None,
         }
@@ -138,6 +173,17 @@ pub struct BlockCache<I: MemoryInterface> {
     /// dynarec feature is on.
     #[cfg(feature = "dynarec")]
     compiler: Option<DynarecCompiler>,
+    /// Link-time block-chaining waiters. Keyed by the target block's
+    /// `BlockKey`; each entry is the list of chain slots belonging to
+    /// already-compiled blocks that fall through to this target and
+    /// are waiting for the target to be compiled. When `finish_record`
+    /// lands a new compiled block at some key K, it drains
+    /// `waiters[K]`, storing its own compiled fn pointer into every
+    /// slot — that retroactively links every predecessor that was
+    /// parked here. ROM-only (we never compile RAM blocks), so
+    /// waiters survive `flush()` but are cleared by `flush_all()`.
+    #[cfg(feature = "dynarec")]
+    waiters: FxHashMap<BlockKey, Vec<Rc<ChainSlot>>>,
 }
 
 /// Try to JIT compile the recorded block's Thumb instructions. Bails out
@@ -175,6 +221,11 @@ const DYNAREC_MAX_BLOCK_LEN: usize = 4;
 ///                               any memory op (F7/F8/F9/F10/F11/F14)
 ///   DYNAREC_DEBUG=no-branch     skip blocks whose last instr is Bcc/B/BL/BX
 ///   DYNAREC_DEBUG=no-dp-long    skip blocks with 6+ pure-DP instructions
+///   DYNAREC_DEBUG=no-chain      compile blocks as before but don't emit
+///                               the link-time chain check in epilogues.
+///                               Keeps chain-slot allocation + linking
+///                               alive so the difference is a pure codegen
+///                               bisect (chaining-on vs chaining-off).
 ///
 /// Multiple tokens can be combined with commas (evaluated as AND):
 ///   DYNAREC_DEBUG=no-mem,no-branch
@@ -192,6 +243,7 @@ struct DynarecDebug {
     no_bx: bool, // skip only format-5 BX
     no_pop_pc: bool, // skip only POP{PC}
     no_dp_long: bool,
+    no_chain: bool,
     max_len: Option<usize>,
 }
 
@@ -212,6 +264,7 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "no-bx" => d.no_bx = true,
                     "no-pop-pc" => d.no_pop_pc = true,
                     "no-dp-long" => d.no_dp_long = true,
+                    "no-chain" => d.no_chain = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
                             d.max_len = Some(n);
@@ -227,11 +280,21 @@ fn dynarec_debug() -> &'static DynarecDebug {
     })
 }
 
+/// Compile result including the block's chain slot (for link-time
+/// chaining). The chain slot is always allocated when compilation
+/// succeeds UNLESS `DYNAREC_DEBUG=no-chain` is set, in which case
+/// codegen skips the chain check and the slot is `None`.
+#[cfg(feature = "dynarec")]
+struct CompileResult {
+    func: CompiledThumbFn,
+    chain_slot: Option<Rc<ChainSlot>>,
+}
+
 #[cfg(feature = "dynarec")]
 fn try_compile_thumb<I: MemoryInterface>(
     compiler: &mut DynarecCompiler,
     block: &Block<I>,
-) -> Option<CompiledThumbFn> {
+) -> Option<CompileResult> {
     if !compiler.has_bus() {
         return None;
     }
@@ -325,7 +388,21 @@ fn try_compile_thumb<I: MemoryInterface>(
     // The dynarec compile API takes entry_pc = block_start_addr (what
     // the unit tests use), so subtract 4 to match.
     let block_start_addr = (block.entry_pc & !1).wrapping_sub(4);
-    compiler.try_compile_thumb_mem_block_with_branch(&raws, block_start_addr)
+    // Allocate the chain slot up front so its stable address can be
+    // baked into the generated code. `no-chain` debug knob disables
+    // chain-slot allocation entirely; codegen then emits the original
+    // dispatcher-return epilogue.
+    let chain_slot: Option<Rc<ChainSlot>> = if dbg.no_chain {
+        None
+    } else {
+        Some(Rc::new(AtomicUsize::new(0)))
+    };
+    let func = compiler.try_compile_thumb_mem_block_with_branch(
+        &raws,
+        block_start_addr,
+        chain_slot.as_deref(),
+    )?;
+    Some(CompileResult { func, chain_slot })
 }
 
 /// Cheap detectors that mirror the block-level classifier rules in
@@ -372,6 +449,8 @@ impl<I: MemoryInterface> Default for BlockCache<I> {
             recording: None,
             #[cfg(feature = "dynarec")]
             compiler: None,
+            #[cfg(feature = "dynarec")]
+            waiters: FxHashMap::default(),
         }
     }
 }
@@ -413,6 +492,12 @@ impl<I: MemoryInterface> BlockCache<I> {
         self.rom_blocks.clear();
         self.ram_blocks.clear();
         self.recording = None;
+        // Chain waiters reference chain slots inside the now-cleared
+        // ROM blocks. The Rc keeps the slots alive, but there's no
+        // point holding onto them — nothing will drain them now the
+        // blocks they reference are gone.
+        #[cfg(feature = "dynarec")]
+        self.waiters.clear();
     }
 
     /// Install a Cranelift-backed dynarec compiler. After this, any
@@ -487,15 +572,23 @@ impl<I: MemoryInterface> BlockCache<I> {
             let pc = key.0 & !1;
             if is_rom_address(pc)
                 && let Some(compiler) = self.compiler.as_mut()
+                && let Some(result) = try_compile_thumb(compiler, &block)
             {
-                block.compiled = try_compile_thumb(compiler, &block);
+                block.compiled = Some(result.func);
+                block.chain_slot = result.chain_slot;
+                // Fall-through key: (entry_pc + 2*len) with the Thumb
+                // bit preserved — the block-cache lookup key for the
+                // next block on the sequential path.
+                let len_bytes = (block.instrs.len() as u32).wrapping_mul(2);
+                let fallthrough_pc = (block.entry_pc & !1).wrapping_add(len_bytes);
+                block.fallthrough_key = Some(BlockKey::new(fallthrough_pc, true));
                 // Tag the block with its shape category so the dispatcher
                 // can `shape_profile::tick` the right counter on every
                 // invocation. Only meaningful when the compile succeeded
                 // — interpreter-path blocks don't have a bench-comparable
                 // shape.
                 #[cfg(feature = "shape_profile")]
-                if block.compiled.is_some() {
+                {
                     let raws: Vec<u16> = block
                         .instrs
                         .iter()
@@ -509,11 +602,67 @@ impl<I: MemoryInterface> BlockCache<I> {
             }
         }
 
+        #[cfg(feature = "dynarec")]
+        let block_compiled_fn = block.compiled;
+        #[cfg(feature = "dynarec")]
+        let block_fallthrough = block.fallthrough_key;
+        #[cfg(feature = "dynarec")]
+        let block_chain_slot = block.chain_slot.clone();
+
         let pc = key.0 & !1;
         if is_rom_address(pc) {
             self.rom_blocks.insert(key, Rc::new(block));
         } else {
             self.ram_blocks.insert(key, Rc::new(block));
+        }
+
+        // Link-time chaining bookkeeping. Only meaningful under
+        // dynarec and only when we actually compiled the block we
+        // just inserted.
+        #[cfg(feature = "dynarec")]
+        if is_rom_address(pc) {
+            if let (Some(compiled), Some(chain_slot)) =
+                (block_compiled_fn, block_chain_slot.as_ref())
+            {
+                // (a) Try to link THIS block's chain slot to its
+                // fallthrough target if the target is already
+                // compiled. Otherwise park the slot on the waiters
+                // list for that target.
+                if let Some(ft_key) = block_fallthrough {
+                    if let Some(target_block) = self.rom_blocks.get(&ft_key) {
+                        if let Some(target_fn) = target_block.compiled {
+                            chain_slot.store(
+                                target_fn as usize,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        // Target exists but didn't compile: slot stays null
+                        // forever. No point parking in waiters — the target
+                        // won't ever transition to compiled (rom blocks
+                        // are recorded once).
+                    } else {
+                        // Target block not recorded yet. Park our slot so
+                        // that when the target eventually compiles, it can
+                        // retroactively link us.
+                        self.waiters
+                            .entry(ft_key)
+                            .or_default()
+                            .push(Rc::clone(chain_slot));
+                    }
+                }
+
+                // (b) Drain any waiters that were parked against
+                // THIS block's key — retroactively link their chain
+                // slots to our compiled fn. The key is `key` (the
+                // BlockKey we inserted under), which carries the
+                // Thumb bit in bit 0.
+                if let Some(mut parked) = self.waiters.remove(&key) {
+                    let compiled_addr = compiled as usize;
+                    for slot in parked.drain(..) {
+                        slot.store(compiled_addr, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
 
@@ -649,5 +798,77 @@ mod tests {
 
         let block = cache.get(key).expect("block in cache");
         assert!(block.compiled.is_none(), "unsupported shape -> no compile");
+    }
+
+    /// Record a compiled Thumb block of `DYNAREC_MIN_BLOCK_LEN` stub
+    /// MOVs at the given `entry_pc`. The opcode 0x2005 is `MOV R0, #5`
+    /// (Thumb format 3), which the dynarec compiles as a fall-through
+    /// body tail — the one tail shape that gets a chain slot.
+    fn record_stub_block_at(cache: &mut BlockCache<SimpleMemory>, entry_pc: u32) {
+        let key = BlockKey::new(entry_pc, true);
+        cache.begin_record(key);
+        for _ in 0..DYNAREC_MIN_BLOCK_LEN {
+            cache.record_instr(thumb(0x2005, stub_thumb_handler));
+        }
+        cache.finish_record();
+    }
+
+    /// Eager-link case: block A is recorded + compiled first, its
+    /// chain slot ends up parked in the waiters map against the key
+    /// of its fall-through target. When block B is later compiled
+    /// and inserted at that key, the waiter drain populates A's
+    /// chain slot with B's compiled-fn pointer.
+    #[test]
+    fn chaining_waiter_drain_links_predecessor_to_successor() {
+        use std::sync::atomic::Ordering;
+        let mut cache: BlockCache<SimpleMemory> = BlockCache::new();
+        cache.enable_dynarec(
+            DynarecCompiler::new_with_bus(trampolines::for_cpu::<SimpleMemory>()),
+        );
+
+        // Block A at 0x0800_0000 × 4 Thumb instrs (8 bytes) →
+        // fallthrough_key points at 0x0800_0008.
+        record_stub_block_at(&mut cache, 0x0800_0000);
+        // Block B lives at A's fallthrough. Compiling B should drain
+        // A from the waiters map.
+        record_stub_block_at(&mut cache, 0x0800_0008);
+
+        let block_a = cache.get(BlockKey::new(0x0800_0000, true)).expect("A");
+        let block_b = cache.get(BlockKey::new(0x0800_0008, true)).expect("B");
+
+        let a_chain = block_a.chain_slot.as_ref().expect("A has slot");
+        let b_fn = block_b.compiled.expect("B compiled") as usize;
+        assert_eq!(
+            a_chain.load(Ordering::Relaxed),
+            b_fn,
+            "waiter drain should link A's chain slot to B's compiled fn",
+        );
+    }
+
+    /// Immediate-link case: block B is recorded first. When A is
+    /// recorded afterwards, its fall-through lookup finds B already
+    /// compiled and links the chain slot synchronously without going
+    /// through the waiters map.
+    #[test]
+    fn chaining_immediate_link_when_target_compiled_first() {
+        use std::sync::atomic::Ordering;
+        let mut cache: BlockCache<SimpleMemory> = BlockCache::new();
+        cache.enable_dynarec(
+            DynarecCompiler::new_with_bus(trampolines::for_cpu::<SimpleMemory>()),
+        );
+
+        record_stub_block_at(&mut cache, 0x0800_0008);
+        record_stub_block_at(&mut cache, 0x0800_0000);
+
+        let block_a = cache.get(BlockKey::new(0x0800_0000, true)).expect("A");
+        let block_b = cache.get(BlockKey::new(0x0800_0008, true)).expect("B");
+
+        let a_chain = block_a.chain_slot.as_ref().expect("A has slot");
+        let b_fn = block_b.compiled.expect("B compiled") as usize;
+        assert_eq!(
+            a_chain.load(Ordering::Relaxed),
+            b_fn,
+            "eager link should set A's chain slot to B's compiled fn",
+        );
     }
 }

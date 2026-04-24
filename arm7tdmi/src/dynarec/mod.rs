@@ -99,6 +99,16 @@ pub type BusIdleCycleFn = unsafe extern "C" fn(*mut u8);
 /// Called once at each compiled Thumb block's entry so cycle accounting
 /// stays parity-correct with the interpreter.
 pub type BusThumbFetchNFn = unsafe extern "C" fn(*mut u8, u32, u32);
+/// Link-time block-chaining guard. Called from a compiled block's
+/// Tail::Body epilogue immediately before it tail-calls its linked
+/// successor block. Returns non-zero when the outer dispatcher must
+/// get control back instead of staying on the compiled hot path —
+/// mirrors the abort conditions that scalar `replay_cached_block`
+/// checks every other instruction:
+///   - RAM dirty (self-modifying code flush).
+///   - `cached_block_should_abort` (IRQ / DMA / halt / scheduler event).
+/// Returns 0 to continue into the chain target.
+pub type BusChainAbortCheckFn = unsafe extern "C" fn(*mut u8) -> u32;
 
 /// Generic bus trampolines. Instantiate with the concrete MemoryInterface
 /// type of your CPU. The `cpu_ctx` opaque pointer passed to the dynarec
@@ -242,6 +252,38 @@ pub mod trampolines {
         cpu.pc = first_fetch_pc.wrapping_add(2 * count);
     }
 
+    /// Chain-abort check called from the compiled-block epilogue right
+    /// before tail-calling the chained successor. Returns non-zero when
+    /// the compiled hot path must bail to the outer dispatcher —
+    /// mirrors the checks scalar `replay_cached_block` does every
+    /// other instruction. Only queried when a chain slot is linked;
+    /// unlinked blocks skip straight to normal return.
+    ///
+    /// If `take_block_cache_dirty` is true this ALSO flushes the RAM
+    /// side of the cache, matching scalar's behavior at the same
+    /// check point (cpu.rs:632-635).
+    #[cfg(feature = "cached_interp")]
+    pub unsafe extern "C" fn chain_abort_check<I: MemoryInterface>(ctx: *mut u8) -> u32 {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        if cpu.bus.take_block_cache_dirty() {
+            cpu.block_cache.flush();
+            return 1;
+        }
+        if cpu.bus.cached_block_should_abort() {
+            return 1;
+        }
+        0
+    }
+    /// Stand-in for builds without `cached_interp` — the whole
+    /// chaining path is a no-op there because block-cache state
+    /// doesn't exist. Always returns 1 ("abort") so that even if the
+    /// chain slot happens to be non-null the compiled code bails to
+    /// the dispatcher instead of calling through a stale pointer.
+    #[cfg(not(feature = "cached_interp"))]
+    pub unsafe extern "C" fn chain_abort_check<I: MemoryInterface>(_ctx: *mut u8) -> u32 {
+        1
+    }
+
     /// Fill a `BusTrampolines` with pointers to the generic trampolines
     /// monomorphized for `I`. Call once at compiler construction time and
     /// hand the returned struct to `DynarecCompiler::new_with_bus`.
@@ -257,6 +299,7 @@ pub mod trampolines {
             pay_thumb_fetch_extra_nonseq: pay_thumb_fetch_extra_nonseq::<I>,
             idle_cycle: idle_cycle::<I>,
             thumb_fetch_n: thumb_fetch_n::<I>,
+            chain_abort_check: chain_abort_check::<I>,
         }
     }
 }
@@ -281,6 +324,9 @@ pub struct BusTrampolines {
     /// Standalone +1I idle cycle for POP/POP{PC} end-of-load idle.
     pub idle_cycle: BusIdleCycleFn,
     pub thumb_fetch_n: BusThumbFetchNFn,
+    /// Link-time block-chaining abort guard. Consulted from compiled
+    /// Tail::Body epilogues before a chained tail-call.
+    pub chain_abort_check: BusChainAbortCheckFn,
 }
 
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
@@ -313,6 +359,7 @@ struct BusImports {
     pay_thumb_fetch_extra_nonseq: FuncId,
     idle_cycle: FuncId,
     thumb_fetch_n: FuncId,
+    chain_abort_check: FuncId,
 }
 
 impl DynarecCompiler {
@@ -360,6 +407,7 @@ impl DynarecCompiler {
                                                               b.pay_thumb_fetch_extra_nonseq as *const u8);
             jit_builder.symbol("rba_idle_cycle",             b.idle_cycle           as *const u8);
             jit_builder.symbol("rba_thumb_fetch_n",          b.thumb_fetch_n        as *const u8);
+            jit_builder.symbol("rba_chain_abort_check",      b.chain_abort_check    as *const u8);
         }
 
         let mut module = JITModule::new(jit_builder);
@@ -456,6 +504,14 @@ impl DynarecCompiler {
                 .declare_function("rba_thumb_fetch_n", Linkage::Import, &sig_fetch_n)
                 .expect("declare thumb_fetch_n failed");
 
+            // chain_abort_check: extern "C" fn(*mut u8) -> u32
+            let mut sig_chain_abort = module.make_signature();
+            sig_chain_abort.params.push(AbiParam::new(ptr_ty));
+            sig_chain_abort.returns.push(AbiParam::new(types::I32));
+            let chain_abort_check = module
+                .declare_function("rba_chain_abort_check", Linkage::Import, &sig_chain_abort)
+                .expect("declare chain_abort_check failed");
+
             BusImports {
                 load_32,
                 store_32,
@@ -467,6 +523,7 @@ impl DynarecCompiler {
                 pay_thumb_fetch_extra_nonseq,
                 idle_cycle,
                 thumb_fetch_n,
+                chain_abort_check,
             }
         });
 
@@ -1668,15 +1725,38 @@ impl DynarecCompiler {
     ///
     /// Requires bus trampolines (new_with_bus). Returns None for any
     /// unsupported encoding or if the compiler has no bus.
+    ///
+    /// `chain_slot`, when `Some`, is a stable-address slot whose
+    /// 64-bit payload is baked in to the compiled code as the chain
+    /// target (a `CompiledThumbFn` pointer). The caller is expected
+    /// to (1) allocate the slot before calling this function, (2)
+    /// keep it alive for the lifetime of the returned compiled fn,
+    /// and (3) write the successor block's compiled fn pointer into
+    /// the slot when the block cache links them. When the slot is
+    /// non-null at runtime AND the chain-abort check returns 0, the
+    /// compiled epilogue tail-calls the slot value instead of
+    /// returning to the outer dispatcher — the link-time block
+    /// chaining hot path. `None` disables chain emission (pure
+    /// dispatcher-return codegen, equivalent to the pre-chaining
+    /// behavior).
+    ///
+    /// Chain emission is only meaningful for `Tail::Body` tails
+    /// (fall-through blocks). `Tail::Bx/PcBranch/PopPc` end a block
+    /// by definition — they already set `pc_out` + `taken=1` and
+    /// return, so chain emission is a no-op for them even when a
+    /// slot is supplied.
     pub fn try_compile_thumb_mem_block_with_branch(
         &mut self,
         opcodes: &[u16],
         entry_pc: u32,
+        chain_slot: Option<&crate::cache::ChainSlot>,
     ) -> Option<extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u8) -> u32> {
         if opcodes.is_empty() {
             return None;
         }
         let imports = self.bus_imports?;
+        let chain_slot_addr: Option<i64> =
+            chain_slot.map(|s| s as *const crate::cache::ChainSlot as i64);
 
         enum Body {
             F1(DecodedThumb1),
@@ -1776,6 +1856,11 @@ impl DynarecCompiler {
             .module
             .declare_function(&name, Linkage::Local, &sig)
             .expect("declare_function failed");
+        // Keep a copy for `import_signature` so `call_indirect` can
+        // target a slot-loaded function pointer with the same ABI as
+        // this compiled block. Needed only when chain emission is
+        // enabled (`chain_slot_addr` is `Some`).
+        let self_sig_template = sig.clone();
         self.ctx.func.signature = sig;
 
         {
@@ -1897,6 +1982,93 @@ impl DynarecCompiler {
                             .module
                             .declare_func_in_func(imports.set_next_fetch_nonseq, builder.func);
                         builder.ins().call(nonseq_ref, &[cpu_ctx]);
+                    }
+                    // Link-time block-chaining check. When a `chain_slot`
+                    // was supplied at compile time, emit a load of the
+                    // slot's 64-bit payload. If non-null AND the
+                    // chain-abort check returns 0, tail-call the slot
+                    // value (a `CompiledThumbFn`) with the same 4-arg
+                    // signature instead of returning to the outer
+                    // dispatcher. Null-slot or abort-nonzero falls
+                    // through to the normal `return took_var` epilogue.
+                    //
+                    // Correctness: the abort check mirrors what scalar
+                    // `replay_cached_block` does every other instruction
+                    // (RAM dirty / IRQ / DMA / halt / scheduler event).
+                    // Chain emission runs only for fall-through `Tail::Body`
+                    // blocks, which cannot flip the ARM/Thumb state in
+                    // the body, so we don't need an extra state-flip
+                    // guard here.
+                    if let Some(slot_addr) = chain_slot_addr {
+                        let chain_abort_ref = self
+                            .module
+                            .declare_func_in_func(imports.chain_abort_check, builder.func);
+                        let self_sig_ref =
+                            builder.import_signature(self_sig_template.clone());
+
+                        let slot_addr_val = builder
+                            .ins()
+                            .iconst(types::I64, slot_addr);
+                        let chain_fn_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            slot_addr_val,
+                            0,
+                        );
+
+                        let chain_try_blk = builder.create_block();
+                        let chain_call_blk = builder.create_block();
+                        let chain_merge_blk = builder.create_block();
+
+                        let is_nonnull = builder
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, chain_fn_ptr, 0);
+                        builder.ins().brif(
+                            is_nonnull,
+                            chain_try_blk,
+                            &[],
+                            chain_merge_blk,
+                            &[],
+                        );
+
+                        builder.switch_to_block(chain_try_blk);
+                        builder.seal_block(chain_try_blk);
+                        let abort_call =
+                            builder.ins().call(chain_abort_ref, &[cpu_ctx]);
+                        let abort = builder.inst_results(abort_call)[0];
+                        let abort_nz = builder
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, abort, 0);
+                        builder.ins().brif(
+                            abort_nz,
+                            chain_merge_blk,
+                            &[],
+                            chain_call_blk,
+                            &[],
+                        );
+
+                        builder.switch_to_block(chain_call_blk);
+                        builder.seal_block(chain_call_blk);
+                        // Flush our cpsr_var to *cpsr_ptr before
+                        // handing off — the tail-called block reads
+                        // cpsr fresh from *cpsr_ptr at its own entry.
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            cpsr_cur,
+                            cpsr_ptr,
+                            0,
+                        );
+                        let indirect_call = builder.ins().call_indirect(
+                            self_sig_ref,
+                            chain_fn_ptr,
+                            &[gpr_ptr, cpsr_ptr, pc_out, cpu_ctx],
+                        );
+                        let chained_ret = builder.inst_results(indirect_call)[0];
+                        builder.ins().return_(&[chained_ret]);
+
+                        builder.switch_to_block(chain_merge_blk);
+                        builder.seal_block(chain_merge_blk);
                     }
                 }
                 Tail::Bx(bx) => {
@@ -4363,6 +4535,11 @@ mod tests {
     unsafe extern "C" fn test_pay_thumb_fetch_extra_nonseq(_ctx: *mut u8, _pc: u32) {}
     /// No-op idle trampoline stub; these tests don't observe scheduler state.
     unsafe extern "C" fn test_idle_cycle(_ctx: *mut u8) {}
+    /// Chain-abort stub. Tests don't exercise chaining (no real
+    /// Arm7tdmiCore behind ctx), so the stub returns 1 — "always
+    /// abort" — which prevents codegen-emitted chain checks from
+    /// tail-calling through a (deliberately null) chain slot.
+    unsafe extern "C" fn test_chain_abort_check(_ctx: *mut u8) -> u32 { 1 }
 
     fn test_trampolines() -> BusTrampolines {
         BusTrampolines {
@@ -4376,6 +4553,7 @@ mod tests {
             pay_thumb_fetch_extra_nonseq: test_pay_thumb_fetch_extra_nonseq,
             idle_cycle: test_idle_cycle,
             thumb_fetch_n: test_thumb_fetch_n,
+            chain_abort_check: test_chain_abort_check,
         }
     }
 
@@ -4857,7 +5035,7 @@ mod tests {
             super::trampolines::for_cpu::<CycleCountingMemWithExtra>(),
         );
         let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&opcodes, 0x0800_0000)
+            .try_compile_thumb_mem_block_with_branch(&opcodes, 0x0800_0000, None)
             .expect("compiles");
 
         let mut gpr = [0u32; 15];
@@ -4890,7 +5068,7 @@ mod tests {
             super::trampolines::for_cpu::<CycleCountingMemWithExtra>(),
         );
         let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&opcodes, 0x0800_0000)
+            .try_compile_thumb_mem_block_with_branch(&opcodes, 0x0800_0000, None)
             .expect("compiles");
 
         let mut gpr = [0u32; 15];
@@ -4986,7 +5164,7 @@ mod tests {
         let (bus, mut compiler) = new_bus_and_compiler();
         // MOV R0, #5  (no branch, no memory)
         let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&[0x2005], 0x0800_0000)
+            .try_compile_thumb_mem_block_with_branch(&[0x2005], 0x0800_0000, None)
             .expect("compiles");
 
         let mut gpr = [0u32; 15];
@@ -5006,7 +5184,7 @@ mod tests {
         let (bus, mut compiler) = new_bus_and_compiler();
         // BX LR  -> 0x4770
         let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&[0x4770], 0x0800_0000)
+            .try_compile_thumb_mem_block_with_branch(&[0x4770], 0x0800_0000, None)
             .unwrap();
 
         let mut gpr = [0u32; 15];
@@ -5031,7 +5209,7 @@ mod tests {
         }
         // POP {PC}
         let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&[0xBD00], 0)
+            .try_compile_thumb_mem_block_with_branch(&[0xBD00], 0, None)
             .unwrap();
 
         let mut gpr = [0u32; 15];
@@ -5066,6 +5244,7 @@ mod tests {
             .try_compile_thumb_mem_block_with_branch(
                 &[0x2001, 0x9004, 0xBD10],
                 0x0800_3000,
+                None,
             )
             .expect("compiles");
 
@@ -5093,7 +5272,7 @@ mod tests {
         let (bus, mut compiler) = new_bus_and_compiler();
         // BEQ +4 with Z=0 -> not taken, pc_out untouched, return 0.
         let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&[0xD002], 0x0800_4000)
+            .try_compile_thumb_mem_block_with_branch(&[0xD002], 0x0800_4000, None)
             .unwrap();
         let mut gpr = [0u32; 15];
         let mut cpsr = 0u32;
@@ -5111,11 +5290,11 @@ mod tests {
         let (_bus, mut compiler) = new_bus_and_compiler();
         // BX followed by MOV -> BX not in last slot -> reject.
         assert!(compiler
-            .try_compile_thumb_mem_block_with_branch(&[0x4770, 0x2001], 0)
+            .try_compile_thumb_mem_block_with_branch(&[0x4770, 0x2001], 0, None)
             .is_none());
         // POP{PC} in middle, same.
         assert!(compiler
-            .try_compile_thumb_mem_block_with_branch(&[0xBD00, 0x2001], 0)
+            .try_compile_thumb_mem_block_with_branch(&[0xBD00, 0x2001], 0, None)
             .is_none());
     }
 
@@ -5123,7 +5302,7 @@ mod tests {
     fn unified_thumb_requires_bus() {
         let mut compiler = DynarecCompiler::new();
         assert!(compiler
-            .try_compile_thumb_mem_block_with_branch(&[0x2005], 0)
+            .try_compile_thumb_mem_block_with_branch(&[0x2005], 0, None)
             .is_none());
     }
 
