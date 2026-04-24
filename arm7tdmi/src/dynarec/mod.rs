@@ -118,6 +118,21 @@ pub type BusChainAbortCheckFn = unsafe extern "C" fn(*mut u8) -> u32;
 /// opcodes from the recorded block).
 pub type BusAbortMidBlockFn =
     unsafe extern "C" fn(*mut u8, u32 /* pc */, u32 /* pipe0 */, u32 /* pipe1 */);
+/// Per-iter Thumb fetch replacement for `thumb_fetch_n`'s pre-payment.
+/// Called ONCE per body/tail instruction from the compiled block, BEFORE
+/// the instruction's emit. Fetches at `addr` using the access mode
+/// indicated by `access_hint` (0 = NonSeq, 1 = Seq, 2 = read from
+/// cpu.next_fetch_access — used for the first iter of a block), charges
+/// cycles via `cpu.load_16` (which goes through `sysbus.add_cycles`),
+/// shifts `pipeline[0] = pipeline[1]`, sets `pipeline[1] = fetched`,
+/// advances `cpu.pc` by 2. Does NOT modify `cpu.next_fetch_access` —
+/// the caller is responsible for writing it AFTER the body item's emit
+/// finishes (so subsequent iter's fetch access reflects this iter's
+/// AdvancePC return).
+pub type BusThumbFetchChargeShiftFn = unsafe extern "C" fn(*mut u8, u32, u32);
+/// Write `cpu.next_fetch_access`. access_hint: 0=NonSeq, 1=Seq.
+/// Used by per-iter codegen to mirror scalar's handler-driven update.
+pub type BusSetNextFetchAccessFn = unsafe extern "C" fn(*mut u8, u32);
 
 /// Generic bus trampolines. Instantiate with the concrete MemoryInterface
 /// type of your CPU. The `cpu_ctx` opaque pointer passed to the dynarec
@@ -382,6 +397,42 @@ pub mod trampolines {
         cpu.next_fetch_access = MemoryAccess::Seq;
     }
 
+    /// Per-iter Thumb fetch + pipeline-shift + pc-advance. See the
+    /// BusThumbFetchChargeShiftFn type doc for semantics. access_hint
+    /// = 0 (NonSeq), 1 (Seq), 2 (read cpu.next_fetch_access — used for
+    /// the first iter of a block).
+    pub unsafe extern "C" fn thumb_fetch_charge_shift<I: MemoryInterface>(
+        ctx: *mut u8,
+        addr: u32,
+        access_hint: u32,
+    ) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        let access = match access_hint {
+            0 => MemoryAccess::NonSeq,
+            1 => MemoryAccess::Seq,
+            _ => cpu.next_fetch_access,
+        };
+        let val = cpu.load_16(addr, access) as u32;
+        cpu.pipeline[0] = cpu.pipeline[1];
+        cpu.pipeline[1] = val;
+        cpu.pc = addr.wrapping_add(2);
+    }
+
+    /// Write `cpu.next_fetch_access`. Called by the per-iter codegen
+    /// after each body emit to mirror scalar's per-iter update of
+    /// `self.next_fetch_access` from the instruction handler's
+    /// `AdvancePC(access)` return value. access_hint: 0=NonSeq, 1=Seq.
+    pub unsafe extern "C" fn set_next_fetch_access<I: MemoryInterface>(
+        ctx: *mut u8,
+        access_hint: u32,
+    ) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.next_fetch_access = match access_hint {
+            0 => MemoryAccess::NonSeq,
+            _ => MemoryAccess::Seq,
+        };
+    }
+
     /// Fill a `BusTrampolines` with pointers to the generic trampolines
     /// monomorphized for `I`. Call once at compiler construction time and
     /// hand the returned struct to `DynarecCompiler::new_with_bus`.
@@ -404,6 +455,8 @@ pub mod trampolines {
             thumb_fetch_n: thumb_fetch_n::<I>,
             chain_abort_check: chain_abort_check::<I>,
             abort_mid_block: abort_mid_block::<I>,
+            thumb_fetch_charge_shift: thumb_fetch_charge_shift::<I>,
+            set_next_fetch_access: set_next_fetch_access::<I>,
         }
     }
 }
@@ -443,6 +496,16 @@ pub struct BusTrampolines {
     pub chain_abort_check: BusChainAbortCheckFn,
     /// Mid-block abort state writeback (pc + pipeline[0/1] + next_fetch_access).
     pub abort_mid_block: BusAbortMidBlockFn,
+    /// Per-iter Thumb fetch + pipeline-shift + pc-advance. Replaces
+    /// `thumb_fetch_n`'s block-entry pre-payment with one call per
+    /// instruction, matching scalar `replay_cached_block`'s per-iter
+    /// cycle accounting so mid-block abort checks see the same
+    /// scheduler timestamp as scalar would.
+    pub thumb_fetch_charge_shift: BusThumbFetchChargeShiftFn,
+    /// Write `cpu.next_fetch_access`. Called by per-iter codegen after
+    /// each body emit to mirror scalar's handler-driven update of
+    /// `self.next_fetch_access` from `AdvancePC(access)` returns.
+    pub set_next_fetch_access: BusSetNextFetchAccessFn,
 }
 
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
@@ -487,6 +550,8 @@ struct BusImports {
     thumb_fetch_n: FuncId,
     chain_abort_check: FuncId,
     abort_mid_block: FuncId,
+    thumb_fetch_charge_shift: FuncId,
+    set_next_fetch_access: FuncId,
 }
 
 impl DynarecCompiler {
@@ -541,6 +606,10 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_thumb_fetch_n",          b.thumb_fetch_n        as *const u8);
             jit_builder.symbol("rba_chain_abort_check",      b.chain_abort_check    as *const u8);
             jit_builder.symbol("rba_abort_mid_block",        b.abort_mid_block      as *const u8);
+            jit_builder.symbol("rba_thumb_fetch_charge_shift",
+                                                              b.thumb_fetch_charge_shift as *const u8);
+            jit_builder.symbol("rba_set_next_fetch_access",
+                                                              b.set_next_fetch_access as *const u8);
         }
 
         let mut module = JITModule::new(jit_builder);
@@ -675,6 +744,31 @@ impl DynarecCompiler {
                 .declare_function("rba_abort_mid_block", Linkage::Import, &sig_abort_mid)
                 .expect("declare abort_mid_block failed");
 
+            // thumb_fetch_charge_shift: extern "C" fn(*mut u8, u32 addr, u32 access_hint)
+            let mut sig_fetch_cs = module.make_signature();
+            sig_fetch_cs.params.push(AbiParam::new(ptr_ty));
+            sig_fetch_cs.params.push(AbiParam::new(types::I32));
+            sig_fetch_cs.params.push(AbiParam::new(types::I32));
+            let thumb_fetch_charge_shift = module
+                .declare_function(
+                    "rba_thumb_fetch_charge_shift",
+                    Linkage::Import,
+                    &sig_fetch_cs,
+                )
+                .expect("declare thumb_fetch_charge_shift failed");
+
+            // set_next_fetch_access: extern "C" fn(*mut u8, u32 hint)
+            let mut sig_set_access = module.make_signature();
+            sig_set_access.params.push(AbiParam::new(ptr_ty));
+            sig_set_access.params.push(AbiParam::new(types::I32));
+            let set_next_fetch_access = module
+                .declare_function(
+                    "rba_set_next_fetch_access",
+                    Linkage::Import,
+                    &sig_set_access,
+                )
+                .expect("declare set_next_fetch_access failed");
+
             BusImports {
                 load_32,
                 store_32,
@@ -693,6 +787,8 @@ impl DynarecCompiler {
                 thumb_fetch_n,
                 chain_abort_check,
                 abort_mid_block,
+                thumb_fetch_charge_shift,
+                set_next_fetch_access,
             }
         });
 
@@ -2095,6 +2191,11 @@ impl DynarecCompiler {
         let imports = self.bus_imports?;
         let chain_slot_addr: Option<i64> =
             chain_slot.map(|s| s as *const crate::cache::ChainSlot as i64);
+        // DYNAREC_DEBUG=per-iter-fetch switches codegen from fetch_n
+        // block-entry pre-payment to per-iter fetch_charge_shift, which
+        // matches scalar `replay_cached_block`'s per-iter cycle
+        // accounting exactly (eliminates abort-check timestamp skew).
+        let per_iter_fetch = crate::cache::dynarec_per_iter_fetch();
 
         enum Body {
             F1(DecodedThumb1),
@@ -2350,18 +2451,28 @@ impl DynarecCompiler {
                 .declare_func_in_func(imports.idle_cycle, builder.func);
             let entry_pc_val = builder.ins().iconst(types::I32, entry_pc as i64);
 
-            // Pay fetch cycles for the whole block up front and let the
-            // trampoline stage pipeline[0/1] + pc + next_fetch_access so
-            // the register-only block body can run without any further
-            // bus access on the instruction side. first_fetch_pc is
-            // block_start_addr + 4 per the Thumb pipeline-head convention;
-            // entry_pc in this compile API is block_start_addr.
+            // Pay fetch cycles. Two models:
+            //   - fetch_n (default): pre-pay all N fetches at block entry.
+            //     Fast (one trampoline call) but advances scheduler.timestamp
+            //     atomically, causing mid-block abort_checks to see events
+            //     as due (N-1)*s cycles earlier than scalar's per-iter
+            //     timestamp — source of the 23 pokeemerald SDL divergences.
+            //   - per-iter (DYNAREC_DEBUG=per-iter-fetch): one fetch call
+            //     per body/tail iteration, interleaved with emit_body and
+            //     with check-before-fetch at odd iters. Matches scalar
+            //     exactly.
             let total_count = (body.len() as u32) + 1; // body + tail
-            let first_fetch_pc_val = builder
-                .ins()
-                .iconst(types::I32, (entry_pc.wrapping_add(4)) as i64);
-            let count_val = builder.ins().iconst(types::I32, total_count as i64);
-            builder.ins().call(fetch_n_ref, &[cpu_ctx, first_fetch_pc_val, count_val]);
+            if !per_iter_fetch {
+                let first_fetch_pc_val = builder
+                    .ins()
+                    .iconst(types::I32, (entry_pc.wrapping_add(4)) as i64);
+                let count_val = builder.ins().iconst(types::I32, total_count as i64);
+                builder.ins().call(fetch_n_ref, &[cpu_ctx, first_fetch_pc_val, count_val]);
+            }
+            // Silence unused-variable warning when per_iter_fetch is on
+            // and fetch_n_ref was declared but not called.
+            let _ = fetch_n_ref;
+            let _ = total_count;
 
             // NZCV bitmask: N=8, Z=4, C=2, V=1. Mirrors the table
             // in the `try_compile_thumb_block` dead-flag pass.
@@ -2501,21 +2612,155 @@ impl DynarecCompiler {
             let abort_mid_ref = self
                 .module
                 .declare_func_in_func(imports.abort_mid_block, builder.func);
+            // Per-iter trampolines — only used when per_iter_fetch is on.
+            // Declared unconditionally so the FuncRefs live in the right
+            // scope; Cranelift will dead-code-eliminate the unused ones.
+            let fetch_cs_ref = self
+                .module
+                .declare_func_in_func(imports.thumb_fetch_charge_shift, builder.func);
+            let set_access_ref = self
+                .module
+                .declare_func_in_func(imports.set_next_fetch_access, builder.func);
+            let _ = abort_mid_ref; // unused in per-iter path
+
+            // Helper: AdvancePC access hint for a body item (0=NonSeq, 1=Seq).
+            // Used by per-iter fetch_charge_shift + set_next_fetch_access
+            // to match scalar handlers' `AdvancePC(access)` returns
+            // exactly. Does NOT use `body_item_is_nonseq_advance`
+            // because that helper's F6 classification is Seq (a legacy
+            // under-count that fetch_n tolerated); scalar's
+            // `exec_thumb_ldr_pc` returns NonSeq.
+            fn advance_hint(item: &Body) -> u32 {
+                match item {
+                    Body::F6(_) => 0, // scalar: AdvancePC(NonSeq)
+                    Body::F7(d) => if !d.load { 0 } else { 1 },
+                    Body::F8(_) => 0, // all 4 sub-ops return NonSeq
+                    Body::F9(d) => if !d.load { 0 } else { 1 },
+                    Body::F10(d) => if !d.load { 0 } else { 1 },
+                    Body::F11(d) => if !d.load { 0 } else { 1 },
+                    Body::F14(_) => 0, // PUSH + POP both NonSeq
+                    Body::F15(_) => 0, // LDM + STM both NonSeq
+                    // F1-F5 ALU, F12 load-address, F13 ADD SP: all Seq.
+                    _ => 1,
+                }
+            }
+            // Helper: emit fetch_charge_shift for a specific iter.
+            // `prev_access_hint` = 2 for iter 0 (read cpu.next_fetch_access);
+            // else 0/1 from previous body's AdvancePC return.
+            let emit_fetch_iter =
+                |builder: &mut FunctionBuilder, iter: usize, prev_access_hint: u32| {
+                    let addr = entry_pc
+                        .wrapping_add(4)
+                        .wrapping_add((2 * iter) as u32);
+                    let addr_val = builder.ins().iconst(types::I32, addr as i64);
+                    let hint_val = builder.ins().iconst(types::I32, prev_access_hint as i64);
+                    builder
+                        .ins()
+                        .call(fetch_cs_ref, &[cpu_ctx, addr_val, hint_val]);
+                };
+            let emit_set_access =
+                |builder: &mut FunctionBuilder, hint: u32| {
+                    let hint_val = builder.ins().iconst(types::I32, hint as i64);
+                    builder.ins().call(set_access_ref, &[cpu_ctx, hint_val]);
+                };
+            let _ = (&emit_fetch_iter, &emit_set_access); // silence unused when per_iter_fetch is off
 
             for (k, item) in body.iter().enumerate() {
                 let instr_pc = entry_pc.wrapping_add((2 * k) as u32);
+
+                if per_iter_fetch {
+                    // Abort check BEFORE this iter's fetch (scalar
+                    // checks at iter 1, 3, 5 before fetching that
+                    // iter's instruction). pc/pipeline/next_fetch_access
+                    // state is already correct from previous iter's
+                    // fetch_charge_shift + set_next_fetch_access calls,
+                    // so abort just flushes cpsr and returns 2.
+                    if k >= 1 && k % 2 == 1 {
+                        let abort_call = builder.ins().call(abort_chain_ref, &[cpu_ctx]);
+                        let abort = builder.inst_results(abort_call)[0];
+                        let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
+                        let do_abort_blk = builder.create_block();
+                        let cont_blk = builder.create_block();
+                        builder.ins().brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
+
+                        builder.switch_to_block(do_abort_blk);
+                        builder.seal_block(do_abort_blk);
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), cpsr_cur, cpsr_ptr, 0);
+                        let abort_ret = builder.ins().iconst(types::I32, 2);
+                        builder.ins().return_(&[abort_ret]);
+
+                        builder.switch_to_block(cont_blk);
+                        builder.seal_block(cont_blk);
+                    }
+                    // Per-iter fetch: charge cycles, shift pipeline,
+                    // advance pc. access_hint: iter 0 reads
+                    // cpu.next_fetch_access (runtime, from prev block);
+                    // iter >= 1 uses compile-time body[k-1].AdvancePC.
+                    let prev_hint = if k == 0 { 2 } else { advance_hint(&body[k - 1]) };
+                    emit_fetch_iter(&mut builder, k, prev_hint);
+                }
+
                 emit_body(&mut builder, item, skip_flags[k], instr_pc);
-                // Mid-block abort check — match scalar's
-                // `instr_idx != 0 && instr_idx & 1 == 1` cadence:
-                // scalar checks AT THE START of iters 1, 3, 5, ...
-                // which is AFTER iters 0, 2, 4, ... finish. Mirror
-                // by checking after body[k] at even k. Skip if
-                // pipeline[1] at the abort point would be past the
-                // block (k+2 >= opcodes.len()) — we'd need a bus
-                // fetch to reconstruct it. Minor drift residue at
-                // the last abort-eligible position; catches the
-                // bulk of the inter-event drift.
-                if k % 2 == 0 && k + 2 < opcodes.len() {
+
+                if per_iter_fetch {
+                    // Update cpu.next_fetch_access from this iter's
+                    // AdvancePC return. Matches scalar's per-iter
+                    // handler-driven update of self.next_fetch_access.
+                    emit_set_access(&mut builder, advance_hint(item));
+                } else {
+                    // Legacy fetch_n path: abort check AFTER body at
+                    // even k (= scalar iter k+1 check), with pipeline
+                    // fixup via abort_mid_block. Timestamp mismatch
+                    // with scalar at the check point is the 23-div
+                    // root cause; see `per_iter_fetch` branch above
+                    // for the fix.
+                    if k % 2 == 0 && k + 2 < opcodes.len() {
+                        let abort_call = builder.ins().call(abort_chain_ref, &[cpu_ctx]);
+                        let abort = builder.inst_results(abort_call)[0];
+                        let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
+                        let do_abort_blk = builder.create_block();
+                        let cont_blk = builder.create_block();
+                        builder.ins().brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
+
+                        builder.switch_to_block(do_abort_blk);
+                        builder.seal_block(do_abort_blk);
+                        let abort_pc = entry_pc.wrapping_add((2 * (k + 1)) as u32).wrapping_add(4);
+                        let pipe0 = opcodes[k + 1] as u32;
+                        let pipe1 = opcodes[k + 2] as u32;
+                        let pc_val = builder.ins().iconst(types::I32, abort_pc as i64);
+                        let p0 = builder.ins().iconst(types::I32, pipe0 as i64);
+                        let p1 = builder.ins().iconst(types::I32, pipe1 as i64);
+                        builder
+                            .ins()
+                            .call(abort_mid_ref, &[cpu_ctx, pc_val, p0, p1]);
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), cpsr_cur, cpsr_ptr, 0);
+                        let abort_ret = builder.ins().iconst(types::I32, 2);
+                        builder.ins().return_(&[abort_ret]);
+
+                        builder.switch_to_block(cont_blk);
+                        builder.seal_block(cont_blk);
+                    }
+                    if body_item_is_nonseq_advance(item) {
+                        builder
+                            .ins()
+                            .call(pay_extra_nonseq_ref, &[cpu_ctx, entry_pc_val]);
+                    }
+                }
+            }
+
+            // Per-iter tail fetch: same cadence (check-before-fetch at
+            // odd iter if odd; fetch with prev body's AdvancePC hint).
+            // `tail_iter` = body.len() — the 0-indexed position of the
+            // tail instruction in the block's iter stream.
+            if per_iter_fetch {
+                let tail_iter = body.len();
+                if tail_iter >= 1 && tail_iter % 2 == 1 {
                     let abort_call = builder.ins().call(abort_chain_ref, &[cpu_ctx]);
                     let abort = builder.inst_results(abort_call)[0];
                     let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
@@ -2525,17 +2770,6 @@ impl DynarecCompiler {
 
                     builder.switch_to_block(do_abort_blk);
                     builder.seal_block(do_abort_blk);
-                    // Abort point: pc points at body[k+1]'s pipeline-head.
-                    let abort_pc = entry_pc.wrapping_add((2 * (k + 1)) as u32).wrapping_add(4);
-                    let pipe0 = opcodes[k + 1] as u32;
-                    let pipe1 = opcodes[k + 2] as u32;
-                    let pc_val = builder.ins().iconst(types::I32, abort_pc as i64);
-                    let p0 = builder.ins().iconst(types::I32, pipe0 as i64);
-                    let p1 = builder.ins().iconst(types::I32, pipe1 as i64);
-                    builder
-                        .ins()
-                        .call(abort_mid_ref, &[cpu_ctx, pc_val, p0, p1]);
-                    // Flush cpsr_var, set abort-signal return (bit 1 = 2).
                     let cpsr_cur = builder.use_var(cpsr_var);
                     builder
                         .ins()
@@ -2546,18 +2780,12 @@ impl DynarecCompiler {
                     builder.switch_to_block(cont_blk);
                     builder.seal_block(cont_blk);
                 }
-                // Compensate for the under-counted next fetch when this
-                // body item is a STORE: scalar would have charged NonSeq
-                // for the fetch that follows, but `thumb_fetch_n` paid
-                // Seq up front. One trampoline call per intermediate
-                // store covers both:
-                //   - in-body STORE → next body item's fetch
-                //   - last body STORE → tail/branch fetch
-                if body_item_is_nonseq_advance(item) {
-                    builder
-                        .ins()
-                        .call(pay_extra_nonseq_ref, &[cpu_ctx, entry_pc_val]);
-                }
+                let prev_hint = if tail_iter == 0 {
+                    2
+                } else {
+                    advance_hint(&body[tail_iter - 1])
+                };
+                emit_fetch_iter(&mut builder, tail_iter, prev_hint);
             }
 
             let took_var = builder.declare_var(types::I32);
@@ -2581,12 +2809,21 @@ impl DynarecCompiler {
                     // fetch is paid by the cached-interp loop out of
                     // `cpu.next_fetch_access`, so we need to flip it to
                     // NonSeq here if the last instruction was a store.
-                    let tail_is_nonseq = body_item_is_nonseq_advance(b);
-                    if tail_is_nonseq {
-                        let nonseq_ref = self
-                            .module
-                            .declare_func_in_func(imports.set_next_fetch_nonseq, builder.func);
-                        builder.ins().call(nonseq_ref, &[cpu_ctx]);
+                    if per_iter_fetch {
+                        // Update cpu.next_fetch_access from the tail
+                        // body's AdvancePC return. The caller reads
+                        // cpu.next_fetch_access at the NEXT block's
+                        // first fetch (fetch_charge_shift iter 0
+                        // hint=2 → read cpu.next_fetch_access).
+                        emit_set_access(&mut builder, advance_hint(b));
+                    } else {
+                        let tail_is_nonseq = body_item_is_nonseq_advance(b);
+                        if tail_is_nonseq {
+                            let nonseq_ref = self
+                                .module
+                                .declare_func_in_func(imports.set_next_fetch_nonseq, builder.func);
+                            builder.ins().call(nonseq_ref, &[cpu_ctx]);
+                        }
                     }
                     // Link-time block-chaining check. When a `chain_slot`
                     // was supplied at compile time, emit a load of the
@@ -5762,6 +5999,9 @@ mod tests {
     unsafe extern "C" fn test_abort_mid_block(
         _ctx: *mut u8, _pc: u32, _p0: u32, _p1: u32,
     ) {}
+    unsafe extern "C" fn test_thumb_fetch_charge_shift(
+        _ctx: *mut u8, _addr: u32, _access: u32,
+    ) {}
 
     fn test_trampolines() -> BusTrampolines {
         BusTrampolines {
@@ -5782,8 +6022,12 @@ mod tests {
             store_16: test_store_32,
             load_with_idle_16: test_load_with_idle_32,
             load_with_idle_sh: test_load_with_idle_32,
+            thumb_fetch_charge_shift: test_thumb_fetch_charge_shift,
+            set_next_fetch_access: test_set_next_fetch_access,
         }
     }
+
+    unsafe extern "C" fn test_set_next_fetch_access(_ctx: *mut u8, _hint: u32) {}
 
     #[test]
     fn bus_stub_round_trip_load_32() {
