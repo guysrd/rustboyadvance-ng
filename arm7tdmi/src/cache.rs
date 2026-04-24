@@ -826,9 +826,10 @@ mod tests {
 
         let key = BlockKey::new(0x0800_0000, true);
         cache.begin_record(key);
-        // Thumb format 6 PC-relative LDR: 0b0100_1ddd_iiiiiiii. 0x4900
-        // is LDR R1, [PC, #0]. Not yet supported by the dynarec.
-        cache.record_instr(thumb(0x4900, stub_thumb_handler));
+        // Thumb format 10 STRH Rd, [Rs, #imm5*2]: 1000_LD_iiiii...
+        // 0x8000 is STRH R0, [R0, #0]. Not yet supported by the
+        // dynarec (format 10 halfword loads/stores unimplemented).
+        cache.record_instr(thumb(0x8000, stub_thumb_handler));
         cache.finish_record();
 
         let block = cache.get(key).expect("block in cache");

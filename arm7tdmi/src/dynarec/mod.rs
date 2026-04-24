@@ -1575,6 +1575,21 @@ impl DynarecCompiler {
         Some(DecodedThumb9 { load, byte, offset, rs, rd })
     }
 
+    /// Thumb format 6: PC-relative LDR.  LDR Rd, [PC, #imm8*4]
+    /// Encoding: 0100_1[Rd:3][imm8:8].  Loads a word from
+    /// `((pc+4) & !3) + imm8*4` into Rd.  Since the pc of any given
+    /// instruction in a cached block is known at codegen time, the
+    /// effective address is a constant — emit can fold it and skip
+    /// the runtime alignment/add.
+    fn decode_thumb_format6(op: u16) -> Option<DecodedThumb6> {
+        if (op >> 11) & 0b11111 != 0b01001 {
+            return None;
+        }
+        let rd = ((op >> 8) & 0b111) as i32;
+        let imm8 = (op & 0xFF) as u32;
+        Some(DecodedThumb6 { rd, imm8 })
+    }
+
     /// Thumb variant of `try_compile_block_with_branch`: compiles a block
     /// whose body is supported Thumb shapes plus an optional trailing BX Rs.
     /// BX is a block terminator that writes the target pc (preserving bit 0
@@ -1830,6 +1845,7 @@ impl DynarecCompiler {
             F3(DecodedThumb3),
             F4(DecodedThumb4),
             F5(DecodedThumb5),
+            F6(DecodedThumb6),
             F9(DecodedThumb9),
             F11(DecodedThumb11),
             F14(DecodedThumb14),
@@ -1865,6 +1881,8 @@ impl DynarecCompiler {
                 Some(Body::F11(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format9(op) {
                 Some(Body::F9(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format6(op) {
+                Some(Body::F6(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format1(op) {
                 Some(Body::F1(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format2(op) {
@@ -2007,7 +2025,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F9(_) | Body::F11(_) | Body::F14(_) => 0,
+                    Body::F6(_) | Body::F9(_) | Body::F11(_) | Body::F14(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2056,7 +2074,7 @@ impl DynarecCompiler {
                 }
             }
 
-            let emit_body = |builder: &mut FunctionBuilder, item: &Body, skip_flag_write: bool| {
+            let emit_body = |builder: &mut FunctionBuilder, item: &Body, skip_flag_write: bool, instr_pc: u32| {
                 match item {
                     Body::F1(d) => emit_thumb_format1(builder, gpr_ptr, cpsr_var, *d),
                     Body::F2(d) => {
@@ -2075,6 +2093,9 @@ impl DynarecCompiler {
                     }
                     Body::F4(d) => emit_thumb_format4_logical(builder, gpr_ptr, cpsr_var, *d),
                     Body::F5(d) => emit_thumb_format5_non_branch(builder, gpr_ptr, cpsr_var, *d),
+                    Body::F6(d) => emit_thumb_format6(
+                        builder, gpr_ptr, cpu_ctx, load_idle_32_ref, *d, instr_pc,
+                    ),
                     Body::F9(d) => emit_thumb_format9(
                         builder, gpr_ptr, cpu_ctx,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
@@ -2091,7 +2112,8 @@ impl DynarecCompiler {
             };
 
             for (k, item) in body.iter().enumerate() {
-                emit_body(&mut builder, item, skip_flags[k]);
+                let instr_pc = entry_pc.wrapping_add((2 * k) as u32);
+                emit_body(&mut builder, item, skip_flags[k], instr_pc);
                 // Compensate for the under-counted next fetch when this
                 // body item is a STORE: scalar would have charged NonSeq
                 // for the fetch that follows, but `thumb_fetch_n` paid
@@ -2116,7 +2138,8 @@ impl DynarecCompiler {
                     // the caller (dispatcher, next block's cpsr load)
                     // sees whatever flags it writes, so we never skip
                     // its flag update.
-                    emit_body(&mut builder, b, false);
+                    let tail_instr_pc = entry_pc.wrapping_add((2 * body.len()) as u32);
+                    emit_body(&mut builder, b, false, tail_instr_pc);
                     // Mirror scalar's `CpuAction::AdvancePC(NonSeq)` for the
                     // post-block fetch: when the tail body item is a STORE
                     // (STR/STRB/PUSH), scalar STR returns NonSeq, so the
@@ -3014,6 +3037,13 @@ struct DecodedThumb5 {
     rs: i32,
 }
 
+/// Thumb format 6 PC-relative LDR.
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb6 {
+    rd: i32,
+    imm8: u32,
+}
+
 /// Thumb format 9 LDR/STR immediate offset (word or unsigned byte).
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb9 {
@@ -3374,6 +3404,36 @@ fn emit_thumb_format11(
 /// load_with_idle_8/store_8 with zero extension (LDRB) or low-byte
 /// truncation (STRB). The "_with_idle" load trampolines charge +1I per
 /// LDR/LDRB to match the scalar `idle_cycle()` after each data fetch.
+/// Thumb format 6 (PC-relative LDR) — LDR Rd, [PC, #imm8*4]. Since
+/// the pc of each instruction in a compiled block is known at
+/// codegen time, the effective address is a constant folded here.
+/// `instr_pc` is the pc of the instruction being emitted — this is
+/// the pc Thumb semantics call "PC", which is aligned then offset.
+fn emit_thumb_format6(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    cpu_ctx: Value,
+    load_idle_32_ref: cranelift::codegen::ir::FuncRef,
+    dec: DecodedThumb6,
+    instr_pc: u32,
+) {
+    // Thumb format 6 spec: addr = ((PC + 4) & ~3) + imm8 * 4, where
+    // PC is the address of the LDR instruction. (PC + 4 because the
+    // Thumb pipeline-head convention leaves PC pointing two instrs
+    // ahead during decode.)
+    let addr = instr_pc
+        .wrapping_add(4)
+        .wrapping_add(0xFFFF_FFFC_u32 & 0)  // no-op, documents the align
+        & !3_u32;
+    let addr = addr.wrapping_add(dec.imm8.wrapping_mul(4));
+    let addr_val = builder.ins().iconst(types::I32, addr as i64);
+    let call = builder.ins().call(load_idle_32_ref, &[cpu_ctx, addr_val]);
+    let v = builder.inst_results(call)[0];
+    builder
+        .ins()
+        .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+}
+
 fn emit_thumb_format9(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
