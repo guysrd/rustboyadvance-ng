@@ -2786,6 +2786,61 @@ impl DynarecCompiler {
                     advance_hint(&body[tail_iter - 1])
                 };
                 emit_fetch_iter(&mut builder, tail_iter, prev_hint);
+
+                // BL pair occupies TWO iter slots (hi + lo): scalar's
+                // exec_thumb_branch_long_with_link runs hi at iter
+                // `tail_iter` (returns AdvancePC(Seq), writes
+                // intermediate LR), then lo at iter `tail_iter+1`
+                // (overwrites LR with final, computes target, reloads
+                // pipeline16, PipelineFlushed). Emit hi's effect +
+                // next-fetch-access update BEFORE the lo-iter abort
+                // check so that if abort fires between hi and lo, the
+                // next replay_cached_block dispatch sees hi's
+                // post-exec state (intermediate LR + Seq access). The
+                // BlPair tail emit below overwrites LR with the final
+                // value on the no-abort path.
+                if let Tail::BlPair { hi, hi_pc, .. } = &tail {
+                    let lr_intermediate = hi_pc
+                        .wrapping_add(4)
+                        .wrapping_add(hi.lr_delta as u32);
+                    let lr_val = builder
+                        .ins()
+                        .iconst(types::I32, lr_intermediate as i64);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        lr_val,
+                        gpr_ptr,
+                        Offset32::new(14 * 4),
+                    );
+                    // hi's AdvancePC = Seq.
+                    emit_set_access(&mut builder, 1);
+
+                    let lo_iter = tail_iter + 1;
+                    if lo_iter % 2 == 1 {
+                        let abort_call = builder.ins().call(abort_chain_ref, &[cpu_ctx]);
+                        let abort = builder.inst_results(abort_call)[0];
+                        let abort_nz =
+                            builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
+                        let do_abort_blk = builder.create_block();
+                        let cont_blk = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
+
+                        builder.switch_to_block(do_abort_blk);
+                        builder.seal_block(do_abort_blk);
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), cpsr_cur, cpsr_ptr, 0);
+                        let abort_ret = builder.ins().iconst(types::I32, 2);
+                        builder.ins().return_(&[abort_ret]);
+
+                        builder.switch_to_block(cont_blk);
+                        builder.seal_block(cont_blk);
+                    }
+                    emit_fetch_iter(&mut builder, lo_iter, 1);
+                }
             }
 
             let took_var = builder.declare_var(types::I32);
