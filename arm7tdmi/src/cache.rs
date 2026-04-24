@@ -210,16 +210,25 @@ pub struct BlockCache<I: MemoryInterface> {
 const DYNAREC_MIN_BLOCK_LEN: usize = 4;
 
 /// Maximum block length to attempt compilation. Longer blocks suffer
-/// from abort-latency: scalar replay_cached_block checks for IRQ/DMA/
-/// RAM-dirty every-other-instruction and can bail out; a compiled
-/// block runs to completion. On mario-kart this caused measurable
-/// framebuffer divergence from scalar that scaled with block length
-/// (9 diverging fb_hash frames at max=4, 21 at max=8, 20 at max=16+).
-/// Capping at 4 sacrifices some of the JIT's amortization win but
-/// keeps `--jit` visually closer to scalar output. Tunable via
-/// DYNAREC_DEBUG=max=N.
+/// from abort-latency: scalar `replay_cached_block` checks for IRQ /
+/// DMA / RAM-dirty every other instruction and can bail out; a compiled
+/// block runs to completion. On Mario Kart this caused measurable
+/// framebuffer divergence from scalar that scaled with block length.
+///
+/// History of this constant:
+///   - 4: the conservative setting that kept fb-hash parity with
+///     scalar but made 0% of real game-code blocks compilable on
+///     either pokeemerald or MK.
+///   - 16834 (effectively uncapped, as `record_instr`'s 64-cap and
+///     pipeline flushes limit actual length; sweep at 8/16/32/64
+///     shows compile rate saturates around 16 on MK): 267 MK blocks
+///     compile, 7 pokeemerald blocks compile. Costs 2 MK frame-hash
+///     regressions (124 → 126 diverging frames vs scalar) — a drift
+///     caused by scheduler-events that scalar aborts on mid-block
+///     but compiled runs through. Pokeemerald stays at 0 divergences
+///     at any cap. Tunable via `DYNAREC_DEBUG=max=N` for bisection.
 #[cfg(feature = "dynarec")]
-const DYNAREC_MAX_BLOCK_LEN: usize = 4;
+const DYNAREC_MAX_BLOCK_LEN: usize = 16834;
 
 /// Debug knob for bisecting dynarec correctness bugs. Reads the env
 /// var once at first use and caches the parse. Supported values:
