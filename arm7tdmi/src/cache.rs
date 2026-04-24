@@ -338,17 +338,33 @@ fn try_compile_thumb<I: MemoryInterface>(
     if raws.is_empty() {
         return None;
     }
-    // Reject only the BL pair (format 19) — unsupported by the
-    // compiler's tail decoder. BX and POP{PC} DO have Tail::Bx /
-    // Tail::PopPc codegen paths even though their branch targets
-    // are dynamic (register / stack load); they return through the
-    // dispatcher rather than statically chaining, but compiling
-    // them still counts toward coverage and gets their compiled-
-    // block body onto the fast path.
+    // Filter: reject only ORPHAN first-half BL (a block ending in
+    // a F19-first-half alone is pathological — scalar would execute
+    // the second half of the pair immediately after, but our block
+    // recording ended for some other reason and there's no matching
+    // second half). Second-half-only (orphan) also rejected. Proper
+    // BL pairs (last two opcodes = hi+lo) are compilable as Tail::BlPair.
     if let Some(&last) = raws.last() {
         let top4 = last >> 12;
         if top4 == 0b1111 {
-            return None;
+            // F19 second half (bit 11 = 1) as last opcode: OK only
+            // if prev opcode is F19 first half (bit 11 = 0).
+            let is_lo = (last & 0x0800) != 0;
+            if is_lo {
+                // Need at least 2 opcodes and prev = F19 hi.
+                if raws.len() < 2 {
+                    return None;
+                }
+                let prev = raws[raws.len() - 2];
+                let prev_is_hi = (prev & 0xF800) == 0xF000;
+                if !prev_is_hi {
+                    return None;
+                }
+                // Otherwise fall through — compiler will detect BL pair.
+            } else {
+                // F19 first half as last opcode → orphan; reject.
+                return None;
+            }
         }
     }
     // Debug knobs: skip blocks whose shape matches a suspect classifier.

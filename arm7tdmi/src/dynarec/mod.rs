@@ -1686,6 +1686,33 @@ impl DynarecCompiler {
         })
     }
 
+    /// Thumb format 19 first-half (FLAG_LOW_OFFSET=false):
+    /// `1111_0_offset11`. Sets LR = pc + sign_extend(offset11 << 12).
+    /// Pure register op; AdvancePC(Seq). Paired with second-half
+    /// below to form a full BL.
+    fn decode_thumb_format19_hi(op: u16) -> Option<DecodedThumbBlHi> {
+        if (op & 0xF800) != 0xF000 {
+            return None;
+        }
+        let imm11 = (op & 0x07FF) as u32;
+        // Sign-extend 11-bit value and shift left 12 — matches scalar
+        // `(off << 21) >> 9`.
+        let shifted = ((imm11 as i32) << 21) >> 9;
+        Some(DecodedThumbBlHi { lr_delta: shifted })
+    }
+
+    /// Thumb format 19 second-half (FLAG_LOW_OFFSET=true):
+    /// `1111_1_offset11`. PipelineFlushed. Target = (LR & !1) +
+    /// (offset11 << 1). LR := (pc - 2) | 1.
+    fn decode_thumb_format19_lo(op: u16) -> Option<DecodedThumbBlLo> {
+        if (op & 0xF800) != 0xF800 {
+            return None;
+        }
+        let imm11 = (op & 0x07FF) as u32;
+        let off_lo = imm11 << 1;
+        Some(DecodedThumbBlLo { off_lo })
+    }
+
     /// Thumb format 8 LDSB: sign-extended byte load Rd = (i8)[Rb+Ro].
     /// Encoding: `0101_10_1_Ro_Rb_Rd` (H=0 sign=1).
     /// Execution: 1N load + 1I, AdvancePC(NonSeq).
@@ -2062,6 +2089,11 @@ impl DynarecCompiler {
             Bx(DecodedThumbBx),
             PcBranch(DecodedThumbPcBranch),
             PopPc(DecodedThumb14),
+            /// BL pair — the last TWO opcodes together form the long
+            /// branch. `hi_pc` is the pc of the first-half instruction;
+            /// `lo_pc` is pc of the second-half. We fold LR +
+            /// branch-target into constants at codegen.
+            BlPair { hi: DecodedThumbBlHi, lo: DecodedThumbBlLo, hi_pc: u32, lo_pc: u32 },
             Body(Body),
         }
 
@@ -2154,7 +2186,31 @@ impl DynarecCompiler {
             }
         }
 
-        let (body_opcodes, tail_slot) = opcodes.split_at(opcodes.len() - 1);
+        // Detect BL pair tail: last two opcodes are F19 hi + lo.
+        let bl_pair_tail = if opcodes.len() >= 2 {
+            let hi_op = opcodes[opcodes.len() - 2];
+            let lo_op = opcodes[opcodes.len() - 1];
+            match (
+                Self::decode_thumb_format19_hi(hi_op),
+                Self::decode_thumb_format19_lo(lo_op),
+            ) {
+                (Some(hi), Some(lo)) => Some((hi, lo)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let (body_opcodes, tail): (&[u16], Tail) = if let Some((hi, lo)) = bl_pair_tail {
+            // body is everything except the last two.
+            let body_end = opcodes.len() - 2;
+            let hi_pc = entry_pc.wrapping_add((2 * body_end) as u32);
+            let lo_pc = hi_pc.wrapping_add(2);
+            (&opcodes[..body_end], Tail::BlPair { hi, lo, hi_pc, lo_pc })
+        } else {
+            let (bo, tail_slot) = opcodes.split_at(opcodes.len() - 1);
+            (bo, classify_tail(tail_slot[0])?)
+        };
         let mut body: Vec<Body> = Vec::with_capacity(body_opcodes.len());
         for &op in body_opcodes {
             // Terminators not allowed in body.
@@ -2162,12 +2218,13 @@ impl DynarecCompiler {
                 || Self::decode_thumb_format16(op).is_some()
                 || Self::decode_thumb_format18(op).is_some()
                 || Self::decode_thumb_pop_pc(op).is_some()
+                || Self::decode_thumb_format19_hi(op).is_some()
+                || Self::decode_thumb_format19_lo(op).is_some()
             {
                 return None;
             }
             body.push(classify_body(op)?);
         }
-        let tail = classify_tail(tail_slot[0])?;
 
         let ptr_type = self.module.isa().pointer_type();
         let mut sig = self.module.make_signature();
@@ -2308,6 +2365,7 @@ impl DynarecCompiler {
                     Tail::Body(b) => flag_write_mask_body(b),
                     Tail::Bx(_) | Tail::PopPc(_) => 0, // don't write NZCV
                     Tail::PcBranch(_) => 0, // B/Bcc don't write flags
+                    Tail::BlPair { .. } => 0, // BL writes LR/PC, not NZCV
                 };
                 let tail_reads_flags = match &tail {
                     Tail::PcBranch(br) => br.cond != ArmCond::Al,
@@ -2717,6 +2775,40 @@ impl DynarecCompiler {
                     // sequence (see exec_thumb_push_pop "// Idle 1 cycle").
                     // Mirror for parity.
                     builder.ins().call(idle_cycle_ref, &[cpu_ctx]);
+                    let one = builder.ins().iconst(types::I32, 1);
+                    builder.def_var(took_var, one);
+                }
+                Tail::BlPair { hi, lo, hi_pc, lo_pc } => {
+                    // Scalar first-half: LR = (hi_pc + 4) + hi.lr_delta.
+                    //   (pc at first-half exec = hi_pc + 4 in Thumb pipeline-head.)
+                    let lr_from_hi = hi_pc
+                        .wrapping_add(4)
+                        .wrapping_add(hi.lr_delta as u32);
+                    // Scalar second-half:
+                    //   target = (LR & !1) + (off_lo << 1) which is lo.off_lo.
+                    //   LR := (pc_at_lo - 2) | 1 = (lo_pc + 4 - 2) | 1 = (lo_pc + 2) | 1.
+                    //   PC := target, reload_pipeline16, PipelineFlushed.
+                    let target = (lr_from_hi & !1u32).wrapping_add(lo.off_lo);
+                    let new_lr = (lo_pc.wrapping_add(2)) | 1;
+                    // Both LR assignments (first-half intermediate + second-half
+                    // final) write to gpr[14]. The first-half intermediate is
+                    // overwritten before it's visible outside, so we only emit
+                    // the final value.
+                    let lr_val = builder.ins().iconst(types::I32, new_lr as i64);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        lr_val,
+                        gpr_ptr,
+                        Offset32::new(14 * 4),
+                    );
+                    // Force Thumb bit in pc_out so the caller's thumb_bit
+                    // check lands in Thumb mode.
+                    let target_thumb = builder
+                        .ins()
+                        .iconst(types::I32, (target | 1) as i64);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), target_thumb, pc_out, 0);
                     let one = builder.ins().iconst(types::I32, 1);
                     builder.def_var(took_var, one);
                 }
@@ -3404,6 +3496,21 @@ struct DecodedThumb8Ldsb {
     ro: i32,
     rb: i32,
     rd: i32,
+}
+
+/// BL first half — sets LR = pc + lr_delta (compile-time constant
+/// given the instruction's pc).
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumbBlHi {
+    lr_delta: i32,
+}
+
+/// BL second half — completes the long branch. Target and new LR
+/// are compile-time constants given the instruction's pc and the
+/// first-half's lr_delta.
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumbBlLo {
+    off_lo: u32,
 }
 
 /// Thumb format 10 halfword LDRH/STRH imm5.
