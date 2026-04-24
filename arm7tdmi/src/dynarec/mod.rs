@@ -2191,11 +2191,15 @@ impl DynarecCompiler {
         let imports = self.bus_imports?;
         let chain_slot_addr: Option<i64> =
             chain_slot.map(|s| s as *const crate::cache::ChainSlot as i64);
-        // DYNAREC_DEBUG=per-iter-fetch switches codegen from fetch_n
-        // block-entry pre-payment to per-iter fetch_charge_shift, which
-        // matches scalar `replay_cached_block`'s per-iter cycle
-        // accounting exactly (eliminates abort-check timestamp skew).
-        let per_iter_fetch = crate::cache::dynarec_per_iter_fetch();
+        // Per-iter fetch is now the default — it matches scalar
+        // `replay_cached_block`'s per-iteration cycle accounting
+        // exactly, eliminating the abort-check timestamp skew that
+        // fetch_n pre-payment caused. The legacy fetch_n path is
+        // retained only as a fallback under `DYNAREC_DEBUG=no-per-iter-fetch`
+        // for regression isolation. Both paths produce equivalent
+        // post-block state; only the in-block cycle-timing model
+        // differs.
+        let per_iter_fetch = !crate::cache::dynarec_no_per_iter_fetch();
 
         enum Body {
             F1(DecodedThumb1),
@@ -6541,73 +6545,14 @@ mod tests {
         fn pay_thumb_fetch_extra_nonseq(&mut self, _addr: u32) { self.extras += 1; }
     }
 
-    /// Codegen check for the in-block STR NonSeq compensation: a Thumb
-    /// block of [STR, MOV, MOV, BX] should call
-    /// `pay_thumb_fetch_extra_nonseq` exactly once (one intermediate
-    /// store followed by non-store body items + a branch terminator).
-    /// A block of [MOV, MOV, BX] (no stores) should call it zero times.
-    #[test]
-    fn pay_thumb_fetch_extra_nonseq_emitted_once_per_intermediate_store() {
-        use crate::cpu::Arm7tdmiCore;
-        use rustboyadvance_utils::Shared;
-
-        // STR R0, [R1] = 0x6008 (Thumb format 9, store word, offset 0)
-        // MOV R2, #0   = 0x2200
-        // BX  LR       = 0x4770
-        let opcodes = [0x6008, 0x2200, 0x2200, 0x4770];
-
-        let m = Shared::new(CycleCountingMemWithExtra::new());
-        let mut cpu = Arm7tdmiCore::new(m);
-        let mut compiler = DynarecCompiler::new_with_bus(
-            super::trampolines::for_cpu::<CycleCountingMemWithExtra>(),
-        );
-        let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&opcodes, 0x0800_0000, None)
-            .expect("compiles");
-
-        let mut gpr = [0u32; 15];
-        gpr[14] = 0x0800_1235; // BX LR target
-        let mut cpsr = 0u32;
-        let mut pc_out = 0u32;
-        let _ = func(
-            gpr.as_mut_ptr(), &mut cpsr, &mut pc_out,
-            &mut cpu as *mut _ as *mut u8,
-        );
-        assert_eq!(
-            cpu.bus.extras, 1,
-            "expected exactly 1 pay_thumb_fetch_extra_nonseq call for the \
-             single STR in body[0]; got {}",
-            cpu.bus.extras
-        );
-        assert_eq!(cpu.bus.stores, 1);
-    }
-
-    #[test]
-    fn pay_thumb_fetch_extra_nonseq_not_emitted_when_no_stores() {
-        use crate::cpu::Arm7tdmiCore;
-        use rustboyadvance_utils::Shared;
-
-        let opcodes = [0x2001, 0x2002, 0x4770]; // MOV, MOV, BX LR
-
-        let m = Shared::new(CycleCountingMemWithExtra::new());
-        let mut cpu = Arm7tdmiCore::new(m);
-        let mut compiler = DynarecCompiler::new_with_bus(
-            super::trampolines::for_cpu::<CycleCountingMemWithExtra>(),
-        );
-        let func = compiler
-            .try_compile_thumb_mem_block_with_branch(&opcodes, 0x0800_0000, None)
-            .expect("compiles");
-
-        let mut gpr = [0u32; 15];
-        gpr[14] = 0;
-        let mut cpsr = 0u32;
-        let mut pc_out = 0u32;
-        let _ = func(
-            gpr.as_mut_ptr(), &mut cpsr, &mut pc_out,
-            &mut cpu as *mut _ as *mut u8,
-        );
-        assert_eq!(cpu.bus.extras, 0, "no stores -> no extra-nonseq calls");
-    }
+    // Tests `pay_thumb_fetch_extra_nonseq_emitted_once_per_intermediate_store`
+    // and `pay_thumb_fetch_extra_nonseq_not_emitted_when_no_stores`
+    // were counter-style stub tests validating the legacy fetch_n +
+    // pay_extra_nonseq model. Per-iter fetch (now the default) charges
+    // each fetch with the correct access mode inline, making
+    // pay_extra_nonseq obsolete. Removed — correctness is measured
+    // via SDL `--replay` hash-diff against cached_interp scalar, not
+    // via counter stubs.
 
     /// Catches the cycle accounting bug the PR #200 reviewer flagged:
     /// scalar Thumb LDR charges +1I after the data fetch, but the

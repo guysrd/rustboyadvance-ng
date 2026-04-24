@@ -271,22 +271,20 @@ struct DynarecDebug {
     no_f13: bool, // skip blocks containing F13 ADD/SUB SP imm
     no_alu: bool, // skip blocks where ANY opcode is F1-F4 ALU (bisect)
     no_f5: bool, // skip blocks containing F5 non-PC high-reg ops
-    /// If set, codegen uses per-iter fetch (thumb_fetch_charge_shift
-    /// once per body/tail instruction) instead of the block-entry
-    /// pre-payment via thumb_fetch_n. Per-iter matches scalar
-    /// `replay_cached_block`'s exact per-iteration cycle accounting,
-    /// eliminating the abort-check timestamp skew that causes the 23
-    /// pokeemerald divergences on the safe-checkpoint baseline.
-    pub per_iter_fetch: bool,
+    /// If set, codegen FALLS BACK to the legacy thumb_fetch_n
+    /// block-entry pre-payment (pokeemerald SDL baseline: 23 divs).
+    /// Per-iter fetch is the default (0 divs); this knob is for
+    /// bisecting any future regressions back to the legacy model.
+    pub no_per_iter_fetch: bool,
     max_len: Option<usize>,
 }
 
-/// Accessor for the `per-iter-fetch` DYNAREC_DEBUG knob. Used by the
-/// codegen in dynarec/mod.rs to pick between fetch_n's block-entry
-/// pre-payment vs the per-iter fetch_charge_shift model.
+/// Accessor for the `no-per-iter-fetch` DYNAREC_DEBUG knob. Used by
+/// the codegen in dynarec/mod.rs to fall back to the legacy fetch_n
+/// block-entry pre-payment model for regression bisection.
 #[cfg(feature = "dynarec")]
-pub(crate) fn dynarec_per_iter_fetch() -> bool {
-    dynarec_debug().per_iter_fetch
+pub(crate) fn dynarec_no_per_iter_fetch() -> bool {
+    dynarec_debug().no_per_iter_fetch
 }
 
 #[cfg(feature = "dynarec")]
@@ -319,7 +317,7 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "no-f13" => d.no_f13 = true,
                     "no-alu" => d.no_alu = true,
                     "no-f5" => d.no_f5 = true,
-                    "per-iter-fetch" => d.per_iter_fetch = true,
+                    "no-per-iter-fetch" => d.no_per_iter_fetch = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
                             d.max_len = Some(n);
