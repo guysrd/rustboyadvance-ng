@@ -2194,8 +2194,9 @@ impl DynarecCompiler {
                         | 1;
                     let cond_pass = emit_cond_check(&mut builder, cpsr_var, br.cond);
                     let taken_blk = builder.create_block();
+                    let fallthrough_blk = builder.create_block();
                     let merge_blk = builder.create_block();
-                    builder.ins().brif(cond_pass, taken_blk, &[], merge_blk, &[]);
+                    builder.ins().brif(cond_pass, taken_blk, &[], fallthrough_blk, &[]);
 
                     builder.switch_to_block(taken_blk);
                     builder.seal_block(taken_blk);
@@ -2204,6 +2205,76 @@ impl DynarecCompiler {
                     let one = builder.ins().iconst(types::I32, 1);
                     builder.def_var(took_var, one);
                     builder.ins().jump(merge_blk, &[]);
+
+                    // Fall-through (cond failed): emit chain check on
+                    // the same `chain_slot` (fall-through target key)
+                    // that Tail::Body uses. Equivalent semantics —
+                    // scalar would advance past the Bcc and execute
+                    // the next sequential block; if that block is
+                    // compiled we tail-call it instead of returning
+                    // to the dispatcher.
+                    builder.switch_to_block(fallthrough_blk);
+                    builder.seal_block(fallthrough_blk);
+                    if let Some(slot_addr) = chain_slot_addr {
+                        let chain_abort_ref = self
+                            .module
+                            .declare_func_in_func(imports.chain_abort_check, builder.func);
+                        let self_sig_ref =
+                            builder.import_signature(self_sig_template.clone());
+                        let slot_addr_val =
+                            builder.ins().iconst(types::I64, slot_addr);
+                        let chain_fn_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            slot_addr_val,
+                            0,
+                        );
+                        let chain_try_blk = builder.create_block();
+                        let chain_call_blk = builder.create_block();
+                        let is_nonnull = builder
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, chain_fn_ptr, 0);
+                        builder.ins().brif(
+                            is_nonnull,
+                            chain_try_blk,
+                            &[],
+                            merge_blk,
+                            &[],
+                        );
+                        builder.switch_to_block(chain_try_blk);
+                        builder.seal_block(chain_try_blk);
+                        let abort_call =
+                            builder.ins().call(chain_abort_ref, &[cpu_ctx]);
+                        let abort = builder.inst_results(abort_call)[0];
+                        let abort_nz = builder
+                            .ins()
+                            .icmp_imm(IntCC::NotEqual, abort, 0);
+                        builder.ins().brif(
+                            abort_nz,
+                            merge_blk,
+                            &[],
+                            chain_call_blk,
+                            &[],
+                        );
+                        builder.switch_to_block(chain_call_blk);
+                        builder.seal_block(chain_call_blk);
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            cpsr_cur,
+                            cpsr_ptr,
+                            0,
+                        );
+                        let indirect_call = builder.ins().call_indirect(
+                            self_sig_ref,
+                            chain_fn_ptr,
+                            &[gpr_ptr, cpsr_ptr, pc_out, cpu_ctx],
+                        );
+                        let chained_ret = builder.inst_results(indirect_call)[0];
+                        builder.ins().return_(&[chained_ret]);
+                    } else {
+                        builder.ins().jump(merge_blk, &[]);
+                    }
 
                     builder.switch_to_block(merge_blk);
                     builder.seal_block(merge_blk);

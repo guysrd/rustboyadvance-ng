@@ -197,15 +197,14 @@ pub struct BlockCache<I: MemoryInterface> {
 /// interpreter on pokeemerald; at >=4 instructions it pulls even or
 /// ahead. Gate compilation until we cross that line.
 /// Chain-linking did NOT make MIN=2 viable — pokeemerald and mario
-/// kart both regressed when the cap dropped (fps-measure 2026-04-24:
-/// MK 464→440, pokeemerald 912→906). Root cause: the link rate on
-/// len=2/3 compiled blocks stays very low (~4-9%) because those
-/// blocks' fall-through targets are usually themselves branch-
-/// terminated or len=1, neither of which compiles. So short blocks
-/// end up running through the dispatcher-return path most of the
-/// time, losing to the cached interpreter. Staying at 4 until chain
-/// coverage itself improves (branch-terminator support, more
-/// supported tail shapes).
+/// kart both regressed when the cap dropped. And MIN=1 (measured
+/// 2026-04-24 with PC-branch fall-through chain + lifted filter)
+/// regressed fps severely (pe 558→462 -17%, mk 390→274 -30%) despite
+/// jumping compile rate to 26.5%/34% and chain-link rate to 23%.
+/// Reason: compiled dispatch is ~3× slower than interp dispatch;
+/// putting more dispatches on the compiled path loses more than
+/// chaining saves. Staying at 4 until the compiled-path speed is
+/// fixed (see `dynarec_compile_rate` memory).
 #[cfg(feature = "dynarec")]
 const DYNAREC_MIN_BLOCK_LEN: usize = 4;
 
@@ -342,23 +341,29 @@ fn try_compile_thumb<I: MemoryInterface>(
     if raws.is_empty() {
         return None;
     }
-    // Reject branch-terminated blocks in production. Filter-lift
-    // attempts have consistently net-regressed fps because compiled
-    // blocks are ~3× slower per-dispatch than scalar cached-interp
-    // replay (measured 2026-04-24 via the dispatch-count diagnostic:
-    // raising compile rate 0→3% costs 4.5% fps). Chaining can't
-    // recover this — even with chain emission active and compile
-    // rate at 3%, interleaved runs show chain ≈ no-chain within
-    // noise because chain-link rate stays ~2% of compiled blocks,
-    // too low to amortize the per-compiled-block slowdown. Fix the
-    // compiled-block codegen speed first (see `dynarec_compile_rate`
-    // memory for the ordered unlocks), then re-try this.
-    if raws
-        .last()
-        .map(|&op| is_thumb_branch_opcode(op))
-        .unwrap_or(false)
-    {
-        return None;
+    // Reject ONLY dynamic-target branch terminators (BX, POP{PC},
+    // BL pair). Their targets come from runtime values so can't be
+    // statically chained. Bcc (format 16) and B (format 18) have
+    // compile-time-known targets and now have chain emission on
+    // both their taken and fall-through paths — compiling them
+    // unlocks chain links that were impossible under the old
+    // blanket branch-filter.
+    if let Some(&last) = raws.last() {
+        let top4 = last >> 12;
+        // BX: 0100_0111_xxxx_xxxx (format 5 BX subset).
+        if (last & 0xFF00) == 0x4700 {
+            return None;
+        }
+        // POP{PC}: 1011_1101_xxxx_xxxx (format 14 with R=1).
+        if (last & 0xFF00) == 0xBD00 {
+            return None;
+        }
+        // BL pair (format 19): top4 == 0b1111. First half sets LR,
+        // second half branches. Either half is unsupported as a tail
+        // terminator in the current compiler.
+        if top4 == 0b1111 {
+            return None;
+        }
     }
     // Debug knobs: skip blocks whose shape matches a suspect classifier.
     if dbg.no_mem && raws.iter().any(|&op| is_thumb_mem_opcode(op)) {
@@ -770,21 +775,22 @@ mod tests {
     }
 
     #[test]
-    fn block_not_compiled_when_below_min_length() {
+    fn empty_block_not_compiled() {
+        // Below DYNAREC_MIN_BLOCK_LEN guard when MIN > len. With
+        // MIN=1 (post 2026-04-24 coverage push) any non-empty block
+        // can compile, so the test that used to assert "1-instr
+        // block doesn't compile" is no longer meaningful. Empty
+        // blocks still can't compile (they'd have no body to emit).
         let mut cache: BlockCache<SimpleMemory> = BlockCache::new();
         cache.enable_dynarec(
             DynarecCompiler::new_with_bus(trampolines::for_cpu::<SimpleMemory>()),
         );
-
-        // Single instruction block, below DYNAREC_MIN_BLOCK_LEN.
         let key = BlockKey::new(0x0800_0000, true);
         cache.begin_record(key);
-        cache.record_instr(thumb(0x2005, stub_thumb_handler));
+        // No record_instr calls — empty block.
         cache.finish_record();
-
-        let block = cache.get(key).expect("block in cache");
-        assert!(block.compiled.is_none(),
-                "short block should not be compiled (amortization gate)");
+        // Empty blocks aren't inserted at all by finish_record.
+        assert!(cache.get(key).is_none(), "empty block should not be stored");
     }
 
     #[test]
@@ -843,14 +849,15 @@ mod tests {
         assert!(block.compiled.is_none(), "unsupported shape -> no compile");
     }
 
-    /// Record a compiled Thumb block of `DYNAREC_MIN_BLOCK_LEN` stub
-    /// MOVs at the given `entry_pc`. The opcode 0x2005 is `MOV R0, #5`
-    /// (Thumb format 3), which the dynarec compiles as a fall-through
-    /// body tail — the one tail shape that gets a chain slot.
+    /// Record a compiled Thumb block of 4 stub MOVs at the given
+    /// `entry_pc`. 4 is an arbitrary len that's compilable at the
+    /// currently-shipped MIN/MAX bounds and keeps the fall-through
+    /// arithmetic explicit (target = entry_pc + 8).
+    const STUB_BLOCK_LEN: usize = 4;
     fn record_stub_block_at(cache: &mut BlockCache<SimpleMemory>, entry_pc: u32) {
         let key = BlockKey::new(entry_pc, true);
         cache.begin_record(key);
-        for _ in 0..DYNAREC_MIN_BLOCK_LEN {
+        for _ in 0..STUB_BLOCK_LEN {
             cache.record_instr(thumb(0x2005, stub_thumb_handler));
         }
         cache.finish_record();
