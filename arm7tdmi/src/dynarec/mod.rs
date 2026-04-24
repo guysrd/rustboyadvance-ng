@@ -351,6 +351,11 @@ pub struct DynarecCompiler {
 struct BusImports {
     load_32: FuncId,
     store_32: FuncId,
+    /// Declared for completeness — all LDRB-family codegen goes
+    /// through `load_with_idle_8` so the +1I cycle is paid. Kept
+    /// around so future scalar-load use sites don't have to redo
+    /// the JIT import plumbing.
+    #[allow(dead_code)]
     load_8: FuncId,
     store_8: FuncId,
     load_with_idle_32: FuncId,
