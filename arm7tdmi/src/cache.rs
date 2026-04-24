@@ -905,4 +905,72 @@ mod tests {
             "eager link should set A's chain slot to B's compiled fn",
         );
     }
+
+    /// RAM-region blocks never compile (they'd be flushed on every
+    /// RAM write, so burning a Cranelift codegen pass for a single
+    /// use is pointless). A block recorded at a RAM-region PC
+    /// therefore ends up with compiled=None, chain_slot=None,
+    /// fallthrough_key=None — no compiled-fn pointer to chain to,
+    /// and no way for a predecessor to chain into it.
+    #[test]
+    fn chaining_skips_ram_region_blocks() {
+        let mut cache: BlockCache<SimpleMemory> = BlockCache::new();
+        cache.enable_dynarec(
+            DynarecCompiler::new_with_bus(trampolines::for_cpu::<SimpleMemory>()),
+        );
+        // 0x0300_0000 is IWRAM — RAM region, not ROM.
+        let key = BlockKey::new(0x0300_0000, true);
+        cache.begin_record(key);
+        for _ in 0..DYNAREC_MIN_BLOCK_LEN {
+            cache.record_instr(thumb(0x2005, stub_thumb_handler));
+        }
+        cache.finish_record();
+        let block = cache.get(key).expect("RAM block in cache");
+        assert!(block.compiled.is_none(), "RAM blocks never compile");
+        assert!(block.chain_slot.is_none(), "RAM blocks never get a chain slot");
+        assert!(block.fallthrough_key.is_none(), "RAM blocks never get a fallthrough key");
+    }
+
+    /// `flush_all` is a diagnostic path that blows away the whole
+    /// cache. The waiters map holds Rc<ChainSlot> clones against
+    /// ROM blocks that got cleared; those waiter entries are now
+    /// orphaned and must also be cleared so a future block at the
+    /// same target PC doesn't try to link to the now-dropped
+    /// predecessor.
+    #[test]
+    fn chaining_flush_all_clears_waiters() {
+        use std::sync::atomic::Ordering;
+        let mut cache: BlockCache<SimpleMemory> = BlockCache::new();
+        cache.enable_dynarec(
+            DynarecCompiler::new_with_bus(trampolines::for_cpu::<SimpleMemory>()),
+        );
+
+        // Record a block whose fall-through target doesn't exist
+        // yet — this parks the block's chain slot in the waiters
+        // map.
+        record_stub_block_at(&mut cache, 0x0800_0000);
+        let block_a = cache.get(BlockKey::new(0x0800_0000, true)).expect("A");
+        let a_chain_pre = block_a.chain_slot.as_ref().expect("A has slot");
+        assert_eq!(
+            a_chain_pre.load(Ordering::Relaxed),
+            0,
+            "target not recorded yet, chain stays null",
+        );
+        drop(block_a);
+
+        // Flush everything. Waiters entries must be cleared too.
+        cache.flush_all();
+
+        // Now record the target block at the fall-through key.
+        // Since the predecessor is gone AND its waiter entry was
+        // cleared, nothing retroactively links to the new block.
+        record_stub_block_at(&mut cache, 0x0800_0008);
+        let block_b = cache.get(BlockKey::new(0x0800_0008, true)).expect("B");
+        assert!(block_b.compiled.is_some(), "B still compiles normally");
+        // A was flushed; confirm it's gone.
+        assert!(
+            cache.get(BlockKey::new(0x0800_0000, true)).is_none(),
+            "flush_all should have removed A",
+        );
+    }
 }
