@@ -576,6 +576,13 @@ impl DynarecCompiler {
         flag_builder
             .set("unwind_info", "false")
             .expect("set unwind_info=false");
+        // opt_level stays at the Cranelift default (`none`) — measured
+        // `speed` on shape-opt/apr22 (2026-04-25) gave -9% pokeemerald
+        // fps and -13% MK fps because middle-end opt time-per-block
+        // outweighs the runtime savings at ~20k compiled blocks. A
+        // future lazy-compile threshold (compile only hot blocks)
+        // would shift the break-even point and is worth re-trying
+        // then.
         let flags = settings::Flags::new(flag_builder);
         let isa = isa_builder
             .finish(flags)
