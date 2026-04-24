@@ -1644,6 +1644,26 @@ impl DynarecCompiler {
         })
     }
 
+    /// Thumb format 12: load address PC-rel or SP-rel into Rd.
+    /// Encoding: `1010_L_Rd_imm8`. L=0 PC, L=1 SP.
+    ///   PC case: Rd = ((instr_pc & !2) + 4) + imm8*4 — folded at
+    ///   codegen since instr_pc is known.
+    ///   SP case: Rd = SP + imm8*4.
+    /// No memory access, no flag update, AdvancePC(Seq).
+    fn decode_thumb_format12(op: u16) -> Option<DecodedThumb12> {
+        if (op >> 12) & 0xF != 0b1010 {
+            return None;
+        }
+        let sp = (op >> 11) & 1 != 0;
+        let rd = ((op >> 8) & 0b111) as i32;
+        let imm8 = (op & 0xFF) as u32;
+        Some(DecodedThumb12 {
+            sp,
+            rd,
+            offset: imm8 * 4,
+        })
+    }
+
     /// Thumb variant of `try_compile_block_with_branch`: compiles a block
     /// whose body is supported Thumb shapes plus an optional trailing BX Rs.
     /// BX is a block terminator that writes the target pc (preserving bit 0
@@ -1902,6 +1922,7 @@ impl DynarecCompiler {
             F6(DecodedThumb6),
             F9(DecodedThumb9),
             F11(DecodedThumb11),
+            F12(DecodedThumb12),
             F13(DecodedThumb13),
             F14(DecodedThumb14),
         }
@@ -1945,6 +1966,8 @@ impl DynarecCompiler {
                 Some(Body::F14(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format13(op) {
                 Some(Body::F13(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format12(op) {
+                Some(Body::F12(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format11(op) {
                 Some(Body::F11(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format9(op) {
@@ -2102,7 +2125,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F6(_) | Body::F9(_) | Body::F11(_) | Body::F13(_) | Body::F14(_) => 0,
+                    Body::F6(_) | Body::F9(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2181,6 +2204,7 @@ impl DynarecCompiler {
                         builder, gpr_ptr, cpu_ctx,
                         load_idle_32_ref, store_32_ref, *d,
                     ),
+                    Body::F12(d) => emit_thumb_format12(builder, gpr_ptr, *d, instr_pc),
                     Body::F13(d) => emit_thumb_format13(builder, gpr_ptr, *d),
                     Body::F14(d) => emit_thumb_format14(
                         builder, gpr_ptr, cpu_ctx,
@@ -3189,6 +3213,14 @@ struct DecodedThumb13 {
     offset: u32,
 }
 
+/// Thumb format 12 load address (PC/SP-rel into Rd).
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb12 {
+    sp: bool,
+    rd: i32,
+    offset: u32,
+}
+
 /// Thumb format 9 LDR/STR immediate offset (word or unsigned byte).
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb9 {
@@ -3586,6 +3618,35 @@ fn emit_thumb_format6(
     builder
         .ins()
         .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+}
+
+/// Thumb format 12 load address. SP case: Rd = SP + offset.
+/// PC case: Rd is a constant `((instr_pc & !2) + 4 + offset)`,
+/// folded here since instr_pc is known at codegen.
+fn emit_thumb_format12(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    dec: DecodedThumb12,
+    instr_pc: u32,
+) {
+    let val = if dec.sp {
+        let sp = builder.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            gpr_ptr,
+            Offset32::new(13 * 4),
+        );
+        builder.ins().iadd_imm(sp, dec.offset as i64)
+    } else {
+        // scalar: (pc_thumb() & !0b10) + 4 + offset. pc_thumb() = instr_pc.
+        let folded = (instr_pc & !0b10_u32)
+            .wrapping_add(4)
+            .wrapping_add(dec.offset);
+        builder.ins().iconst(types::I32, folded as i64)
+    };
+    builder
+        .ins()
+        .store(MemFlags::trusted(), val, gpr_ptr, Offset32::new(dec.rd * 4));
 }
 
 /// Thumb format 13 ADD SP, #imm / SUB SP, #imm. Pure SP update.
