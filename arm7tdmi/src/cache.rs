@@ -318,10 +318,10 @@ fn try_compile_thumb<I: MemoryInterface>(
     if block.instrs.len() > DYNAREC_MAX_BLOCK_LEN {
         return None;
     }
-    if let Some(max) = dbg.max_len {
-        if block.instrs.len() > max {
-            return None;
-        }
+    if let Some(max) = dbg.max_len
+        && block.instrs.len() > max
+    {
+        return None;
     }
     let mut raws: Vec<u16> = Vec::with_capacity(block.instrs.len());
     for instr in &block.instrs {
@@ -630,47 +630,46 @@ impl<I: MemoryInterface> BlockCache<I> {
         // dynarec and only when we actually compiled the block we
         // just inserted.
         #[cfg(feature = "dynarec")]
-        if is_rom_address(pc) {
-            if let (Some(compiled), Some(chain_slot)) =
+        if is_rom_address(pc)
+            && let (Some(compiled), Some(chain_slot)) =
                 (block_compiled_fn, block_chain_slot.as_ref())
-            {
-                // (a) Try to link THIS block's chain slot to its
-                // fallthrough target if the target is already
-                // compiled. Otherwise park the slot on the waiters
-                // list for that target.
-                if let Some(ft_key) = block_fallthrough {
-                    if let Some(target_block) = self.rom_blocks.get(&ft_key) {
-                        if let Some(target_fn) = target_block.compiled {
-                            chain_slot.store(
-                                target_fn as usize,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        // Target exists but didn't compile: slot stays null
-                        // forever. No point parking in waiters — the target
-                        // won't ever transition to compiled (rom blocks
-                        // are recorded once).
-                    } else {
-                        // Target block not recorded yet. Park our slot so
-                        // that when the target eventually compiles, it can
-                        // retroactively link us.
-                        self.waiters
-                            .entry(ft_key)
-                            .or_default()
-                            .push(Rc::clone(chain_slot));
+        {
+            // (a) Try to link THIS block's chain slot to its
+            // fallthrough target if the target is already
+            // compiled. Otherwise park the slot on the waiters
+            // list for that target.
+            if let Some(ft_key) = block_fallthrough {
+                if let Some(target_block) = self.rom_blocks.get(&ft_key) {
+                    if let Some(target_fn) = target_block.compiled {
+                        chain_slot.store(
+                            target_fn as usize,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
+                    // Target exists but didn't compile: slot stays null
+                    // forever. No point parking in waiters — the target
+                    // won't ever transition to compiled (rom blocks
+                    // are recorded once).
+                } else {
+                    // Target block not recorded yet. Park our slot so
+                    // that when the target eventually compiles, it can
+                    // retroactively link us.
+                    self.waiters
+                        .entry(ft_key)
+                        .or_default()
+                        .push(Rc::clone(chain_slot));
                 }
+            }
 
-                // (b) Drain any waiters that were parked against
-                // THIS block's key — retroactively link their chain
-                // slots to our compiled fn. The key is `key` (the
-                // BlockKey we inserted under), which carries the
-                // Thumb bit in bit 0.
-                if let Some(mut parked) = self.waiters.remove(&key) {
-                    let compiled_addr = compiled as usize;
-                    for slot in parked.drain(..) {
-                        slot.store(compiled_addr, std::sync::atomic::Ordering::Relaxed);
-                    }
+            // (b) Drain any waiters that were parked against
+            // THIS block's key — retroactively link their chain
+            // slots to our compiled fn. The key is `key` (the
+            // BlockKey we inserted under), which carries the
+            // Thumb bit in bit 0.
+            if let Some(mut parked) = self.waiters.remove(&key) {
+                let compiled_addr = compiled as usize;
+                for slot in parked.drain(..) {
+                    slot.store(compiled_addr, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -711,10 +710,10 @@ impl<I: MemoryInterface> BlockCache<I> {
             if block.compiled.is_some() {
                 compiled += 1;
             }
-            if let Some(slot) = &block.chain_slot {
-                if slot.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-                    linked += 1;
-                }
+            if let Some(slot) = &block.chain_slot
+                && slot.load(std::sync::atomic::Ordering::Relaxed) != 0
+            {
+                linked += 1;
             }
         }
         (self.rom_blocks.len(), compiled, linked)
