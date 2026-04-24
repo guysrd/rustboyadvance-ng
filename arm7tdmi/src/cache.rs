@@ -263,12 +263,13 @@ fn try_compile_thumb<I: MemoryInterface>(
     // Reject branch-terminated blocks in production: even at MAX=4 they
     // introduced framebuffer divergence from scalar on mario-kart
     // replays (9 diverging frames). With this filter AND the MAX=4 cap,
-    // the replay is bit-identical to scalar (0 diverging frames) and
-    // the perf delta vs uncapped dynarec is tiny — most of the dynarec
-    // win comes from long DP chains, not from the branch-terminated
-    // short blocks this filter excludes. DYNAREC_DEBUG=no-branch also
-    // rejects branch-terminated blocks, kept for bisection only since
-    // this filter now applies unconditionally.
+    // the replay is bit-identical to scalar (0 diverging frames).
+    // Tried rejecting only BX (expecting Bcc/B to stay compilable for
+    // better perf) but that regressed both divergence (0->4) and FPS
+    // (471->455) — the `no-branch` filter is strictly better here.
+    //
+    // DYNAREC_DEBUG=no-branch is a superset of this filter, kept for
+    // bisection.
     if raws
         .last()
         .map(|&op| is_thumb_branch_opcode(op))
