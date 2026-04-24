@@ -685,6 +685,30 @@ impl<I: MemoryInterface> BlockCache<I> {
     pub fn len(&self) -> usize {
         self.rom_blocks.len() + self.ram_blocks.len()
     }
+
+    /// Diagnostic: compile-rate stats for the ROM-block half of the
+    /// cache. Returns `(total_rom_blocks, with_compiled_fn,
+    /// with_chain_slot_linked)`.  A block counts as "chain-linked"
+    /// when its chain slot has been populated with a non-null
+    /// target — i.e. a real fall-through successor was compiled.
+    /// Used by benchmarks / diagnostic runs to estimate how much of
+    /// the hot code is on the dynarec fast path.
+    #[cfg(feature = "dynarec")]
+    pub fn compile_stats(&self) -> (usize, usize, usize) {
+        let mut compiled = 0;
+        let mut linked = 0;
+        for block in self.rom_blocks.values() {
+            if block.compiled.is_some() {
+                compiled += 1;
+            }
+            if let Some(slot) = &block.chain_slot {
+                if slot.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    linked += 1;
+                }
+            }
+        }
+        (self.rom_blocks.len(), compiled, linked)
+    }
 }
 
 #[cfg(all(test, feature = "dynarec"))]
