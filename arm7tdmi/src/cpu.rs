@@ -552,30 +552,75 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
     /// advance the scheduler exactly as before. Scheduler events still fire
     /// between `step_block` calls in the outer loop; worst-case overshoot per
     /// block is bounded by the 64-instruction record cap.
+    /// Max number of blocks to chain through in a single `step_block`
+    /// call before bailing back to the outer run loop. In the common
+    /// case scheduler events or IRQs fire long before this and break
+    /// the chain, but having a hard cap prevents a pathological tight
+    /// loop with no abort-triggering events from monopolizing the
+    /// emulator thread.
+    #[cfg(feature = "cached_interp")]
+    const CHAIN_MAX_DEPTH: u32 = 16;
+
     #[cfg(feature = "cached_interp")]
     #[inline]
     pub fn step_block(&mut self) {
-        // If any RAM write happened since the last block started, blow the
-        // whole cache. Coarse but cheap and correct; a finer per-page scheme
-        // slots in here later without changing any caller.
-        if self.bus.take_block_cache_dirty() {
-            self.block_cache.flush();
-        }
+        // Iterate through contiguous fall-through / pipeline-flush
+        // chains so the gba::run → single_step → cpu_step → step_block
+        // overhead (~20 ns at the measurement site) is amortized over
+        // multiple blocks instead of every block. Each iteration
+        // dispatches one block and then checks the same abort
+        // conditions the inner scalar replay loop checks (RAM dirty,
+        // IRQ/DMA/halt/scheduler) before continuing to the next
+        // block. The loop terminates on abort, on a cache miss (fall
+        // through to recording), on Thumb/ARM state flip, or on the
+        // chain-depth cap.
+        for _ in 0..Self::CHAIN_MAX_DEPTH {
+            // If any RAM write happened since the last block started,
+            // blow the whole cache. Coarse but cheap and correct.
+            if self.bus.take_block_cache_dirty() {
+                self.block_cache.flush();
+                return;
+            }
 
-        let thumb = matches!(self.cpsr.state(), CpuState::THUMB);
-        let key = super::cache::BlockKey::new(self.pc, thumb);
+            let thumb = matches!(self.cpsr.state(), CpuState::THUMB);
+            let key = super::cache::BlockKey::new(self.pc, thumb);
 
-        if let Some(block) = self.block_cache.get(key) {
-            self.replay_cached_block(&block, thumb);
-        } else {
-            self.block_cache.begin_record(key);
-            self.record_new_block(thumb);
-            self.block_cache.finish_record();
+            let can_chain = if let Some(block) = self.block_cache.get(key) {
+                self.replay_cached_block(&block, thumb)
+            } else {
+                self.block_cache.begin_record(key);
+                self.record_new_block(thumb);
+                self.block_cache.finish_record();
+                // New recording — return to outer loop once so the
+                // scheduler can advance and we don't chain through a
+                // just-recorded block on the same tick.
+                return;
+            };
+            if !can_chain {
+                return;
+            }
+
+            // Inter-block abort check: scalar replay does this every
+            // other instruction inside the block; between chained
+            // blocks we do it once per block boundary.
+            if self.bus.cached_block_should_abort() {
+                return;
+            }
         }
     }
 
+    /// Replay a cached block. Returns `true` when the caller can
+    /// chain into the next block at the updated PC (normal fall-
+    /// through or pipeline flush with pipeline already reloaded at
+    /// the new target), `false` when it must return to the outer
+    /// run loop (abort condition, mode flip, or self-modifying
+    /// cache-dirty mid-block).
     #[cfg(feature = "cached_interp")]
-    fn replay_cached_block(&mut self, block: &super::cache::Block<I>, entry_thumb: bool) {
+    fn replay_cached_block(
+        &mut self,
+        block: &super::cache::Block<I>,
+        entry_thumb: bool,
+    ) -> bool {
         use super::cache::DecodedInstr;
 
         // Dispatch to a dynarec compiled native block when one is attached.
@@ -630,7 +675,7 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 self.pc = pc_out & if thumb_bit { !1 } else { !3 };
                 if thumb_bit { self.reload_pipeline16() } else { self.reload_pipeline32() }
             }
-            return;
+            return true; // chain: pipeline already reloaded if branch fired
         }
 
         // Always run the first instruction before checking abort conditions —
@@ -656,21 +701,21 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 // rest of this block no longer matches; bail and let the next
                 // step_block call re-resolve or re-record.
                 if matches!(self.cpsr.state(), CpuState::THUMB) != entry_thumb {
-                    return;
+                    return false;
                 }
 
                 // If an earlier instr in this block wrote to RAM, remaining
                 // cached handlers were resolved from potentially stale memory.
                 if self.bus.take_block_cache_dirty() {
                     self.block_cache.flush();
-                    return;
+                    return false;
                 }
 
                 // Yield to the outer loop at about per-two-instruction
                 // granularity (pending IRQ, newly active DMA, halt, scheduler
                 // overshoot).
                 if self.bus.cached_block_should_abort() {
-                    return;
+                    return false;
                 }
             }
             instr_idx = instr_idx.wrapping_add(1);
@@ -700,7 +745,7 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                             self.next_fetch_access = access;
                             self.advance_arm();
                         }
-                        CpuAction::PipelineFlushed => return,
+                        CpuAction::PipelineFlushed => return true,
                     }
                 }
                 DecodedInstr::Thumb { raw: expected, handler } => {
@@ -720,11 +765,15 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                             self.advance_thumb();
                             self.next_fetch_access = access;
                         }
-                        CpuAction::PipelineFlushed => return,
+                        CpuAction::PipelineFlushed => return true,
                     }
                 }
             }
         }
+        // Block finished normally (all recorded instructions
+        // executed without a pipeline flush). Fall-through to the
+        // next block at the advanced PC; caller can chain into it.
+        true
     }
 
     #[cfg(feature = "cached_interp")]
