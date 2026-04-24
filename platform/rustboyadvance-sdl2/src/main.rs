@@ -336,6 +336,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "block cache: {} rom blocks, {} compiled ({:.1}%), {} chain-linked ({:.1}% of compiled)",
                         total, compiled, pct, linked, link_pct,
                     );
+                    let cc = gba.cpu.dispatch_compiled_count;
+                    let ic = gba.cpu.dispatch_interp_count;
+                    let total_d = cc + ic;
+                    let cc_pct = if total_d > 0 {
+                        100.0 * cc as f64 / total_d as f64
+                    } else {
+                        0.0
+                    };
+                    println!(
+                        "dispatch: {} total, {} compiled ({:.2}%), {} interp",
+                        total_d, cc, cc_pct, ic,
+                    );
                 }
                 // Dump the per-shape execution counters. Output is parsed
                 // by scripts/dynarec_measure.sh to retrain `W_*` weights

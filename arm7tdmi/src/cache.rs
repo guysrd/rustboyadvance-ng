@@ -333,29 +333,16 @@ fn try_compile_thumb<I: MemoryInterface>(
     if raws.is_empty() {
         return None;
     }
-    // Reject branch-terminated blocks in production: even at MAX=4 they
-    // introduced framebuffer divergence from scalar on mario-kart
-    // replays (9 diverging frames). With this filter AND the MAX=4 cap,
-    // the replay is bit-identical to scalar (0 diverging frames).
-    // Tried rejecting only BX (expecting Bcc/B to stay compilable for
-    // better perf) but that regressed both divergence (0->4) and FPS
-    // (471->455) — the `no-branch` filter is strictly better here.
-    //
-    // Tried again 2026-04-24 with chain-linking infrastructure in
-    // place, expecting compiled Bcc/B blocks to win via chain
-    // amortization. Result: got compile rate 0% → 2.4% pokeemerald /
-    // 3.3% MK, but fps REGRESSED 558→534 (pokeemerald) / 396→374 (MK)
-    // on real SDL. Chain-link rate on those compiled blocks stayed
-    // ~1.4-2.3%, too low to amortize the per-compiled-block dispatch
-    // overhead. Root cause: compiled blocks as currently emitted
-    // are slower than scalar cached-interp replay for this class of
-    // blocks, likely because thumb_fetch_n + compiled body doesn't
-    // beat scalar's inlined per-instr load_16 + LUT dispatch. Until
-    // compiled blocks are faster per-block, lifting the filter is
-    // net-negative.
-    //
-    // DYNAREC_DEBUG=no-branch is a superset of this filter, kept for
-    // bisection.
+    // Reject branch-terminated blocks in production. Latest attempt
+    // at lifting this filter (2026-04-24): got compile rate 0%→3%,
+    // 2.2% of dispatches went compiled on pokeemerald, but overall
+    // fps regressed 4.5%. Dispatch-count diagnostic showed compiled
+    // dispatch is ~3x slower than interp dispatch per-call, so even
+    // at 2% of dispatches the compiled path loses. Chain-linking
+    // can't save this — the per-dispatch cost is the bottleneck.
+    // Fix the compiled-block speed first (thumb_fetch_n trampoline
+    // overhead + I-cache spread across 800 JIT fns is the leading
+    // suspect), then re-try lifting this filter.
     if raws
         .last()
         .map(|&op| is_thumb_branch_opcode(op))

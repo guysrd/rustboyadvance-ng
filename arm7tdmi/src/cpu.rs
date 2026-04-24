@@ -129,6 +129,21 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     /// cycle accounting for compiled blocks is parity-safe.
     #[cfg(feature = "dynarec")]
     pub dynarec_dispatch_enabled: bool,
+
+    /// Diagnostic counter incremented every time `replay_cached_block`
+    /// hits the compiled-dispatch fast path (compiled block present +
+    /// dynarec dispatch enabled + Thumb state). Reset to 0 at
+    /// construction; read via `dispatch_counts()` at the end of a run
+    /// to see what fraction of block replays went through compiled
+    /// native code vs the scalar interpreter loop.
+    #[cfg(feature = "dynarec")]
+    pub dispatch_compiled_count: u64,
+    /// Companion to `dispatch_compiled_count`: bumped on every block
+    /// replay that fell through to the scalar interpreter loop
+    /// (compiled was None, dynarec disabled, or block wasn't Thumb).
+    /// Sum of both is the total number of block replays.
+    #[cfg(feature = "dynarec")]
+    pub dispatch_interp_count: u64,
 }
 
 // BlockCache holds handler function pointers keyed by entry-PC; cloning a CPU
@@ -153,6 +168,10 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             block_cache: super::cache::BlockCache::new(),
             #[cfg(feature = "dynarec")]
             dynarec_dispatch_enabled: false,
+            #[cfg(feature = "dynarec")]
+            dispatch_compiled_count: 0,
+            #[cfg(feature = "dynarec")]
+            dispatch_interp_count: 0,
         }
     }
 }
@@ -179,6 +198,10 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             block_cache: super::cache::BlockCache::new(),
             #[cfg(feature = "dynarec")]
             dynarec_dispatch_enabled: false,
+            #[cfg(feature = "dynarec")]
+            dispatch_compiled_count: 0,
+            #[cfg(feature = "dynarec")]
+            dispatch_interp_count: 0,
         }
     }
 
@@ -227,6 +250,10 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             block_cache: super::cache::BlockCache::new(),
             #[cfg(feature = "dynarec")]
             dynarec_dispatch_enabled: false,
+            #[cfg(feature = "dynarec")]
+            dispatch_compiled_count: 0,
+            #[cfg(feature = "dynarec")]
+            dispatch_interp_count: 0,
         }
     }
 
@@ -575,6 +602,7 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             && let Some(compiled) = block.compiled
             && entry_thumb
         {
+            self.dispatch_compiled_count = self.dispatch_compiled_count.wrapping_add(1);
             // Bump the per-shape execution counter under `shape_profile`
             // so `scripts/dynarec_measure.sh` can retrain the W_* weights
             // from measured gameplay rather than hand-picked constants.
@@ -610,6 +638,10 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // pending but CPU has IRQs disabled, so cpu_interrupt() is a no-op and
         // would otherwise loop us forever between the outer run() while and
         // step_block's early return.
+        #[cfg(feature = "dynarec")]
+        {
+            self.dispatch_interp_count = self.dispatch_interp_count.wrapping_add(1);
+        }
         let mut instr_idx: u32 = 0;
 
         for instr in &block.instrs {
