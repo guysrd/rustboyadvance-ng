@@ -1644,6 +1644,26 @@ impl DynarecCompiler {
         })
     }
 
+    /// Thumb format 7: LDR/STR register offset (word/byte).
+    /// Encoding: `0101_L_B_0_Ro_Rb_Rd` — bit 9 must be 0 to
+    /// distinguish from F8 (bit 9 = 1, sign-extended).
+    /// Address = Rb + Ro. L=1 load, B=1 byte.
+    fn decode_thumb_format7(op: u16) -> Option<DecodedThumb7> {
+        // F7 and F8 share top-5 0b0101, differ on bit 9.
+        if (op >> 12) & 0xF != 0b0101 {
+            return None;
+        }
+        if (op >> 9) & 1 != 0 {
+            return None; // F8
+        }
+        let load = (op >> 11) & 1 != 0;
+        let byte = (op >> 10) & 1 != 0;
+        let ro = ((op >> 6) & 0b111) as i32;
+        let rb = ((op >> 3) & 0b111) as i32;
+        let rd = (op & 0b111) as i32;
+        Some(DecodedThumb7 { load, byte, ro, rb, rd })
+    }
+
     /// Thumb format 12: load address PC-rel or SP-rel into Rd.
     /// Encoding: `1010_L_Rd_imm8`. L=0 PC, L=1 SP.
     ///   PC case: Rd = ((instr_pc & !2) + 4) + imm8*4 — folded at
@@ -1920,6 +1940,7 @@ impl DynarecCompiler {
             F4(DecodedThumb4),
             F5(DecodedThumb5),
             F6(DecodedThumb6),
+            F7(DecodedThumb7),
             F9(DecodedThumb9),
             F11(DecodedThumb11),
             F12(DecodedThumb12),
@@ -1943,6 +1964,7 @@ impl DynarecCompiler {
         /// NonSeq; the LDR path returns Seq.
         fn body_item_is_nonseq_advance(item: &Body) -> bool {
             match item {
+                Body::F7(d) => !d.load,
                 Body::F9(d) => !d.load,
                 Body::F11(d) => !d.load,
                 // F14 PUSH and POP BOTH return AdvancePC(NonSeq) in
@@ -1972,6 +1994,8 @@ impl DynarecCompiler {
                 Some(Body::F11(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format9(op) {
                 Some(Body::F9(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format7(op) {
+                Some(Body::F7(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format6(op) {
                 Some(Body::F6(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format1(op) {
@@ -2125,7 +2149,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F6(_) | Body::F9(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) => 0,
+                    Body::F6(_) | Body::F7(_) | Body::F9(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2195,6 +2219,10 @@ impl DynarecCompiler {
                     Body::F5(d) => emit_thumb_format5_non_branch(builder, gpr_ptr, cpsr_var, *d),
                     Body::F6(d) => emit_thumb_format6(
                         builder, gpr_ptr, cpu_ctx, load_idle_32_ref, *d, instr_pc,
+                    ),
+                    Body::F7(d) => emit_thumb_format7(
+                        builder, gpr_ptr, cpu_ctx,
+                        load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
                     ),
                     Body::F9(d) => emit_thumb_format9(
                         builder, gpr_ptr, cpu_ctx,
@@ -3206,6 +3234,16 @@ struct DecodedThumb6 {
     imm8: u32,
 }
 
+/// Thumb format 7 register-offset LDR/STR (word/byte).
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb7 {
+    load: bool,
+    byte: bool,
+    ro: i32,
+    rb: i32,
+    rd: i32,
+}
+
 /// Thumb format 13 ADD/SUB SP, #imm.
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb13 {
@@ -3618,6 +3656,63 @@ fn emit_thumb_format6(
     builder
         .ins()
         .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+}
+
+/// Thumb format 7 register-offset LDR/STR.  Address = Rb + Ro.
+/// Word load uses `load_with_idle_32` (scalar: ldr_word + +1I).
+/// Byte load uses `load_with_idle_8`. STR uses plain store_32 /
+/// store_8.  Mirrors scalar `do_exec_thumb_ldr_str`.
+fn emit_thumb_format7(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    cpu_ctx: Value,
+    load_idle_32_ref: cranelift::codegen::ir::FuncRef,
+    store_32_ref: cranelift::codegen::ir::FuncRef,
+    load_idle_8_ref: cranelift::codegen::ir::FuncRef,
+    store_8_ref: cranelift::codegen::ir::FuncRef,
+    dec: DecodedThumb7,
+) {
+    let rb_val = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        gpr_ptr,
+        Offset32::new(dec.rb * 4),
+    );
+    let ro_val = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        gpr_ptr,
+        Offset32::new(dec.ro * 4),
+    );
+    let addr = builder.ins().iadd(rb_val, ro_val);
+    match (dec.load, dec.byte) {
+        (true, false) => {
+            let call = builder.ins().call(load_idle_32_ref, &[cpu_ctx, addr]);
+            let v = builder.inst_results(call)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+        }
+        (true, true) => {
+            let call = builder.ins().call(load_idle_8_ref, &[cpu_ctx, addr]);
+            let v = builder.inst_results(call)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+        }
+        (false, false) => {
+            let rd_val = builder.ins().load(
+                types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
+            );
+            builder.ins().call(store_32_ref, &[cpu_ctx, addr, rd_val]);
+        }
+        (false, true) => {
+            let rd_val = builder.ins().load(
+                types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
+            );
+            builder.ins().call(store_8_ref, &[cpu_ctx, addr, rd_val]);
+        }
+    }
 }
 
 /// Thumb format 12 load address. SP case: Rd = SP + offset.
