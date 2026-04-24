@@ -1769,7 +1769,6 @@ impl DynarecCompiler {
 
     /// Thumb format 10: LDRH / STRH imm5 offset.
     /// Encoding: `1000_L_imm5_Rs_Rd`. Address = Rs + imm5*2.
-    #[allow(dead_code)]
     fn decode_thumb_format10(op: u16) -> Option<DecodedThumb10> {
         if (op >> 12) & 0xF != 0b1000 {
             return None;
@@ -2107,7 +2106,6 @@ impl DynarecCompiler {
             F7(DecodedThumb7),
             F8(DecodedThumb8),
             F9(DecodedThumb9),
-            #[allow(dead_code)]
             F10(DecodedThumb10),
             F11(DecodedThumb11),
             F12(DecodedThumb12),
@@ -2175,12 +2173,8 @@ impl DynarecCompiler {
                 Some(Body::F12(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format11(op) {
                 Some(Body::F11(d))
-            // F10 codegen + trampoline are plumbed but classifier
-            // intentionally SKIPS format10 until the 10270-cycle drift
-            // on real-SDL pokeemerald is root-caused. Pre-existing
-            // code paths already exercise `store_16` /
-            // `load_with_idle_16` for the test stubs, so the trampoline
-            // wiring is kept live.
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format10(op) {
+                Some(Body::F10(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format9(op) {
                 Some(Body::F9(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format7(op) {
