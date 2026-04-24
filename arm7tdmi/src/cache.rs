@@ -338,26 +338,15 @@ fn try_compile_thumb<I: MemoryInterface>(
     if raws.is_empty() {
         return None;
     }
-    // Reject ONLY dynamic-target branch terminators (BX, POP{PC},
-    // BL pair). Their targets come from runtime values so can't be
-    // statically chained. Bcc (format 16) and B (format 18) have
-    // compile-time-known targets and now have chain emission on
-    // both their taken and fall-through paths — compiling them
-    // unlocks chain links that were impossible under the old
-    // blanket branch-filter.
+    // Reject only the BL pair (format 19) — unsupported by the
+    // compiler's tail decoder. BX and POP{PC} DO have Tail::Bx /
+    // Tail::PopPc codegen paths even though their branch targets
+    // are dynamic (register / stack load); they return through the
+    // dispatcher rather than statically chaining, but compiling
+    // them still counts toward coverage and gets their compiled-
+    // block body onto the fast path.
     if let Some(&last) = raws.last() {
         let top4 = last >> 12;
-        // BX: 0100_0111_xxxx_xxxx (format 5 BX subset).
-        if (last & 0xFF00) == 0x4700 {
-            return None;
-        }
-        // POP{PC}: 1011_1101_xxxx_xxxx (format 14 with R=1).
-        if (last & 0xFF00) == 0xBD00 {
-            return None;
-        }
-        // BL pair (format 19): top4 == 0b1111. First half sets LR,
-        // second half branches. Either half is unsupported as a tail
-        // terminator in the current compiler.
         if top4 == 0b1111 {
             return None;
         }

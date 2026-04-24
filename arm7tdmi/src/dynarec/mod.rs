@@ -109,6 +109,15 @@ pub type BusThumbFetchNFn = unsafe extern "C" fn(*mut u8, u32, u32);
 ///   - `cached_block_should_abort` (IRQ / DMA / halt / scheduler event).
 /// Returns 0 to continue into the chain target.
 pub type BusChainAbortCheckFn = unsafe extern "C" fn(*mut u8) -> u32;
+/// Mid-block abort state-writeback. Called from compiled blocks when
+/// `chain_abort_check` fires mid-body to restore CPU state to what a
+/// scalar replay would have left at the SAME abort point. Sets
+/// `cpu.pc`, `cpu.pipeline[0/1]`, and `cpu.next_fetch_access` so the
+/// next `replay_cached_block` dispatch reads the right instruction.
+/// pipeline values are baked in at codegen (they are known raw
+/// opcodes from the recorded block).
+pub type BusAbortMidBlockFn =
+    unsafe extern "C" fn(*mut u8, u32 /* pc */, u32 /* pipe0 */, u32 /* pipe1 */);
 
 /// Generic bus trampolines. Instantiate with the concrete MemoryInterface
 /// type of your CPU. The `cpu_ctx` opaque pointer passed to the dynarec
@@ -301,6 +310,25 @@ pub mod trampolines {
         1
     }
 
+    /// Mid-block abort writeback. Called by compiled code when
+    /// `chain_abort_check` fires between body items — restores
+    /// the CPU state a scalar replay would have left at the same
+    /// point so the next `replay_cached_block` dispatch resumes
+    /// from the correct pipeline[0]. pipeline values + pc are
+    /// constants baked in at codegen time.
+    pub unsafe extern "C" fn abort_mid_block<I: MemoryInterface>(
+        ctx: *mut u8,
+        pc: u32,
+        pipe0: u32,
+        pipe1: u32,
+    ) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.pc = pc;
+        cpu.pipeline[0] = pipe0;
+        cpu.pipeline[1] = pipe1;
+        cpu.next_fetch_access = MemoryAccess::Seq;
+    }
+
     /// Fill a `BusTrampolines` with pointers to the generic trampolines
     /// monomorphized for `I`. Call once at compiler construction time and
     /// hand the returned struct to `DynarecCompiler::new_with_bus`.
@@ -317,6 +345,7 @@ pub mod trampolines {
             idle_cycle: idle_cycle::<I>,
             thumb_fetch_n: thumb_fetch_n::<I>,
             chain_abort_check: chain_abort_check::<I>,
+            abort_mid_block: abort_mid_block::<I>,
         }
     }
 }
@@ -344,6 +373,8 @@ pub struct BusTrampolines {
     /// Link-time block-chaining abort guard. Consulted from compiled
     /// Tail::Body epilogues before a chained tail-call.
     pub chain_abort_check: BusChainAbortCheckFn,
+    /// Mid-block abort state writeback (pc + pipeline[0/1] + next_fetch_access).
+    pub abort_mid_block: BusAbortMidBlockFn,
 }
 
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
@@ -382,6 +413,7 @@ struct BusImports {
     idle_cycle: FuncId,
     thumb_fetch_n: FuncId,
     chain_abort_check: FuncId,
+    abort_mid_block: FuncId,
 }
 
 impl DynarecCompiler {
@@ -430,6 +462,7 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_idle_cycle",             b.idle_cycle           as *const u8);
             jit_builder.symbol("rba_thumb_fetch_n",          b.thumb_fetch_n        as *const u8);
             jit_builder.symbol("rba_chain_abort_check",      b.chain_abort_check    as *const u8);
+            jit_builder.symbol("rba_abort_mid_block",        b.abort_mid_block      as *const u8);
         }
 
         let mut module = JITModule::new(jit_builder);
@@ -534,6 +567,16 @@ impl DynarecCompiler {
                 .declare_function("rba_chain_abort_check", Linkage::Import, &sig_chain_abort)
                 .expect("declare chain_abort_check failed");
 
+            // abort_mid_block: extern "C" fn(*mut u8, u32, u32, u32)
+            let mut sig_abort_mid = module.make_signature();
+            sig_abort_mid.params.push(AbiParam::new(ptr_ty));
+            sig_abort_mid.params.push(AbiParam::new(types::I32));
+            sig_abort_mid.params.push(AbiParam::new(types::I32));
+            sig_abort_mid.params.push(AbiParam::new(types::I32));
+            let abort_mid_block = module
+                .declare_function("rba_abort_mid_block", Linkage::Import, &sig_abort_mid)
+                .expect("declare abort_mid_block failed");
+
             BusImports {
                 load_32,
                 store_32,
@@ -546,6 +589,7 @@ impl DynarecCompiler {
                 idle_cycle,
                 thumb_fetch_n,
                 chain_abort_check,
+                abort_mid_block,
             }
         });
 
@@ -4717,6 +4761,9 @@ mod tests {
     /// abort" — which prevents codegen-emitted chain checks from
     /// tail-calling through a (deliberately null) chain slot.
     unsafe extern "C" fn test_chain_abort_check(_ctx: *mut u8) -> u32 { 1 }
+    unsafe extern "C" fn test_abort_mid_block(
+        _ctx: *mut u8, _pc: u32, _p0: u32, _p1: u32,
+    ) {}
 
     fn test_trampolines() -> BusTrampolines {
         BusTrampolines {
@@ -4731,6 +4778,7 @@ mod tests {
             idle_cycle: test_idle_cycle,
             thumb_fetch_n: test_thumb_fetch_n,
             chain_abort_check: test_chain_abort_check,
+            abort_mid_block: test_abort_mid_block,
         }
     }
 
