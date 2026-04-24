@@ -130,6 +130,14 @@ pub type BusAbortMidBlockFn =
 /// finishes (so subsequent iter's fetch access reflects this iter's
 /// AdvancePC return).
 pub type BusThumbFetchChargeShiftFn = unsafe extern "C" fn(*mut u8, u32, u32);
+/// ARM mirror of `BusThumbFetchChargeShiftFn`. Reads a 32-bit word at
+/// `addr` via `cpu.load_32` (charging cycles through the sysbus), shifts
+/// `pipeline[0] = pipeline[1]; pipeline[1] = fetched`, and advances
+/// `cpu.pc` by 4. `access_hint`: 0 = NonSeq, 1 = Seq, 2 = read from
+/// `cpu.next_fetch_access`. Caller is responsible for writing
+/// `cpu.next_fetch_access` after the body item's emit (mirrors the
+/// scalar handler-driven `AdvancePC(access)` flow for ARM mode).
+pub type BusArmFetchChargeShiftFn = unsafe extern "C" fn(*mut u8, u32, u32);
 /// Write `cpu.next_fetch_access`. access_hint: 0=NonSeq, 1=Seq.
 /// Used by per-iter codegen to mirror scalar's handler-driven update.
 pub type BusSetNextFetchAccessFn = unsafe extern "C" fn(*mut u8, u32);
@@ -418,6 +426,29 @@ pub mod trampolines {
         cpu.pc = addr.wrapping_add(2);
     }
 
+    /// ARM mirror of `thumb_fetch_charge_shift`. 32-bit fetch via
+    /// `cpu.load_32` (cycles charged through sysbus.add_cycles), pipeline
+    /// shift, +4 pc advance. Address is the ARM-aligned PC of the fetch
+    /// (caller has already masked &!3). access_hint encoding matches the
+    /// Thumb trampoline: 0 = NonSeq, 1 = Seq, 2 = read
+    /// `cpu.next_fetch_access` (used for the first iter of a block).
+    pub unsafe extern "C" fn arm_fetch_charge_shift<I: MemoryInterface>(
+        ctx: *mut u8,
+        addr: u32,
+        access_hint: u32,
+    ) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        let access = match access_hint {
+            0 => MemoryAccess::NonSeq,
+            1 => MemoryAccess::Seq,
+            _ => cpu.next_fetch_access,
+        };
+        let val = cpu.load_32(addr, access);
+        cpu.pipeline[0] = cpu.pipeline[1];
+        cpu.pipeline[1] = val;
+        cpu.pc = addr.wrapping_add(4);
+    }
+
     /// Write `cpu.next_fetch_access`. Called by the per-iter codegen
     /// after each body emit to mirror scalar's per-iter update of
     /// `self.next_fetch_access` from the instruction handler's
@@ -456,6 +487,7 @@ pub mod trampolines {
             chain_abort_check: chain_abort_check::<I>,
             abort_mid_block: abort_mid_block::<I>,
             thumb_fetch_charge_shift: thumb_fetch_charge_shift::<I>,
+            arm_fetch_charge_shift: arm_fetch_charge_shift::<I>,
             set_next_fetch_access: set_next_fetch_access::<I>,
         }
     }
@@ -502,6 +534,9 @@ pub struct BusTrampolines {
     /// cycle accounting so mid-block abort checks see the same
     /// scheduler timestamp as scalar would.
     pub thumb_fetch_charge_shift: BusThumbFetchChargeShiftFn,
+    /// ARM mirror of `thumb_fetch_charge_shift`. Per-iter 32-bit fetch
+    /// + pipeline shift + +4 pc advance for ARM-mode compiled blocks.
+    pub arm_fetch_charge_shift: BusArmFetchChargeShiftFn,
     /// Write `cpu.next_fetch_access`. Called by per-iter codegen after
     /// each body emit to mirror scalar's handler-driven update of
     /// `self.next_fetch_access` from `AdvancePC(access)` returns.
@@ -551,6 +586,7 @@ struct BusImports {
     chain_abort_check: FuncId,
     abort_mid_block: FuncId,
     thumb_fetch_charge_shift: FuncId,
+    arm_fetch_charge_shift: FuncId,
     set_next_fetch_access: FuncId,
 }
 
@@ -615,6 +651,8 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_abort_mid_block",        b.abort_mid_block      as *const u8);
             jit_builder.symbol("rba_thumb_fetch_charge_shift",
                                                               b.thumb_fetch_charge_shift as *const u8);
+            jit_builder.symbol("rba_arm_fetch_charge_shift",
+                                                              b.arm_fetch_charge_shift as *const u8);
             jit_builder.symbol("rba_set_next_fetch_access",
                                                               b.set_next_fetch_access as *const u8);
         }
@@ -763,6 +801,15 @@ impl DynarecCompiler {
                     &sig_fetch_cs,
                 )
                 .expect("declare thumb_fetch_charge_shift failed");
+            // arm_fetch_charge_shift: same signature as Thumb's
+            // (*mut u8, u32 addr, u32 access_hint). Reused.
+            let arm_fetch_charge_shift = module
+                .declare_function(
+                    "rba_arm_fetch_charge_shift",
+                    Linkage::Import,
+                    &sig_fetch_cs,
+                )
+                .expect("declare arm_fetch_charge_shift failed");
 
             // set_next_fetch_access: extern "C" fn(*mut u8, u32 hint)
             let mut sig_set_access = module.make_signature();
@@ -795,6 +842,7 @@ impl DynarecCompiler {
                 chain_abort_check,
                 abort_mid_block,
                 thumb_fetch_charge_shift,
+                arm_fetch_charge_shift,
                 set_next_fetch_access,
             }
         });
@@ -6326,6 +6374,7 @@ mod tests {
             load_with_idle_16: test_load_with_idle_32,
             load_with_idle_sh: test_load_with_idle_32,
             thumb_fetch_charge_shift: test_thumb_fetch_charge_shift,
+            arm_fetch_charge_shift: test_thumb_fetch_charge_shift,
             set_next_fetch_access: test_set_next_fetch_access,
         }
     }
