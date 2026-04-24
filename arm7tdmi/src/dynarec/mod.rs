@@ -1949,7 +1949,13 @@ impl DynarecCompiler {
                     let pc_addr = builder.ins().iadd_imm(sp, byte_offset);
                     let pc_call = builder.ins().call(load_32_ref, &[cpu_ctx, pc_addr]);
                     let pc_val = builder.inst_results(pc_call)[0];
-                    builder.ins().store(MemFlags::trusted(), pc_val, pc_out, 0);
+                    // Scalar Thumb POP{PC} stays in Thumb regardless of
+                    // the popped value's bit 0 (exec_thumb_push_pop only
+                    // does `self.pc &= !1`; never switches to ARM via
+                    // branch_exchange). Force bit 0 = 1 so the caller's
+                    // thumb_bit check correctly lands in Thumb mode.
+                    let pc_val_thumb = builder.ins().bor_imm(pc_val, 1);
+                    builder.ins().store(MemFlags::trusted(), pc_val_thumb, pc_out, 0);
                     byte_offset += 4;
                     let new_sp = builder.ins().iadd_imm(sp, byte_offset);
                     builder.ins().store(
