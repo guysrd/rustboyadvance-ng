@@ -2750,6 +2750,12 @@ impl DynarecCompiler {
                         let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
                         let do_abort_blk = builder.create_block();
                         let cont_blk = builder.create_block();
+                        // Mid-block abort paths are the rare case
+                        // (scheduler-event-due, IRQ, DMA start). Cold
+                        // lets Cranelift layout favor the common
+                        // continue-execution path for better I-cache
+                        // locality + branch prediction.
+                        builder.set_cold_block(do_abort_blk);
                         builder.ins().brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
 
                         builder.switch_to_block(do_abort_blk);
@@ -2860,6 +2866,12 @@ impl DynarecCompiler {
                         let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
                         let do_abort_blk = builder.create_block();
                         let cont_blk = builder.create_block();
+                        // Mid-block abort paths are the rare case
+                        // (scheduler-event-due, IRQ, DMA start). Cold
+                        // lets Cranelift layout favor the common
+                        // continue-execution path for better I-cache
+                        // locality + branch prediction.
+                        builder.set_cold_block(do_abort_blk);
                         builder.ins().brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
 
                         builder.switch_to_block(do_abort_blk);
@@ -2903,6 +2915,7 @@ impl DynarecCompiler {
                     let abort_nz = builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
                     let do_abort_blk = builder.create_block();
                     let cont_blk = builder.create_block();
+                    builder.set_cold_block(do_abort_blk);
                     builder.ins().brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
 
                     builder.switch_to_block(do_abort_blk);
@@ -2960,6 +2973,7 @@ impl DynarecCompiler {
                             builder.ins().icmp_imm(IntCC::NotEqual, abort, 0);
                         let do_abort_blk = builder.create_block();
                         let cont_blk = builder.create_block();
+                        builder.set_cold_block(do_abort_blk);
                         builder
                             .ins()
                             .brif(abort_nz, do_abort_blk, &[], cont_blk, &[]);
@@ -3053,6 +3067,12 @@ impl DynarecCompiler {
                         let chain_try_blk = builder.create_block();
                         let chain_call_blk = builder.create_block();
                         let chain_merge_blk = builder.create_block();
+                        // Note: chain_merge_blk was tried as cold —
+                        // measured -2% MK fps so reverted. Chain slots
+                        // are unlinked enough in practice (every RAM
+                        // block cache flush relinks from scratch) that
+                        // the merge path isn't "cold enough" for the
+                        // regalloc hint to be a net win.
 
                         let is_nonnull = builder
                             .ins()
