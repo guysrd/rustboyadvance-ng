@@ -172,6 +172,23 @@ pub mod trampolines {
         cpu.idle_cycle();
         v
     }
+    /// Sign-extended halfword LDSH with +1I. Mirrors scalar
+    /// `ldr_sign_half`: on misaligned addr falls back to a byte load
+    /// then sign-extends (ARM7TDMI quirk); on aligned addr does a
+    /// full halfword load and sign-extends that.
+    pub unsafe extern "C" fn load_with_idle_sh<I: MemoryInterface>(
+        ctx: *mut u8,
+        addr: u32,
+    ) -> u32 {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        let v = if addr & 0x1 != 0 {
+            cpu.load_8(addr, MemoryAccess::NonSeq) as i8 as i32 as u32
+        } else {
+            cpu.load_16(addr, MemoryAccess::NonSeq) as i16 as i32 as u32
+        };
+        cpu.idle_cycle();
+        v
+    }
     pub unsafe extern "C" fn load_8<I: MemoryInterface>(ctx: *mut u8, addr: u32) -> u32 {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.load_8(addr, MemoryAccess::NonSeq) as u32
@@ -378,6 +395,7 @@ pub mod trampolines {
             store_32_seq: store_32_seq::<I>,
             store_16: store_16::<I>,
             load_with_idle_16: load_with_idle_16::<I>,
+            load_with_idle_sh: load_with_idle_sh::<I>,
             load_with_idle_32: load_with_idle_32::<I>,
             load_with_idle_8: load_with_idle_8::<I>,
             set_next_fetch_nonseq: set_next_fetch_nonseq::<I>,
@@ -407,6 +425,8 @@ pub struct BusTrampolines {
     /// 16-bit halfword access for Thumb format 10 LDRH / STRH imm.
     pub store_16: BusStore32Fn,
     pub load_with_idle_16: BusLoadIdle32Fn,
+    /// Sign-extended halfword LDSH (format 8) with +1I.
+    pub load_with_idle_sh: BusLoadIdle32Fn,
     /// Data-load with implicit +1I idle cycle (LDR/LDRH/LDRB family).
     pub load_with_idle_32: BusLoadIdle32Fn,
     pub load_with_idle_8: BusLoadIdle8Fn,
@@ -458,6 +478,7 @@ struct BusImports {
     store_32_seq: FuncId,
     store_16: FuncId,
     load_with_idle_16: FuncId,
+    load_with_idle_sh: FuncId,
     load_with_idle_32: FuncId,
     load_with_idle_8: FuncId,
     set_next_fetch_nonseq: FuncId,
@@ -510,6 +531,7 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_bus_store_32_seq",       b.store_32_seq         as *const u8);
             jit_builder.symbol("rba_bus_store_16",           b.store_16             as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_16",  b.load_with_idle_16    as *const u8);
+            jit_builder.symbol("rba_bus_load_with_idle_sh",  b.load_with_idle_sh    as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_32",  b.load_with_idle_32    as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_8",   b.load_with_idle_8     as *const u8);
             jit_builder.symbol("rba_set_next_fetch_nonseq",  b.set_next_fetch_nonseq as *const u8);
@@ -587,6 +609,9 @@ impl DynarecCompiler {
             let load_with_idle_16 = module
                 .declare_function("rba_bus_load_with_idle_16", Linkage::Import, &sig_load_idle_32)
                 .expect("declare load_with_idle_16 failed");
+            let load_with_idle_sh = module
+                .declare_function("rba_bus_load_with_idle_sh", Linkage::Import, &sig_load_idle_32)
+                .expect("declare load_with_idle_sh failed");
 
             // load_with_idle_8: same signature as load_8; charges +1I post-load.
             let mut sig_load_idle_8 = module.make_signature();
@@ -659,6 +684,7 @@ impl DynarecCompiler {
                 store_32_seq,
                 store_16,
                 load_with_idle_16,
+                load_with_idle_sh,
                 load_with_idle_32,
                 load_with_idle_8,
                 set_next_fetch_nonseq,
@@ -1713,28 +1739,32 @@ impl DynarecCompiler {
         Some(DecodedThumbBlLo { off_lo })
     }
 
-    /// Thumb format 8 LDSB: sign-extended byte load Rd = (i8)[Rb+Ro].
-    /// Encoding: `0101_10_1_Ro_Rb_Rd` (H=0 sign=1).
-    /// Execution: 1N load + 1I, AdvancePC(NonSeq).
-    /// Only the LDSB sub-op of F8 is supported here — STRH/LDRH share
-    /// the F10 halfword trampolines (which currently drift), and LDSH
-    /// requires an ldr_sign_half trampoline we haven't written. LDSB
-    /// is self-contained.
-    fn decode_thumb_format8_ldsb(op: u16) -> Option<DecodedThumb8Ldsb> {
+    /// Thumb format 8 — sign-extended byte/halfword or halfword
+    /// load/store with register offset. Encoding:
+    ///   `0101_HS_1_Ro_Rb_Rd` where HS = {00 STRH, 01 LDSB, 10 LDRH, 11 LDSH}.
+    /// (H = bit 11, S = bit 10 in scalar's template, combined here
+    /// as the `op` field.)  All 4 sub-ops return AdvancePC(NonSeq).
+    fn decode_thumb_format8(op: u16) -> Option<DecodedThumb8> {
         if (op >> 12) & 0xF != 0b0101 {
             return None;
         }
         if (op >> 9) & 1 == 0 {
             return None; // F7 (bit 9 = 0)
         }
-        // H=bit 11, S=bit 10. LDSB is H=0, S=1 → bits 11-10 = 01.
-        if (op >> 10) & 0b11 != 0b01 {
-            return None;
-        }
+        let hs = ((op >> 10) & 0b11) as u8;
         let ro = ((op >> 6) & 0b111) as i32;
         let rb = ((op >> 3) & 0b111) as i32;
         let rd = (op & 0b111) as i32;
-        Some(DecodedThumb8Ldsb { ro, rb, rd })
+        Some(DecodedThumb8 { hs, ro, rb, rd })
+    }
+
+    /// Deprecated wrapper kept for the test suite that was matching
+    /// against LDSB only.
+    #[allow(dead_code)]
+    fn decode_thumb_format8_ldsb(op: u16) -> Option<DecodedThumb8Ldsb> {
+        let d = Self::decode_thumb_format8(op)?;
+        if d.hs != 0b01 { return None; }
+        Some(DecodedThumb8Ldsb { ro: d.ro, rb: d.rb, rd: d.rd })
     }
 
     /// Thumb format 10: LDRH / STRH imm5 offset.
@@ -2075,7 +2105,7 @@ impl DynarecCompiler {
             F5(DecodedThumb5),
             F6(DecodedThumb6),
             F7(DecodedThumb7),
-            F8Ldsb(DecodedThumb8Ldsb),
+            F8(DecodedThumb8),
             F9(DecodedThumb9),
             #[allow(dead_code)]
             F10(DecodedThumb10),
@@ -2108,9 +2138,10 @@ impl DynarecCompiler {
         fn body_item_is_nonseq_advance(item: &Body) -> bool {
             match item {
                 Body::F7(d) => !d.load,
-                // F8 always NonSeq advance (both loads + stores per
-                // scalar exec_thumb_ldr_str_shb's return value).
-                Body::F8Ldsb(_) => true,
+                // F8 always NonSeq advance (scalar's
+                // exec_thumb_ldr_str_shb returns AdvancePC(NonSeq)
+                // for all 4 sub-ops).
+                Body::F8(_) => true,
                 Body::F9(d) => !d.load,
                 // F10 STRH returns NonSeq; LDRH returns Seq.
                 Body::F10(d) => !d.load,
@@ -2154,8 +2185,8 @@ impl DynarecCompiler {
                 Some(Body::F9(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format7(op) {
                 Some(Body::F7(d))
-            } else if let Some(d) = DynarecCompiler::decode_thumb_format8_ldsb(op) {
-                Some(Body::F8Ldsb(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format8(op) {
+                Some(Body::F8(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format6(op) {
                 Some(Body::F6(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format1(op) {
@@ -2291,6 +2322,9 @@ impl DynarecCompiler {
                 self.module.declare_func_in_func(imports.store_16, builder.func);
             let load_idle_16_ref =
                 self.module.declare_func_in_func(imports.load_with_idle_16, builder.func);
+            // F8 LDSH trampoline (sign-extended halfword load).
+            let load_idle_sh_ref =
+                self.module.declare_func_in_func(imports.load_with_idle_sh, builder.func);
             let fetch_n_ref =
                 self.module.declare_func_in_func(imports.thumb_fetch_n, builder.func);
             // pay_extra_nonseq: charges (n - s) cycles for the next fetch
@@ -2339,7 +2373,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F6(_) | Body::F7(_) | Body::F8Ldsb(_) | Body::F9(_) | Body::F10(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) | Body::F15(_) => 0,
+                    Body::F6(_) | Body::F7(_) | Body::F8(_) | Body::F9(_) | Body::F10(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) | Body::F15(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2415,8 +2449,10 @@ impl DynarecCompiler {
                         builder, gpr_ptr, cpu_ctx,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref, *d,
                     ),
-                    Body::F8Ldsb(d) => emit_thumb_format8_ldsb(
-                        builder, gpr_ptr, cpu_ctx, load_idle_8_ref, *d,
+                    Body::F8(d) => emit_thumb_format8(
+                        builder, gpr_ptr, cpu_ctx,
+                        store_16_ref, load_idle_16_ref, load_idle_8_ref, load_idle_sh_ref,
+                        *d,
                     ),
                     Body::F9(d) => emit_thumb_format9(
                         builder, gpr_ptr, cpu_ctx,
@@ -3498,6 +3534,16 @@ struct DecodedThumb8Ldsb {
     rd: i32,
 }
 
+/// Thumb format 8 — all 4 sub-ops (STRH / LDSB / LDRH / LDSH).
+/// `hs` selects: 00=STRH, 01=LDSB, 10=LDRH, 11=LDSH.
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb8 {
+    hs: u8,
+    ro: i32,
+    rb: i32,
+    rd: i32,
+}
+
 /// BL first half — sets LR = pc + lr_delta (compile-time constant
 /// given the instruction's pc).
 #[derive(Clone, Copy, Debug)]
@@ -3936,8 +3982,68 @@ fn emit_thumb_format6(
         .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
 }
 
+/// Thumb format 8 — STRH / LDSB / LDRH / LDSH with register offset.
+/// All four sub-ops AdvancePC(NonSeq). Matches scalar
+/// `exec_thumb_ldr_str_shb`.
+fn emit_thumb_format8(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    cpu_ctx: Value,
+    store_16_ref: cranelift::codegen::ir::FuncRef,
+    load_idle_16_ref: cranelift::codegen::ir::FuncRef,
+    load_idle_8_ref: cranelift::codegen::ir::FuncRef,
+    load_idle_sh_ref: cranelift::codegen::ir::FuncRef,
+    dec: DecodedThumb8,
+) {
+    let rb_val = builder.ins().load(
+        types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rb * 4),
+    );
+    let ro_val = builder.ins().load(
+        types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.ro * 4),
+    );
+    let addr = builder.ins().iadd(rb_val, ro_val);
+    match dec.hs {
+        0b00 => {
+            // STRH
+            let rd_val = builder.ins().load(
+                types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(dec.rd * 4),
+            );
+            builder.ins().call(store_16_ref, &[cpu_ctx, addr, rd_val]);
+        }
+        0b01 => {
+            // LDSB: load_with_idle_8 + sign-extend.
+            let call = builder.ins().call(load_idle_8_ref, &[cpu_ctx, addr]);
+            let byte = builder.inst_results(call)[0];
+            let shl = builder.ins().ishl_imm(byte, 24);
+            let signed = builder.ins().sshr_imm(shl, 24);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), signed, gpr_ptr, Offset32::new(dec.rd * 4));
+        }
+        0b10 => {
+            // LDRH
+            let call = builder.ins().call(load_idle_16_ref, &[cpu_ctx, addr]);
+            let v = builder.inst_results(call)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+        }
+        0b11 => {
+            // LDSH — trampoline handles the aligned/misaligned
+            // split and returns a pre-sign-extended u32.
+            let call = builder.ins().call(load_idle_sh_ref, &[cpu_ctx, addr]);
+            let v = builder.inst_results(call)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Thumb format 8 LDSB — sign-extended byte load. Addr = Rb + Ro,
 /// load 1 byte via load_with_idle_8, sign-extend to i32.
+#[allow(dead_code)]
 fn emit_thumb_format8_ldsb(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
@@ -5576,6 +5682,7 @@ mod tests {
             store_32_seq: test_store_32,
             store_16: test_store_32,
             load_with_idle_16: test_load_with_idle_32,
+            load_with_idle_sh: test_load_with_idle_32,
         }
     }
 

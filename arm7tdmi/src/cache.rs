@@ -845,11 +845,10 @@ mod tests {
 
         let key = BlockKey::new(0x0800_0000, true);
         cache.begin_record(key);
-        // Thumb format 8 STRH Rd, [Rb, Ro] reg-offset: 0101_HS_1_...
-        // 0x5200 = STRH R0, [R0, R0]. Not yet supported by the
-        // dynarec (format 8 sign-extended/halfword reg-offset
-        // unimplemented).
-        cache.record_instr(thumb(0x5200, stub_thumb_handler));
+        // Thumb format 17 SWI: `1101_1111_imm8`. 0xDF00 = SWI 0.
+        // Not yet supported — raises an exception, needs CPU
+        // exception-dispatch integration.
+        cache.record_instr(thumb(0xDF00, stub_thumb_handler));
         cache.finish_record();
 
         let block = cache.get(key).expect("block in cache");
