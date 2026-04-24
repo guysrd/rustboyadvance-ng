@@ -2217,6 +2217,22 @@ impl DynarecCompiler {
             F13(DecodedThumb13),
             F14(DecodedThumb14),
             F15(DecodedThumb15),
+            /// Thumb format 16 Bcc in a non-tail body position. Scalar
+            /// records this when the cond was NOT taken at record-time
+            /// and the block continued. On replay the cond may take,
+            /// so the compiled body emits a cond check and returns
+            /// (with pc_out = target, took = 1) when it does; falls
+            /// through to the next iter when it doesn't. Per-iter
+            /// fetch accounting handles the early-exit cleanly
+            /// (no pre-paid fetches to refund).
+            CondBranch(DecodedThumbPcBranch),
+            /// Thumb format 18 unconditional B in a non-tail body
+            /// position. Always taken — exits the block with pc_out
+            /// set + took = 1. Scalar normally terminates recording
+            /// at an unconditional B; this body variant catches the
+            /// rare recordings that continued past (e.g. recording
+            /// aborted mid-iter earlier, then re-run extends).
+            UncondBranch(DecodedThumbPcBranch),
         }
         enum Tail {
             Bx(DecodedThumbBx),
@@ -2255,6 +2271,12 @@ impl DynarecCompiler {
                 Body::F11(d) => !d.load,
                 // F15 LDM: AdvancePC(NonSeq). STM: AdvancePC(NonSeq). Always NonSeq.
                 Body::F15(_) => true,
+                // CondBranch not-taken: AdvancePC(Seq). Taken: early
+                // exit (no advance — caller reloads pipeline).
+                Body::CondBranch(_) => false,
+                // UncondBranch: always taken (no fall-through).
+                // Legacy path unused; per-iter exits inline.
+                Body::UncondBranch(_) => false,
                 // F14 PUSH and POP BOTH return AdvancePC(NonSeq) in
                 // scalar (exec_thumb_push_pop initializes `result =
                 // CpuAction::AdvancePC(NonSeq)` before the direction
@@ -2302,6 +2324,13 @@ impl DynarecCompiler {
                 Some(Body::F4(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format5_non_branch(op) {
                 Some(Body::F5(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format16(op) {
+                // Bcc in body — conditional branch that may take at
+                // replay time. Handled via early-exit emit below.
+                Some(Body::CondBranch(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format18(op) {
+                // Unconditional B in body — always taken.
+                Some(Body::UncondBranch(d))
             } else {
                 None
             }
@@ -2358,10 +2387,13 @@ impl DynarecCompiler {
         };
         let mut body: Vec<Body> = Vec::with_capacity(body_opcodes.len());
         for &op in body_opcodes {
-            // Terminators not allowed in body.
+            // Unsupported terminators in body: BX, POP{PC}, F19 BL
+            // halves (orphaned). Bcc (format 16) + unconditional B
+            // (format 18) are ALLOWED — classify_body picks them as
+            // Body::CondBranch / Body::UncondBranch and emit_body's
+            // special-case in the per-iter loop handles the early-
+            // exit semantics.
             if Self::decode_thumb_bx(op).is_some()
-                || Self::decode_thumb_format16(op).is_some()
-                || Self::decode_thumb_format18(op).is_some()
                 || Self::decode_thumb_pop_pc(op).is_some()
                 || Self::decode_thumb_format19_hi(op).is_some()
                 || Self::decode_thumb_format19_lo(op).is_some()
@@ -2498,6 +2530,8 @@ impl DynarecCompiler {
                     },
                     // Memory ops don't write flags.
                     Body::F6(_) | Body::F7(_) | Body::F8(_) | Body::F9(_) | Body::F10(_) | Body::F11(_) | Body::F12(_) | Body::F13(_) | Body::F14(_) | Body::F15(_) => 0,
+                    // Branches in body don't write NZCV.
+                    Body::CondBranch(_) | Body::UncondBranch(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2530,15 +2564,27 @@ impl DynarecCompiler {
                     Tail::PcBranch(br) => br.cond != ArmCond::Al,
                     _ => false,
                 };
+                // A body item reads flags if it's a non-AL conditional
+                // branch (Bcc) — keeps the prev writer's result live.
+                fn body_reads_flags(item: &Body) -> bool {
+                    match item {
+                        Body::CondBranch(br) => br.cond != ArmCond::Al,
+                        _ => false,
+                    }
+                }
                 for k in 0..body_len {
                     let cur = flag_write_mask_body(&body[k]);
                     if cur == 0 {
                         continue; // mem op; nothing to skip
                     }
                     let next = if k + 1 < body_len {
-                        flag_write_mask_body(&body[k + 1])
+                        if body_reads_flags(&body[k + 1]) {
+                            0 // live — next item reads NZCV
+                        } else {
+                            flag_write_mask_body(&body[k + 1])
+                        }
                     } else if tail_reads_flags {
-                        0 // live — Bcc will read them
+                        0 // live — Bcc tail will read them
                     } else {
                         tail_mask
                     };
@@ -2605,6 +2651,15 @@ impl DynarecCompiler {
                         load_32_seq_ref, store_32_seq_ref,
                         idle_cycle_ref, *d,
                     ),
+                    // CondBranch + UncondBranch have their own
+                    // control-flow needs (early exit with pc_out +
+                    // took=1). They're handled specially in the body
+                    // loop (see below) and emit_body is never called
+                    // with them — include here as unreachable to
+                    // make the match exhaustive.
+                    Body::CondBranch(_) | Body::UncondBranch(_) => {
+                        unreachable!("branch-in-body handled in loop, not emit_body");
+                    }
                 }
             };
 
@@ -2644,6 +2699,16 @@ impl DynarecCompiler {
                     Body::F11(d) => if !d.load { 0 } else { 1 },
                     Body::F14(_) => 0, // PUSH + POP both NonSeq
                     Body::F15(_) => 0, // LDM + STM both NonSeq
+                    // CondBranch not-taken: AdvancePC(Seq). Taken is
+                    // early exit — fetch is for "what would've been
+                    // the next iter" and the compiled block is done.
+                    // Advance on fall-through is Seq.
+                    Body::CondBranch(_) => 1,
+                    // UncondBranch always taken — never falls through,
+                    // so advance-on-fall-through is unreachable. Value
+                    // here is unused but has to be something; use 1
+                    // (Seq) matching scalar's generic default.
+                    Body::UncondBranch(_) => 1,
                     // F1-F5 ALU, F12 load-address, F13 ADD SP: all Seq.
                     _ => 1,
                 }
@@ -2705,6 +2770,74 @@ impl DynarecCompiler {
                     // iter >= 1 uses compile-time body[k-1].AdvancePC.
                     let prev_hint = if k == 0 { 2 } else { advance_hint(&body[k - 1]) };
                     emit_fetch_iter(&mut builder, k, prev_hint);
+                }
+
+                // Branch-in-body: early-exit emit instead of emit_body.
+                // Scalar's handler for Bcc (cond-true) and uncond B is
+                // PipelineFlushed — same as branch tails. Per-iter's
+                // per-instruction fetch already charged this iter's
+                // fetch cycle; taken branch sets pc_out + flushes
+                // cpsr_var + returns 1 (caller reloads pipeline).
+                // Not-taken Bcc falls through to the next iter (scalar
+                // returns AdvancePC(Seq); cpu.next_fetch_access update
+                // happens inline below).
+                match item {
+                    Body::CondBranch(br) => {
+                        let target = instr_pc
+                            .wrapping_add(4)
+                            .wrapping_add((br.offset_signed << 1) as u32)
+                            | 1;
+                        let cond_pass = emit_cond_check(&mut builder, cpsr_var, br.cond);
+                        let taken_blk = builder.create_block();
+                        let fallthrough_blk = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(cond_pass, taken_blk, &[], fallthrough_blk, &[]);
+
+                        builder.switch_to_block(taken_blk);
+                        builder.seal_block(taken_blk);
+                        let t_val = builder.ins().iconst(types::I32, target as i64);
+                        builder.ins().store(MemFlags::trusted(), t_val, pc_out, 0);
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), cpsr_cur, cpsr_ptr, 0);
+                        let one = builder.ins().iconst(types::I32, 1);
+                        builder.ins().return_(&[one]);
+
+                        builder.switch_to_block(fallthrough_blk);
+                        builder.seal_block(fallthrough_blk);
+                        // Cond-false path: scalar's AdvancePC(Seq) —
+                        // keep cpu.next_fetch_access in sync.
+                        if per_iter_fetch {
+                            emit_set_access(&mut builder, 1);
+                        }
+                        continue;
+                    }
+                    Body::UncondBranch(br) => {
+                        let target = instr_pc
+                            .wrapping_add(4)
+                            .wrapping_add((br.offset_signed << 1) as u32)
+                            | 1;
+                        let t_val = builder.ins().iconst(types::I32, target as i64);
+                        builder.ins().store(MemFlags::trusted(), t_val, pc_out, 0);
+                        let cpsr_cur = builder.use_var(cpsr_var);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), cpsr_cur, cpsr_ptr, 0);
+                        let one = builder.ins().iconst(types::I32, 1);
+                        builder.ins().return_(&[one]);
+                        // Unreachable fall-through; no more code needed
+                        // for this block — any remaining body items
+                        // after an unconditional branch are dead code.
+                        // Still need a block to switch to so the IR
+                        // builder state is valid for subsequent iters.
+                        let dead_blk = builder.create_block();
+                        builder.switch_to_block(dead_blk);
+                        builder.seal_block(dead_blk);
+                        continue;
+                    }
+                    _ => {}
                 }
 
                 emit_body(&mut builder, item, skip_flags[k], instr_pc);
