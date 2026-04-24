@@ -136,6 +136,19 @@ pub mod trampolines {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.store_32(addr, value, MemoryAccess::NonSeq);
     }
+    /// Sequential-access variants of load_32 / store_32 for the
+    /// 2nd+ slot of a multi-load/store (PUSH/POP, LDM/STM). Scalar
+    /// pays 1 NonSeq cycle for the first access and 1 Seq for each
+    /// subsequent — mirroring that here avoids cycle-accounting
+    /// drift that accumulates over many multi-access ops.
+    pub unsafe extern "C" fn load_32_seq<I: MemoryInterface>(ctx: *mut u8, addr: u32) -> u32 {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.load_32(addr, MemoryAccess::Seq)
+    }
+    pub unsafe extern "C" fn store_32_seq<I: MemoryInterface>(ctx: *mut u8, addr: u32, value: u32) {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.store_32(addr, value, MemoryAccess::Seq);
+    }
     pub unsafe extern "C" fn load_8<I: MemoryInterface>(ctx: *mut u8, addr: u32) -> u32 {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.load_8(addr, MemoryAccess::NonSeq) as u32
@@ -338,6 +351,8 @@ pub mod trampolines {
             store_32: store_32::<I>,
             load_8: load_8::<I>,
             store_8: store_8::<I>,
+            load_32_seq: load_32_seq::<I>,
+            store_32_seq: store_32_seq::<I>,
             load_with_idle_32: load_with_idle_32::<I>,
             load_with_idle_8: load_with_idle_8::<I>,
             set_next_fetch_nonseq: set_next_fetch_nonseq::<I>,
@@ -359,6 +374,11 @@ pub struct BusTrampolines {
     pub store_32: BusStore32Fn,
     pub load_8: BusLoad8Fn,
     pub store_8: BusStore8Fn,
+    /// Sequential-access load/store for the 2nd+ access in a
+    /// multi-access op (PUSH/POP/LDM/STM). Same signature as the
+    /// NonSeq variants; internal trampoline switches access mode.
+    pub load_32_seq: BusLoad32Fn,
+    pub store_32_seq: BusStore32Fn,
     /// Data-load with implicit +1I idle cycle (LDR/LDRH/LDRB family).
     pub load_with_idle_32: BusLoadIdle32Fn,
     pub load_with_idle_8: BusLoadIdle8Fn,
@@ -406,6 +426,8 @@ struct BusImports {
     #[allow(dead_code)]
     load_8: FuncId,
     store_8: FuncId,
+    load_32_seq: FuncId,
+    store_32_seq: FuncId,
     load_with_idle_32: FuncId,
     load_with_idle_8: FuncId,
     set_next_fetch_nonseq: FuncId,
@@ -454,6 +476,8 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_bus_store_32",           b.store_32             as *const u8);
             jit_builder.symbol("rba_bus_load_8",             b.load_8               as *const u8);
             jit_builder.symbol("rba_bus_store_8",            b.store_8              as *const u8);
+            jit_builder.symbol("rba_bus_load_32_seq",        b.load_32_seq          as *const u8);
+            jit_builder.symbol("rba_bus_store_32_seq",       b.store_32_seq         as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_32",  b.load_with_idle_32    as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_8",   b.load_with_idle_8     as *const u8);
             jit_builder.symbol("rba_set_next_fetch_nonseq",  b.set_next_fetch_nonseq as *const u8);
@@ -514,6 +538,15 @@ impl DynarecCompiler {
             let load_with_idle_32 = module
                 .declare_function("rba_bus_load_with_idle_32", Linkage::Import, &sig_load_idle_32)
                 .expect("declare load_with_idle_32 failed");
+
+            // load_32_seq / store_32_seq: same signatures as
+            // load_32 / store_32, just different access type.
+            let load_32_seq = module
+                .declare_function("rba_bus_load_32_seq", Linkage::Import, &sig_load_32)
+                .expect("declare load_32_seq failed");
+            let store_32_seq = module
+                .declare_function("rba_bus_store_32_seq", Linkage::Import, &sig_store_32)
+                .expect("declare store_32_seq failed");
 
             // load_with_idle_8: same signature as load_8; charges +1I post-load.
             let mut sig_load_idle_8 = module.make_signature();
@@ -582,6 +615,8 @@ impl DynarecCompiler {
                 store_32,
                 load_8,
                 store_8,
+                load_32_seq,
+                store_32_seq,
                 load_with_idle_32,
                 load_with_idle_8,
                 set_next_fetch_nonseq,
@@ -1431,6 +1466,10 @@ impl DynarecCompiler {
                 self.module.declare_func_in_func(imports.store_32, builder.func);
             let store_8_ref =
                 self.module.declare_func_in_func(imports.store_8, builder.func);
+            let load_32_seq_ref =
+                self.module.declare_func_in_func(imports.load_32_seq, builder.func);
+            let store_32_seq_ref =
+                self.module.declare_func_in_func(imports.store_32_seq, builder.func);
             let idle_cycle_ref =
                 self.module.declare_func_in_func(imports.idle_cycle, builder.func);
 
@@ -1453,8 +1492,9 @@ impl DynarecCompiler {
                     ),
                     MemItem::F14(d) => emit_thumb_format14(
                         &mut builder, gpr_ptr, cpu_ctx,
-                        load_32_ref, store_32_ref, idle_cycle_ref,
-                        *d,
+                        load_32_ref, store_32_ref,
+                        load_32_seq_ref, store_32_seq_ref,
+                        idle_cycle_ref, *d,
                     ),
                 }
             }
@@ -1869,7 +1909,15 @@ impl DynarecCompiler {
             match item {
                 Body::F9(d) => !d.load,
                 Body::F11(d) => !d.load,
-                Body::F14(d) => d.push,
+                // F14 PUSH and POP BOTH return AdvancePC(NonSeq) in
+                // scalar (exec_thumb_push_pop initializes `result =
+                // CpuAction::AdvancePC(NonSeq)` before the direction
+                // branches, and only POP{PC} overrides with
+                // PipelineFlushed). The previous `d.push` gate missed
+                // the POP case, undercounting the post-block fetch
+                // cycles on blocks ending with POP — one of several
+                // drifts surfaced by the a7fb782 BX+POP lift.
+                Body::F14(_) => true,
                 _ => false,
             }
         }
@@ -1977,6 +2025,15 @@ impl DynarecCompiler {
                 self.module.declare_func_in_func(imports.store_32, builder.func);
             let store_8_ref =
                 self.module.declare_func_in_func(imports.store_8, builder.func);
+            // Sequential-access variants for 2nd+ slot of PUSH/POP.
+            // Scalar pays 1N + (N-1)S cycles over the whole multi-
+            // access; using all-NonSeq compiled-side caused per-POP
+            // drift that accumulated into hash divergence on real
+            // SDL (measured 2026-04-24).
+            let load_32_seq_ref =
+                self.module.declare_func_in_func(imports.load_32_seq, builder.func);
+            let store_32_seq_ref =
+                self.module.declare_func_in_func(imports.store_32_seq, builder.func);
             let fetch_n_ref =
                 self.module.declare_func_in_func(imports.thumb_fetch_n, builder.func);
             // pay_extra_nonseq: charges (n - s) cycles for the next fetch
@@ -2106,7 +2163,9 @@ impl DynarecCompiler {
                     ),
                     Body::F14(d) => emit_thumb_format14(
                         builder, gpr_ptr, cpu_ctx,
-                        load_32_ref, store_32_ref, idle_cycle_ref, *d,
+                        load_32_ref, store_32_ref,
+                        load_32_seq_ref, store_32_seq_ref,
+                        idle_cycle_ref, *d,
                     ),
                 }
             };
@@ -2350,20 +2409,28 @@ impl DynarecCompiler {
                     let sp = builder.ins().load(
                         types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(13 * 4),
                     );
+                    // Scalar POP{PC}: 1 NonSeq access for the FIRST
+                    // load (lowest register or PC if rlist empty),
+                    // Seq for every access after. Mirror that split
+                    // so cycle accounting is drift-free.
                     let mut byte_offset: i64 = 0;
+                    let mut access_count = 0u32;
                     for i in 0..8 {
                         if dec.reg_list & (1 << i) != 0 {
                             let addr = builder.ins().iadd_imm(sp, byte_offset);
-                            let call = builder.ins().call(load_32_ref, &[cpu_ctx, addr]);
+                            let ref_fn = if access_count == 0 { load_32_ref } else { load_32_seq_ref };
+                            let call = builder.ins().call(ref_fn, &[cpu_ctx, addr]);
                             let v = builder.inst_results(call)[0];
                             builder.ins().store(
                                 MemFlags::trusted(), v, gpr_ptr, Offset32::new(i * 4),
                             );
                             byte_offset += 4;
+                            access_count += 1;
                         }
                     }
                     let pc_addr = builder.ins().iadd_imm(sp, byte_offset);
-                    let pc_call = builder.ins().call(load_32_ref, &[cpu_ctx, pc_addr]);
+                    let pc_ref_fn = if access_count == 0 { load_32_ref } else { load_32_seq_ref };
+                    let pc_call = builder.ins().call(pc_ref_fn, &[cpu_ctx, pc_addr]);
                     let pc_val = builder.inst_results(pc_call)[0];
                     // Scalar Thumb POP{PC} stays in Thumb regardless of
                     // the popped value's bit 0 (exec_thumb_push_pop only
@@ -3296,6 +3363,8 @@ fn emit_thumb_format14(
     cpu_ctx: Value,
     load_32_ref: cranelift::codegen::ir::FuncRef,
     store_32_ref: cranelift::codegen::ir::FuncRef,
+    load_32_seq_ref: cranelift::codegen::ir::FuncRef,
+    store_32_seq_ref: cranelift::codegen::ir::FuncRef,
     idle_cycle_ref: cranelift::codegen::ir::FuncRef,
     dec: DecodedThumb14,
 ) {
@@ -3314,8 +3383,11 @@ fn emit_thumb_format14(
         sp
     };
 
-    // Walk the register list low-to-high.
+    // Walk the register list low-to-high.  First access is NonSeq,
+    // all following accesses are Seq — mirrors scalar PUSH/POP
+    // cycle accounting (first load_32 NonSeq, rest Seq).
     let mut byte_offset = 0i64;
+    let mut access_count = 0u32;
     for i in 0..8 {
         if dec.reg_list & (1 << i) != 0 {
             let addr = builder.ins().iadd_imm(start_addr, byte_offset);
@@ -3323,15 +3395,18 @@ fn emit_thumb_format14(
                 let v = builder.ins().load(
                     types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(i * 4),
                 );
-                builder.ins().call(store_32_ref, &[cpu_ctx, addr, v]);
+                let ref_fn = if access_count == 0 { store_32_ref } else { store_32_seq_ref };
+                builder.ins().call(ref_fn, &[cpu_ctx, addr, v]);
             } else {
-                let call = builder.ins().call(load_32_ref, &[cpu_ctx, addr]);
+                let ref_fn = if access_count == 0 { load_32_ref } else { load_32_seq_ref };
+                let call = builder.ins().call(ref_fn, &[cpu_ctx, addr]);
                 let v = builder.inst_results(call)[0];
                 builder.ins().store(
                     MemFlags::trusted(), v, gpr_ptr, Offset32::new(i * 4),
                 );
             }
             byte_offset += 4;
+            access_count += 1;
         }
     }
     // LR bit for PUSH (extra_reg = LR = R14). POP with PC bit was rejected
@@ -3341,7 +3416,8 @@ fn emit_thumb_format14(
         let lr = builder.ins().load(
             types::I32, MemFlags::trusted(), gpr_ptr, Offset32::new(14 * 4),
         );
-        builder.ins().call(store_32_ref, &[cpu_ctx, addr, lr]);
+        let ref_fn = if access_count == 0 { store_32_ref } else { store_32_seq_ref };
+        builder.ins().call(ref_fn, &[cpu_ctx, addr, lr]);
         // byte_offset += 4; (unused after this, kept for readability)
     }
 
@@ -4839,6 +4915,8 @@ mod tests {
             thumb_fetch_n: test_thumb_fetch_n,
             chain_abort_check: test_chain_abort_check,
             abort_mid_block: test_abort_mid_block,
+            load_32_seq: test_load_32,
+            store_32_seq: test_store_32,
         }
     }
 
