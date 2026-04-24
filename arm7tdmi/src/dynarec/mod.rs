@@ -1630,6 +1630,20 @@ impl DynarecCompiler {
         Some(DecodedThumb6 { rd, imm8 })
     }
 
+    /// Thumb format 13: ADD/SUB SP, #imm7 << 2. Register-only ALU
+    /// op, no memory, no flag write. Encoding: `1011_0000_S_imm7`.
+    fn decode_thumb_format13(op: u16) -> Option<DecodedThumb13> {
+        if (op & 0xFF00) != 0xB000 {
+            return None;
+        }
+        let sub = (op >> 7) & 1 != 0;
+        let imm7 = (op & 0x7F) as u32;
+        Some(DecodedThumb13 {
+            sub,
+            offset: imm7 * 4,
+        })
+    }
+
     /// Thumb variant of `try_compile_block_with_branch`: compiles a block
     /// whose body is supported Thumb shapes plus an optional trailing BX Rs.
     /// BX is a block terminator that writes the target pc (preserving bit 0
@@ -1888,6 +1902,7 @@ impl DynarecCompiler {
             F6(DecodedThumb6),
             F9(DecodedThumb9),
             F11(DecodedThumb11),
+            F13(DecodedThumb13),
             F14(DecodedThumb14),
         }
         enum Tail {
@@ -1923,8 +1938,13 @@ impl DynarecCompiler {
         }
 
         fn classify_body(op: u16) -> Option<Body> {
+            // F13 must come BEFORE F14 because both have top4==0b1011
+            // but F13 uses middle=0b0000 while F14 uses middle=0b010x
+            // / 0b110x. Try F14 first to narrow then F13.
             if let Some(d) = DynarecCompiler::decode_thumb_format14_non_pc(op) {
                 Some(Body::F14(d))
+            } else if let Some(d) = DynarecCompiler::decode_thumb_format13(op) {
+                Some(Body::F13(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format11(op) {
                 Some(Body::F11(d))
             } else if let Some(d) = DynarecCompiler::decode_thumb_format9(op) {
@@ -2082,7 +2102,7 @@ impl DynarecCompiler {
                         _ => 0, // MOV/ADD high-reg don't write flags
                     },
                     // Memory ops don't write flags.
-                    Body::F6(_) | Body::F9(_) | Body::F11(_) | Body::F14(_) => 0,
+                    Body::F6(_) | Body::F9(_) | Body::F11(_) | Body::F13(_) | Body::F14(_) => 0,
                 }
             }
             // Dead-flag-write pass. Thumb data-proc instrs always
@@ -2161,6 +2181,7 @@ impl DynarecCompiler {
                         builder, gpr_ptr, cpu_ctx,
                         load_idle_32_ref, store_32_ref, *d,
                     ),
+                    Body::F13(d) => emit_thumb_format13(builder, gpr_ptr, *d),
                     Body::F14(d) => emit_thumb_format14(
                         builder, gpr_ptr, cpu_ctx,
                         load_32_ref, store_32_ref,
@@ -3161,6 +3182,13 @@ struct DecodedThumb6 {
     imm8: u32,
 }
 
+/// Thumb format 13 ADD/SUB SP, #imm.
+#[derive(Clone, Copy, Debug)]
+struct DecodedThumb13 {
+    sub: bool,
+    offset: u32,
+}
+
 /// Thumb format 9 LDR/STR immediate offset (word or unsigned byte).
 #[derive(Clone, Copy, Debug)]
 struct DecodedThumb9 {
@@ -3558,6 +3586,29 @@ fn emit_thumb_format6(
     builder
         .ins()
         .store(MemFlags::trusted(), v, gpr_ptr, Offset32::new(dec.rd * 4));
+}
+
+/// Thumb format 13 ADD SP, #imm / SUB SP, #imm. Pure SP update.
+fn emit_thumb_format13(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    dec: DecodedThumb13,
+) {
+    let sp = builder.ins().load(
+        types::I32,
+        MemFlags::trusted(),
+        gpr_ptr,
+        Offset32::new(13 * 4),
+    );
+    let delta = dec.offset as i64;
+    let new_sp = if dec.sub {
+        builder.ins().iadd_imm(sp, -delta)
+    } else {
+        builder.ins().iadd_imm(sp, delta)
+    };
+    builder
+        .ins()
+        .store(MemFlags::trusted(), new_sp, gpr_ptr, Offset32::new(13 * 4));
 }
 
 fn emit_thumb_format9(
