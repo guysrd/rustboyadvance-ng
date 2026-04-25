@@ -1800,23 +1800,23 @@ impl DynarecCompiler {
             for (k, item) in items.iter().enumerate() {
                 let skip_fu = skip[k];
                 match item {
-                    ThumbItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
+                    ThumbItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     ThumbItem::F2(d) => {
                         if skip_fu {
-                            emit_thumb_format2_no_flags(&mut builder, gpr_ptr, *d);
+                            emit_thumb_format2_no_flags(&mut builder, gpr_ptr, &mut tmp_cache, *d);
                         } else {
                             emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d);
                         }
                     }
                     ThumbItem::F3(d) => {
                         if skip_fu {
-                            emit_thumb_format3_no_flags(&mut builder, gpr_ptr, *d);
+                            emit_thumb_format3_no_flags(&mut builder, gpr_ptr, &mut tmp_cache, *d);
                         } else {
                             emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d);
                         }
                     }
-                    ThumbItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
-                    ThumbItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
+                    ThumbItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
+                    ThumbItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                 }
             }
 
@@ -1945,11 +1945,11 @@ impl DynarecCompiler {
             let mut tmp_cache = GprCache::new(true);
             for item in &items {
                 match item {
-                    MemItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
+                    MemItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     MemItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     MemItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
-                    MemItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
-                    MemItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
+                    MemItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
+                    MemItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     MemItem::F9(d) => emit_thumb_format9(
                         &mut builder, gpr_ptr, cpu_ctx, cpsr_var,
                         load_idle_32_ref, store_32_ref, load_idle_8_ref, store_8_ref,
@@ -2360,11 +2360,11 @@ impl DynarecCompiler {
             let mut tmp_cache = GprCache::new(true);
             for item in &body {
                 match item {
-                    BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
+                    BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
-                    BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
-                    BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
+                    BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
+                    BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                 }
             }
 
@@ -2411,11 +2411,11 @@ impl DynarecCompiler {
                 builder.seal_block(not_taken);
             } else if let Some(item) = tail_body {
                 match item {
-                    BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, d),
+                    BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
                     BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
                     BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
-                    BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, d),
-                    BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, d),
+                    BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
+                    BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
                 }
             }
 
@@ -2925,23 +2925,23 @@ impl DynarecCompiler {
                 instr_pc: u32,
             | {
                 match item {
-                    Body::F1(d) => emit_thumb_format1(builder, gpr_ptr, cpsr_var, *d),
+                    Body::F1(d) => emit_thumb_format1(builder, gpr_ptr, gpr_cache, cpsr_var, *d),
                     Body::F2(d) => {
                         if skip_flag_write {
-                            emit_thumb_format2_no_flags(builder, gpr_ptr, *d);
+                            emit_thumb_format2_no_flags(builder, gpr_ptr, gpr_cache, *d);
                         } else {
                             emit_thumb_format2(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
                         }
                     }
                     Body::F3(d) => {
                         if skip_flag_write {
-                            emit_thumb_format3_no_flags(builder, gpr_ptr, *d);
+                            emit_thumb_format3_no_flags(builder, gpr_ptr, gpr_cache, *d);
                         } else {
                             emit_thumb_format3(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
                         }
                     }
-                    Body::F4(d) => emit_thumb_format4_logical(builder, gpr_ptr, cpsr_var, *d),
-                    Body::F5(d) => emit_thumb_format5_non_branch(builder, gpr_ptr, cpsr_var, *d),
+                    Body::F4(d) => emit_thumb_format4_logical(builder, gpr_ptr, gpr_cache, cpsr_var, *d),
+                    Body::F5(d) => emit_thumb_format5_non_branch(builder, gpr_ptr, gpr_cache, cpsr_var, *d),
                     Body::F6(d) => emit_thumb_format6(
                         builder, gpr_ptr, cpu_ctx, load_idle_32_ref, *d, instr_pc,
                     ),
@@ -3172,6 +3172,7 @@ impl DynarecCompiler {
 
                         builder.switch_to_block(do_abort_blk);
                         builder.seal_block(do_abort_blk);
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder
                             .ins()
@@ -3216,6 +3217,7 @@ impl DynarecCompiler {
                         builder.seal_block(taken_blk);
                         let t_val = builder.ins().iconst(types::I32, target as i64);
                         builder.ins().store(MemFlags::trusted(), t_val, pc_out, 0);
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder
                             .ins()
@@ -3239,6 +3241,7 @@ impl DynarecCompiler {
                             | 1;
                         let t_val = builder.ins().iconst(types::I32, target as i64);
                         builder.ins().store(MemFlags::trusted(), t_val, pc_out, 0);
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder
                             .ins()
@@ -3297,6 +3300,7 @@ impl DynarecCompiler {
                         builder
                             .ins()
                             .call(abort_mid_ref, &[cpu_ctx, pc_val, p0, p1]);
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder
                             .ins()
@@ -3332,6 +3336,7 @@ impl DynarecCompiler {
 
                     builder.switch_to_block(do_abort_blk);
                     builder.seal_block(do_abort_blk);
+                    gpr_cache.flush(&mut builder, gpr_ptr);
                     let cpsr_cur = builder.use_var(cpsr_var);
                     builder
                         .ins()
@@ -3392,6 +3397,7 @@ impl DynarecCompiler {
 
                         builder.switch_to_block(do_abort_blk);
                         builder.seal_block(do_abort_blk);
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder
                             .ins()
@@ -3518,6 +3524,7 @@ impl DynarecCompiler {
                         // Flush our cpsr_var to *cpsr_ptr before
                         // handing off — the tail-called block reads
                         // cpsr fresh from *cpsr_ptr at its own entry.
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder.ins().store(
                             MemFlags::trusted(),
@@ -3627,6 +3634,7 @@ impl DynarecCompiler {
                         );
                         builder.switch_to_block(chain_call_blk);
                         builder.seal_block(chain_call_blk);
+                        gpr_cache.flush(&mut builder, gpr_ptr);
                         let cpsr_cur = builder.use_var(cpsr_var);
                         builder.ins().store(
                             MemFlags::trusted(),
@@ -3760,6 +3768,9 @@ impl DynarecCompiler {
                 }
             }
 
+            // Flush gpr cache to memory before returning. cpsr is
+            // similarly flushed via cpsr_final.
+            gpr_cache.flush(&mut builder, gpr_ptr);
             let cpsr_final = builder.use_var(cpsr_var);
             builder.ins().store(MemFlags::trusted(), cpsr_final, cpsr_ptr, 0);
             let ret = builder.use_var(took_var);
@@ -5504,41 +5515,22 @@ fn emit_thumb_format9(
 fn emit_thumb_format5_non_branch(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     cpsr_var: Variable,
     dec: DecodedThumb5,
 ) {
-    let rd_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rd * 4),
-    );
-    let rs_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rs * 4),
-    );
+    let rd_val = gpr_cache.read(builder, gpr_ptr, dec.rd as usize);
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
 
     match dec.op {
         Thumb5Op::Mov => {
             // Rd = Rs, no flag update.
-            builder.ins().store(
-                MemFlags::trusted(),
-                rs_val,
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            gpr_cache.write(builder, gpr_ptr, dec.rd as usize, rs_val);
         }
         Thumb5Op::Add => {
             // Rd = Rd + Rs, no flag update.
             let result = builder.ins().iadd(rd_val, rs_val);
-            builder.ins().store(
-                MemFlags::trusted(),
-                result,
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
         }
         Thumb5Op::Cmp => {
             // flags from Rd - Rs, no writeback. Reuse the ARM DP S bit
@@ -5564,15 +5556,11 @@ fn emit_thumb_format5_non_branch(
 fn emit_thumb_format1(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     cpsr_var: Variable,
     dec: DecodedThumb1,
 ) {
-    let rs_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rs * 4),
-    );
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
 
     // Precompute result and shifter-out C bit at codegen time by folding
     // the constant imm5 into specific instruction sequences. This avoids
@@ -5626,12 +5614,7 @@ fn emit_thumb_format1(
         }
     };
 
-    builder.ins().store(
-        MemFlags::trusted(),
-        result,
-        gpr_ptr,
-        Offset32::new(dec.rd * 4),
-    );
+    gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
 
     // N, Z from result. C is new_c. V preserved.
     let zero = builder.ins().iconst(types::I32, 0);
@@ -5665,21 +5648,12 @@ fn emit_thumb_format1(
 fn emit_thumb_format4_logical(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     cpsr_var: Variable,
     dec: DecodedThumb4,
 ) {
-    let rd_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rd * 4),
-    );
-    let rs_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rs * 4),
-    );
+    let rd_val = gpr_cache.read(builder, gpr_ptr, dec.rd as usize);
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
 
     let (result, dp_equivalent, writeback) = match dec.op {
         Thumb4Op::And => (builder.ins().band(rd_val, rs_val), DpOp::Tst, true),
@@ -5716,12 +5690,7 @@ fn emit_thumb_format4_logical(
     };
 
     if writeback {
-        builder.ins().store(
-            MemFlags::trusted(),
-            result,
-            gpr_ptr,
-            Offset32::new(dec.rd * 4),
-        );
+        gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
     }
 
     // For NEG, rn for flag computation is 0 (not rd_val). Everything
@@ -5809,34 +5778,20 @@ fn emit_thumb_format2(
 fn emit_thumb_format2_no_flags(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     dec: DecodedThumb2,
 ) {
-    let rs_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rs * 4),
-    );
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
     let rhs = match dec.operand {
         Thumb2Operand::Imm3(v) => builder.ins().iconst(types::I32, v as i64),
-        Thumb2Operand::Reg(rn) => builder.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            gpr_ptr,
-            Offset32::new(rn * 4),
-        ),
+        Thumb2Operand::Reg(rn) => gpr_cache.read(builder, gpr_ptr, rn as usize),
     };
     let result = if dec.sub {
         builder.ins().isub(rs_val, rhs)
     } else {
         builder.ins().iadd(rs_val, rhs)
     };
-    builder.ins().store(
-        MemFlags::trusted(),
-        result,
-        gpr_ptr,
-        Offset32::new(dec.rd * 4),
-    );
+    gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
 }
 
 /// Emit a Thumb format 3 instruction with the flag update SKIPPED.
@@ -5847,17 +5802,13 @@ fn emit_thumb_format2_no_flags(
 fn emit_thumb_format3_no_flags(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     dec: DecodedThumb3,
 ) {
     let imm8 = builder.ins().iconst(types::I32, dec.imm8 as i64);
     match dec.op {
         Thumb3Op::Mov => {
-            builder.ins().store(
-                MemFlags::trusted(),
-                imm8,
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            gpr_cache.write(builder, gpr_ptr, dec.rd as usize, imm8);
         }
         Thumb3Op::Cmp => {
             // Compare-only with no flag write is a true no-op; do
@@ -5866,34 +5817,14 @@ fn emit_thumb_format3_no_flags(
             // overwrites NZCV — effectively CMP vanishes.
         }
         Thumb3Op::Add => {
-            let rd_val = builder.ins().load(
-                types::I32,
-                MemFlags::trusted(),
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            let rd_val = gpr_cache.read(builder, gpr_ptr, dec.rd as usize);
             let result = builder.ins().iadd(rd_val, imm8);
-            builder.ins().store(
-                MemFlags::trusted(),
-                result,
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
         }
         Thumb3Op::Sub => {
-            let rd_val = builder.ins().load(
-                types::I32,
-                MemFlags::trusted(),
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            let rd_val = gpr_cache.read(builder, gpr_ptr, dec.rd as usize);
             let result = builder.ins().isub(rd_val, imm8);
-            builder.ins().store(
-                MemFlags::trusted(),
-                result,
-                gpr_ptr,
-                Offset32::new(dec.rd * 4),
-            );
+            gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
         }
     }
 }
