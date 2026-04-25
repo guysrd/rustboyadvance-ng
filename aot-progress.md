@@ -35,6 +35,23 @@ SLOWER than the phase-1 per-instr trampoline path (490 vs 501 at
 4KB). The trampoline's Rust-inlined F3 fast path is faster than
 equivalent IR ops + 1 fetch_only extern call.
 
+**Performance reasoning for the regression:**
+- The fetch_only extern is OPAQUE to LLVM. The optimizer can't see
+  across it to combine IR ops with the rest of the block.
+- The Rust trampoline has the entire dispatch + fast-path body in
+  one Rust fn that the Rust compiler can fully optimize.
+- LLVM's per-block module-level inlining can't see into Rust externs.
+
+**To actually beat scalar, we need:**
+1. ELIMINATE the per-iter extern call entirely. That means inlining
+   cycle accounting via direct scheduler.timestamp += K stores.
+2. Skip per-iter pipeline shifts; restore at block exit via 2 const
+   stores (halfwords at known ROM addresses, baked at AOT time).
+3. Inline ALL hot formats so no opcode falls through to extern.
+
+That's the real phase 4. ~3-5 days work. The infrastructure
+(CpuOffsets, fetch_only extern) is in place from step 1.
+
 Lesson: inline IR is only a win when the equivalent Rust fast path
 has high overhead. F3 MOV imm8's Rust path is already 4 ops
 (`gpr[rd] = imm; cpsr.set_N(false); cpsr.set_Z(imm==0); pc += 2`).
