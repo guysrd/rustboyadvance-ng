@@ -375,6 +375,160 @@ impl LlvmCompiler {
         Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
     }
 
+    /// Emit a Thumb F11 LDR/STR SP-relative (`LDR/STR Rd, [SP, #imm8*4]`).
+    /// Same shape as F9 but rb is implicit (always R13/SP) and offset
+    /// is imm8*4 (always word-sized).
+    pub fn compile_thumb_format11(
+        &mut self,
+        rd: u8,
+        imm8: u8,
+        load: bool,
+    ) -> Result<CompiledFn, String> {
+        // SP is always R13. F11 is always word-sized (no byte variant).
+        self.compile_thumb_format9(rd, /*rb=SP*/ 13, (imm8 as u32) * 4, load, false)
+    }
+
+    /// Emit a Thumb F12 load-address (`ADD Rd, PC, #imm8*4` or
+    /// `ADD Rd, SP, #imm8*4` based on `from_sp`). Pure ALU — no
+    /// memory access. Used for getting address of literals or
+    /// stack-allocated values.
+    pub fn compile_thumb_format12(
+        &mut self,
+        rd: u8,
+        imm8: u8,
+        instr_pc: u32,
+        from_sp: bool,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+
+        let result = if from_sp {
+            // ADD Rd, SP, #imm8*4: gpr[13] + imm8*4
+            let sp_idx = i32_t.const_int(13, false);
+            let sp_addr = unsafe {
+                builder
+                    .build_in_bounds_gep(i32_t, gpr_ptr, &[sp_idx], "sp_addr")
+                    .map_err(|e| format!("gep: {}", e))?
+            };
+            let sp_val = builder
+                .build_load(i32_t, sp_addr, "sp_val")
+                .map_err(|e| format!("load: {}", e))?
+                .into_int_value();
+            let off = i32_t.const_int((imm8 as u64) * 4, false);
+            builder
+                .build_int_add(sp_val, off, "result")
+                .map_err(|e| format!("iadd: {}", e))?
+        } else {
+            // ADD Rd, PC, #imm8*4: pc-folded constant.
+            // Thumb pipeline: PC = instr_pc + 4 during decode, & ~3 alignment.
+            let addr = ((instr_pc.wrapping_add(4)) & !3u32).wrapping_add((imm8 as u32) * 4);
+            i32_t.const_int(addr as u64, false)
+        };
+
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        builder
+            .build_store(rd_addr, result)
+            .map_err(|e| format!("store: {}", e))?;
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F13 ADD/SUB SP-imm (`ADD/SUB SP, #imm7*4`).
+    /// Adjusts the stack pointer by ±imm7*4. No flag updates.
+    pub fn compile_thumb_format13(
+        &mut self,
+        imm7: u8,
+        sub: bool,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+
+        let sp_idx = i32_t.const_int(13, false);
+        let sp_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[sp_idx], "sp_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let sp_val = builder
+            .build_load(i32_t, sp_addr, "sp_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+        let off = i32_t.const_int((imm7 as u64) * 4, false);
+        let result = if sub {
+            builder
+                .build_int_sub(sp_val, off, "sp_new")
+                .map_err(|e| format!("isub: {}", e))?
+        } else {
+            builder
+                .build_int_add(sp_val, off, "sp_new")
+                .map_err(|e| format!("iadd: {}", e))?
+        };
+        builder
+            .build_store(sp_addr, result)
+            .map_err(|e| format!("store: {}", e))?;
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
     /// Emit a Thumb F9 LDR/STR with imm5 offset (`LDR/STR Rd, [Rb, #imm5*4]`
     /// for word, `LDRB/STRB Rd, [Rb, #imm5]` for byte).
     /// addr = gpr[rb] + offset (offset = imm5*4 for word, imm5 for byte).
@@ -1728,6 +1882,88 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F11 LDR SP-rel: thin wrapper over F9 with rb=SP, offset=imm8*4.
+    #[test]
+    fn thumb_f11_ldr_sp_rel() {
+        unsafe extern "C" fn fake_load(_ctx: *mut u8, addr: u32) -> u32 {
+            addr // echo
+        }
+        let mut compiler = LlvmCompiler::new().expect("new");
+        compiler.register_trampolines(LlvmBusTrampolines {
+            load_with_idle_32: Some(fake_load),
+            ..Default::default()
+        });
+        let func = compiler
+            .compile_thumb_format11(2, /*imm8*/ 5, /*load*/ true)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[13] = 0x0300_7E00; // SP
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // addr = 0x0300_7E00 + 5*4 = 0x0300_7E14, echoed.
+        assert_eq!(gpr[2], 0x0300_7E14);
+    }
+
+    /// F12 ADD Rd, PC, #imm8*4: pure ALU, addr-of-PC.
+    #[test]
+    fn thumb_f12_add_pc() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format12(0, /*imm8*/ 4, /*instr_pc*/ 0x0800_0100, /*from_sp*/ false)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // (0x0800_0100 + 4) & ~3 = 0x0800_0104, + 4*4 = 0x0800_0114.
+        assert_eq!(gpr[0], 0x0800_0114);
+    }
+
+    /// F12 ADD Rd, SP, #imm8*4: gpr[rd] = SP + imm8*4.
+    #[test]
+    fn thumb_f12_add_sp() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format12(0, 5, 0, /*from_sp*/ true)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[13] = 0x0300_8000;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // 0x0300_8000 + 20 = 0x0300_8014.
+        assert_eq!(gpr[0], 0x0300_8014);
+    }
+
+    /// F13 SUB SP, #imm7*4: shrinks the stack.
+    #[test]
+    fn thumb_f13_sub_sp() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format13(/*imm7*/ 4, /*sub*/ true)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[13] = 0x0300_8000;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // SP -= 4*4 = 16. 0x0300_8000 - 16 = 0x0300_7FF0.
+        assert_eq!(gpr[13], 0x0300_7FF0);
     }
 
     /// F9 LDR word from a known address. Stub trampoline returns the
