@@ -12,10 +12,20 @@ AOT_USE_PER_INSTR=1, ignore for now). Phase 1b shipped F3 family
 F1 (LSL/LSR/ASR imm5) and F4 (ALU low-reg, all 16 ops including
 MUL).
 
-**Next deliverable:** phase 2 candidates per A7 — F5 high-reg ops,
-F2 ADD/SUB reg+imm3, F12 ADD Rd, PC/SP, #imm. After that, phase 4
-inlines fetch and abort check (saves the per-iter `load_16` +
-indirect call), which is where actual fps gain over scalar starts.
+**Next deliverable:** phase 4 (inline fetch + abort check) is where
+actual fps gain starts. Two paths:
+
+a) Rust-level: a NEW trampoline `aot_thumb_step_no_fetch` that
+   skips `load_16` per iter; a once-per-block `add_cycles_const`
+   call inside the AOT compiled fn pre-emits the Thumb fetch cost.
+   Pipeline[] state is restored at block exit via a final load_16.
+b) LLVM-level: emit_per_instr_thumb_block that bakes the cycle-add
+   directly into IR. Currently has a divs-at-scale bug
+   (AOT_USE_PER_INSTR=1) under investigation per phase 1a.
+
+Plus phase 2 leftovers: F8 (LDSB/LDRH/LDSH reg-offset), F14 PUSH/POP,
+F15 LDM/STM. F16/F18/F19 are block terminators handled by the AOT
+emit, not by aot_thumb_step.
 
 Trampoline F19-orphan divs at trace seeds (24052) is documented in
 `docs/findings-phase1-trampoline-divs.md`; option-c partial-accept
@@ -66,32 +76,48 @@ Hypothesis: LLVM JIT engine's symbol/state management bug at
 scale, OR a calling-convention issue, OR a memory aliasing
 inference issue.
 
-## Phase 1b/1c/2 (rust-inline) — incremental accept
+## Phase 1b/1c/2/5 (rust-inline) — incremental accept
 
 `aot_thumb_step` in arm7tdmi/src/cpu.rs now has Rust-level inline
 fast paths for:
-- F1: LSL/LSR/ASR Rd, Rs, #imm5 (MoveShiftedReg)
-- F2: ADD/SUB Rd, Rs, Rn or #imm3 (AddSub)
-- F3: MOV/CMP/ADD/SUB Rd, #imm8 (DataProcessImm)
-- F4: AND/EOR/LSL/LSR/ASR/ADC/SBC/ROR/TST/NEG/CMP/CMN/ORR/MUL/BIC/MVN
-  (AluOps; all 16 ops, MUL has variable-latency idle_cycle replication)
-- F5: ADD/CMP/MOV/BX hi-reg (Rd=R15 → PipelineFlushed)
-- F12: ADD Rd, [PC|SP], #imm8 (LoadAddress)
-- F13: ADD/SUB SP, #imm7<<2 (AddSp)
+- F1 MoveShiftedReg LSL/LSR/ASR Rd, Rs, #imm5
+- F2 AddSub ADD/SUB Rd, Rs, Rn or #imm3
+- F3 DataProcessImm MOV/CMP/ADD/SUB Rd, #imm8
+- F4 AluOps all 16 ops (incl. MUL with cycle accuracy)
+- F5 HiRegOpOrBranchExchange ADD/CMP/MOV/BX (Rd=R15 → PipelineFlushed)
+- F6 LdrPc (literal pool load)
+- F7 LdrStrRegOffset LDR/STR reg-offset, byte/word
+- F9 LdrStrImmOffset LDR/STR imm5-offset, byte/word
+- F10 LdrStrHalfWord LDRH/STRH imm5*2 offset
+- F11 LdrStrSp LDR/STR sp-relative word
+- F12 LoadAddress ADD Rd, [PC|SP], #imm8
+- F13 AddSp ADD/SUB SP, #imm7<<2
 
-These skip the THUMB_LUT indirect call when the block is dispatched
-through AOT. Each is bit-exact with its scalar handler — same alu
-helpers, same idle_cycle calls, same PipelineFlushed semantics.
+Missing (deferred): F8 (LDSB/LDRH/LDSH reg-offset, 4 sub-cases),
+F14 PUSH/POP, F15 LDM/STM, F16 Bcc tail (terminator), F18 B tail
+(terminator), F19 BL pair (terminator).
+
+Each is bit-exact with its scalar handler — same alu helpers, same
+idle_cycle calls, same PipelineFlushed/AdvancePC semantics, same
+Seq/NonSeq next-fetch-access encoding.
+
+Trace seed pc fix: trace-out wrote pipeline-head pcs (= exec_addr
++ 4 in Thumb / +8 in ARM) but scan interprets entry_pc as exec_addr.
+SDL frontend now subtracts 4/8 before passing seeds to scan. Fixed
+in commit f0e5434.
 
 Empirical:
-- PE 100-seed trace-in: 0 divs, 0.77% coverage.
-- sweep=0: 0 divs both ROMs, score=+3 (noise, gray zone).
+- PE 100-seed trace-in: 0 divs, 0.52% coverage.
+- sweep=0: 0 divs both ROMs, score in [-8, +3] noise band.
 
 Phase 1 full accept (and any meaningful fps gain) blocked by the
 F19-orphan trampoline bug documented in
-docs/findings-phase1-trampoline-divs.md. Coverage stays low until
-that's fixed OR phase 4 inlines fetch into the LLVM IR (which
-sidesteps the per-iter trampoline path entirely).
+docs/findings-phase1-trampoline-divs.md. The trace-pc fix exposed
+~31 divs at 24052 trace seeds (was 32 before fix); the residual
+bug is in trampoline cycle accounting on the F19 lo orphan path,
+not in the inline fast paths. Coverage stays low at sweep=0 until
+that's fixed OR phase 4 inlines fetch into LLVM IR (which sidesteps
+the per-iter trampoline path entirely).
 
 ## Pending
 
@@ -118,6 +144,12 @@ marker.
 
 ## Recent commits on this branch
 
+- 41412f4 phase 5: f7 ldr/str reg-offset + f10 halfword imm-offset inline
+- 422928e phase 5: f9 ldr/str imm-offset + f11 sp-rel inline
+- a529065 phase 5: f6 ldr pc-rel inline (literal pool)
+- f0e5434 fix: trace seed pcs are pipeline-head, subtract 4/8 before scan
+- 015159a phase 2: f2 add/sub, f5 hi-reg, f12 load-addr, f13 add-sp inline
+- 56b3b26 phase 1c: f1 shifts + f4 alu inline
 - a0bd4f2 phase 1b: F3 family expansion + trampoline divs investigation
 - fa38437 phase 1b: F3 MOV imm8 fast-path
 - 74b3e15 phase 1a debug: per-module unique extern names (didnt fix)
