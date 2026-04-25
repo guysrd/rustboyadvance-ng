@@ -5,115 +5,131 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**Currently in:** phase 0 scaffold (step 2 of ~8).
-**Next deliverable:** scan.rs — ROM reachability per A4 /
-docs/findings-rom-scan.md.
+**Currently in:** phase 0 scaffold (step 4b of ~9).
+**Next deliverable:** placeholder block emit — LLVM fn per block
+that calls `aot_replay_thumb_block_for<I>` trampoline with baked-in
+opcodes_ptr + len + mode. Trampoline runs the block via THUMB_LUT
+handler dispatch + K=2 abort check, mirrors scalar replay.
+Coverage > 80% after this lands.
 
-## What's done
+## What's done (16 commits on aot-apr25)
 
-### A0-A8 phase-0 audits (all complete)
+### Phase 0 audits A0-A8 (3 batched commits)
 
-- **A0** (`docs/findings-pre-flight.md`) — pre-flight ABI sanity.
-  Toolchain confirmed: LLVM_SYS_181_PREFIX=/usr/lib/llvm-18,
-  inkwell 0.9 with llvm18-1-prefer-dynamic, JIT executes a
-  constant fn returning 42.
-- **A1** (`docs/findings-pipeline-read.md`) — no Thumb or ARM
-  handler reads `cpu.pipeline[]`. Inline-fetch optimization
-  (skip read_16, keep add_cycles) is safe for ALL formats.
-  Pipeline state needs reload on AOT→scalar exit.
-- **A2** (`docs/findings-io-regions.md`) — region map. Inlinable RAM
-  regions: BIOS read, EWRAM, IWRAM, cart ROM read. Real bus call:
-  IOMEM/PALRAM/VRAM/OAM/SRAM. Functions in bus.rs.
-- **A3** (`docs/findings-indirect.md`) — simple "miss → scalar
-  forever" fallback for phase 0. Trace-pass deferred to phase 9.
-- **A4** (`docs/findings-rom-scan.md`) — scan algorithm specced.
-  Cart entry from ROM bytes 0-3 as ARM B (verified PE, MK).
-  classify_insn: Linear / DirectBranch / Conditional / IndirectBranch
-  / ExceptionEdge. I22 validation per target.
-- **A5** (`docs/findings-compile-budget.md`) — measured 277 us/block
-  at -O3. Serial PE = 27.7s, MK = 8.3s — both over budget.
-  DECISION: parallel-by-page mandatory.
-- **A6** (`docs/findings-diffinfra.md`) — DiffBus + diff_thumb
-  framework specced.
-- **A7** (`docs/findings-shape-distribution.md`) — provisional
-  ordering: F1 + F3 + F4 lead phase 1. Real measurement runs as
-  part of phase-0 scaffold (profile_shapes example).
-- **A8** (`docs/findings-debug-hooks.md`) — --dump-ir / --dump-asm
-  / --trace-block / --trace-block-instr specced.
+All 9 audits committed: pre-flight ABI sanity passing, no handler
+reads pipeline (inline-fetch safe), IO regions mapped, indirect
+fallback decided, ROM scan algorithm specced, compile budget
+measured (277µs/block → parallel-by-page mandatory), diff infra
+specced, shape distribution provisional ordering, debug hooks
+specced. See `docs/findings-*.md`.
 
-### Phase 0 scaffold step 1 (committed: 762493e)
+### Phase 0 scaffold step 1: bus + table (1 commit)
 
-- `arm7tdmi-aot/src/bus.rs` — region constants + classifiers.
-- `arm7tdmi-aot/src/table.rs` — two-level PC→fn table with inlined
-  lookup. **GOTCHA fixed**: 8-bit top index collides BIOS (0x0)
-  with ROM (0x08000000); both have bits 16-23 = 0. Use 16-bit top
-  (= pc >> 16). Heap-boxed top (512KB upfront).
-- `CompiledFn` ABI (per I8): `extern "C" fn(cpu_ctx, pc_out) -> u32`.
-  Single-pointer cpu_ctx, no separate gpr_ptr — avoids noalias bug.
-- 7 unit tests passing (bus region classification + table
-  insert/lookup).
+`arm7tdmi-aot/src/bus.rs` — region constants + classifiers.
+`arm7tdmi-aot/src/table.rs` — two-level PC→fn table. **Bug fix:
+8-bit top index collides BIOS w/ ROM; switched to 16-bit (65536-entry
+heap-boxed top, 256KB leaves).** `aot_lookup` is `#[inline(always)]`
+with `get_unchecked` on hot path.
+
+### Phase 0 scaffold step 2: scan.rs (1 commit)
+
+ROM reachability per A4. Cart entry decoded from ROM bytes 0-3 as
+ARM B (verified PE: 0x08000204; MK: 0x080000c0). Classifier
+distinguishes Linear / DirectBranch / Conditional / IndirectBranch /
+ExceptionEdge / BlReturn for Thumb (F18 B, F16 Bcc, F17 SWI, F5 BX,
+F19 BL pair, F14 POP{pc}, F4-/F5 ALU) and ARM (B/BL with cond, BX,
+SWI, LDR PC, LDM with R15, ALU Rd=PC). 32-instr cap per I16,
+validation per I22. **23 unit tests passing including real-ROM
+smoke.**
+
+### Phase 0 scaffold step 3: arm7tdmi AOT hook (1 commit)
+
+New `aot_dispatch` feature on arm7tdmi gates two raw fields on
+Arm7tdmiCore: `aot_table: *const u8` and
+`aot_lookup_fn: Option<fn(*const u8, u32) -> usize>`. arm7tdmi stays
+inkwell-free. `step_block` calls `try_aot_dispatch()` at the top of
+each chain iter; on hit dispatches the CompiledFn (single-pointer
+ABI per I8), interprets I8 return bits, reloads pipeline at branch
+target, continues chain. On miss falls through to existing
+block_cache path.
+
+**Cold-start guard per I15**: lookup gated on
+`cpu.pipeline[0] != 0`, so first dispatcher tick after reset always
+falls to scalar. AOT takes over once pipeline is bootstrapped.
+
+`arm7tdmi-aot::enable_aot_on(cpu, &table)` is the public install
+entry point. Casts `&AotTable` to `*const u8`, registers
+`aot_lookup_for_hook` (which casts back inside arm7tdmi-aot).
+
+### Phase 0 scaffold step 4a: compile_rom plumbing + SDL --aot (1 commit)
+
+`compile_rom(rom, base, entry_pc, mode) -> AotTable`: phase 0a
+returns empty table — scan runs but no IR emitted yet. Step 4b will
+add placeholder emit.
+
+New `--features aot` on rustboyadvance-sdl2 (depends on
+arm7tdmi-aot + aot_dispatch core feature). New `--aot` flag wired
+BEFORE skip_bios per I11. AotTable boxed for static lifetime.
+
+**Smoke test on pokeemerald: 0 divs vs scalar reference.** AOT path
+engaged (lookup runs, always misses with empty table), dispatcher
+falls through to scalar correctly.
 
 ## Pending in phase 0 scaffold
 
-- **step 2: scan.rs** — implement A4. Decode cart entry B,
-  walk reachable basic blocks, classify each insn, queue targets,
-  cap blocks at 32 instr (I16). Validate per I22.
+### Step 4b: placeholder block emit (next)
 
-- **step 3: arm7tdmi hook for inlined lookup** —
-  `arm7tdmi/src/cpu.rs` gets `*const AotTable` field under the new
-  `aot_dispatch` feature in arm7tdmi (or a non-feature pub field
-  with a sentinel null when unused). `replay_cached_block` calls
-  `arm7tdmi_aot::aot_lookup` inline before falling through to
-  scalar. Issue: `arm7tdmi` doesn't depend on `arm7tdmi-aot` (avoid
-  inkwell in core). Solution: `arm7tdmi` defines the lookup signature
-  via a fn-pointer or trait, `arm7tdmi-aot` populates it.
+For each `BlockSpec` from scan, emit an LLVM fn that calls
+`aot_replay_thumb_block_for<I>(cpu_ctx, opcodes_ptr, len, mode)`.
+The trampoline runs the block via THUMB_LUT handler dispatch with
+K=2 abort check, mirroring scalar replay. Coverage > 80% after.
 
-- **step 4: compile_rom (parallel-by-page)** — for each page,
-  spawn a thread that creates a Context + Module, emits placeholder
-  block fns (one trampoline call to scalar replay), -O3 compiles.
-  Main thread `add_module` per finished page, populates AotTable.
-  Per I17 compile-then-publish: AotTable returned only after ALL
-  pages compiled.
+Architecture:
+- `arm7tdmi-aot/src/replay.rs` — the trampoline:
+  `pub unsafe extern "C" fn aot_replay_thumb_block_for<I>(cpu_ctx,
+  opcodes_ptr, len, abort_check) -> u32`. Drives THUMB_LUT
+  handler dispatch with the same fetch + pipeline + cpsr semantics
+  as scalar `replay_cached_block`. Returns I8 ABI bits.
+- `arm7tdmi-aot/src/emit.rs` — LLVM IR emit:
+  `pub fn emit_placeholder_block(compiler, spec) -> CompiledFn`.
+  Creates a per-block fn that calls the trampoline with baked-in
+  opcodes_ptr (allocated in a per-block Vec<u32>, kept alive by
+  AotTable).
+- `compile_rom` — for each scanned block, allocate the opcodes
+  vec, emit IR, register the resulting fn in the AotTable.
+- Per A5 + I17: parallel-by-page compile is a phase-0
+  recommendation but the placeholder emit is small enough we can
+  start serial and parallelize if budget exceeds 5s for PE.
 
-- **step 5: enable_aot_on** — wires the AotTable into the CPU's
-  hook field. Called from SDL frontend immediately after
-  `GameBoyAdvance::new` (per I11).
+### Step 4c: SDL replay verifies acceptance
 
-- **step 6: diff.rs + dump.rs** — DiffBus per A6, debug hooks
-  per A8.
+Run `bash scripts/aot_measure.sh` (or just /tmp/sdl_divs.sh + MK
+equivalent with `--aot` arg). Phase 0 acceptance:
+- divs == 0 ✓ (already proven with empty table)
+- |drift| < 1000
+- coverage > 80% (need step 4b for this)
+- replay determinism
 
-- **step 7: SDL frontend** — `--aot` flag (calls
-  `enable_aot_on(rom_bytes, entry_pc)`), `--dump-ir/--dump-asm`/
-  `--trace-block/--trace-block-instr` flags. Compile progress on
-  stderr.
+### Step 5+ (post phase 0): per-format inline IR
 
-- **step 8: scripts/aot_measure.sh** — V1 (replay diff) + V2
-  (drift) + V3 (diff_failures) + V4 (determinism) gates.
-
-- **step 9: profile_shapes example** — A7 actual measurement.
-
-## Phase 0 acceptance gates
-
-- divs == 0 on PE + MK
-- |drift| < 1000 cycles
-- coverage > 80%
-- replay determinism (V4)
-- diff_failures == 0
-
-After phase 0 ships green, phase 1 starts: inline F1 + F3 + F4
-emit fns (or whatever the actual A7 measurement shows hottest).
+Phase 1 inlines the top-3 hottest formats per A7 measurement
+(provisional: F1 + F3 + F4). Each inline phase replaces trampoline
+calls with direct IR for that format.
 
 ## Reminder loop
 
-CronCreate scheduled at minutes 7,22,37,52 every hour. Each fire:
-re-read docs/aot-llvm-program.md, read this file, continue from
-the resume marker.
+CronCreate scheduled at minutes 7,22,37,52 every hour. Each fire
+re-reads docs/aot-llvm-program.md, re-reads this file, continues
+from the resume marker.
 
 ## Recent commits on this branch
 
+- 9dc0326 phase 0 scaffold step 4a: compile_rom plumbing + SDL --aot flag
+- 44411d1 phase 0 scaffold step 3: arm7tdmi AOT dispatch hook
+- d2e6164 phase 0 scaffold step 2: scan.rs (ROM reachability per A4)
 - 762493e phase 0 scaffold step 1: bus regions + PC->fn table
-- (audits A5-A8 commit)
-- (audits A1-A4 commit)
-- (A0: arm7tdmi-aot scaffold)
+- dae1ccb phase 0 audits A5-A8
+- 9a8bec6 phase 0 audits A1-A4
+- 469ae6a A0: arm7tdmi-aot scaffold + pre-flight ABI sanity passing
 - a4a6c0e docs: aot-llvm autoresearch program
 - 192fa88 strip llvm jit, cache_interp scalar only
