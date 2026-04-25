@@ -88,6 +88,33 @@ pub fn compile_rom_with_seeds(
     seeds: &[(u32, Mode)],
     replay_thumb_fn: replay::AotReplayFn,
 ) -> AotTable {
+    compile_rom_with_seeds_and_step(
+        rom,
+        rom_base,
+        entry_pc,
+        entry_mode,
+        seeds,
+        replay_thumb_fn,
+        None,
+        None,
+    )
+}
+
+/// Phase-1 variant: takes per-instruction step + abort trampolines so
+/// `compile_thumb_block` can dispatch per-opcode (per-format inline
+/// IR or step trampoline call) instead of one whole-block trampoline.
+/// When step+abort are None, falls back to the phase-0 whole-block
+/// emit. When both are Some, uses the new per-instruction emit.
+pub fn compile_rom_with_seeds_and_step(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
     // coverage on the SDL replay we ALSO sweep aligned halfwords as
@@ -148,6 +175,13 @@ pub fn compile_rom_with_seeds(
         }
     };
     compiler.register_replay_thumb(replay_thumb_fn);
+    let use_per_instr = match (step_thumb_fn, abort_thumb_fn) {
+        (Some(s), Some(a)) => {
+            compiler.register_step_thumb(s, a);
+            true
+        }
+        _ => false,
+    };
 
     let mut table = AotTable::new();
     let mut emitted = 0usize;
@@ -158,11 +192,15 @@ pub fn compile_rom_with_seeds(
             skipped_arm += 1;
             continue;
         }
-        let opcodes_ptr = table.intern_opcodes(&spec.opcodes);
-        let opcodes_len = spec.opcodes.len() as u32;
-        // entry_pc passed to the trampoline IS the block's first
-        // instruction's exec_addr (= spec.entry_pc).
-        match compiler.emit_placeholder_thumb_block(opcodes_ptr, opcodes_len, spec.entry_pc) {
+        let opcodes_u16: Vec<u16> = spec.opcodes.iter().map(|&o| o as u16).collect();
+        let emit_result = if use_per_instr {
+            compiler.emit_per_instr_thumb_block(&opcodes_u16, spec.entry_pc)
+        } else {
+            let opcodes_ptr = table.intern_opcodes(&spec.opcodes);
+            let opcodes_len = spec.opcodes.len() as u32;
+            compiler.emit_placeholder_thumb_block(opcodes_ptr, opcodes_len, spec.entry_pc)
+        };
+        match emit_result {
             Some(f) => {
                 // Build the BlockKey-style pc with the Thumb bit so
                 // the dispatcher's lookup (which uses self.pc &

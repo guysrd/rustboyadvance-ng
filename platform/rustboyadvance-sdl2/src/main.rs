@@ -156,17 +156,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Vec::new()
         };
-        // Per-I monomorphized trampoline. SDL frontend uses
+        // Per-I monomorphized trampolines. SDL frontend uses
         // SysBus from rustboyadvance-core.
+        //
+        // Default: phase-0 whole-block emit (proven 0 divs at sweep=0).
+        // AOT_USE_PER_INSTR=1: phase-1 per-instruction emit (works
+        // at small scale ≤ ~1000 blocks but produces divergent
+        // results at sweep>=4KB on PE — bug under investigation).
         use rustboyadvance_core::sysbus::SysBus;
-        let table = Box::new(arm7tdmi_aot::compile_rom_with_seeds(
-            &rom_bytes,
-            0x0800_0000,
-            entry_pc,
-            arm7tdmi_aot::Mode::Arm,
-            &seeds,
-            arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
-        ));
+        let use_per_instr = std::env::var("AOT_USE_PER_INSTR")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let table = if use_per_instr {
+            eprintln!("--aot: phase-1 per-instruction dispatch (AOT_USE_PER_INSTR=1)");
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_and_step(
+                &rom_bytes,
+                0x0800_0000,
+                entry_pc,
+                arm7tdmi_aot::Mode::Arm,
+                &seeds,
+                arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
+                Some(arm7tdmi_aot::replay::aot_thumb_step_for::<SysBus>),
+                Some(arm7tdmi_aot::replay::aot_block_should_abort_thumb_for::<SysBus>),
+            ))
+        } else {
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds(
+                &rom_bytes,
+                0x0800_0000,
+                entry_pc,
+                arm7tdmi_aot::Mode::Arm,
+                &seeds,
+                arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
+            ))
+        };
         eprintln!(
             "--aot: scan/compile done in {} ms; {} blocks compiled, {} pages allocated",
             t0.elapsed().as_millis(),

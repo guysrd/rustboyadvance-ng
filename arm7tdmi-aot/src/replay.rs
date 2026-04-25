@@ -17,15 +17,56 @@ use arm7tdmi::memory::MemoryInterface;
 #[allow(unused_imports)]
 use arm7tdmi::CpuAction;
 
-/// Phase-0 trampoline ABI. Caller (SDL frontend with `I = SysBus`)
-/// passes `arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>`
-/// as the `replay_thumb_fn` arg of `compile_rom`.
+/// Phase-0 whole-block trampoline ABI. Used by the placeholder
+/// `compile_thumb_block`. Phase-1+ uses the per-instruction
+/// trampolines below (`AotStepFn`, `AotAbortFn`) for per-format
+/// inline IR.
 pub type AotReplayFn = unsafe extern "C" fn(
     cpu_ctx: *mut u8,
     opcodes_ptr: *const u32,
     opcodes_len: u32,
     entry_pc: u32,
 ) -> u32;
+
+/// Phase-1 per-iter Thumb step trampoline. Mirrors the JIT branch's
+/// `thumb_step_with_fetch_for<I>`. Drives one instruction's
+/// dispatch:
+///   - fetch at fetch_addr (cycle accounting + pipeline shift +
+///     cpu.pc = fetch_addr).
+///   - dispatch THUMB_LUT handler.
+///   - on AdvancePC: cpu.pc = fetch_addr + 2, cpu.next_fetch_access
+///     = handler-supplied access. Returns 0.
+///   - on PipelineFlushed: handler already updated cpu.pc + cpu.pipeline.
+///     Returns 1.
+pub type AotStepFn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    fetch_addr: u32,
+    insn: u32,
+) -> u32;
+
+/// Per-I monomorphized step trampoline. SDL frontend passes
+/// `aot_thumb_step_for::<SysBus>`.
+pub unsafe extern "C" fn aot_thumb_step_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    fetch_addr: u32,
+    insn: u32,
+) -> u32 {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    cpu.aot_thumb_step(fetch_addr, insn)
+}
+
+/// Phase-1 mid-block abort check (K=2 cadence, called from
+/// compile_thumb_block before iters with k odd && k != 0).
+/// Returns 1 if the AOT block should yield to the dispatcher
+/// (mode-flip, block-cache-dirty, or scheduler abort).
+pub type AotAbortFn = unsafe extern "C" fn(cpu_ctx: *mut u8) -> u32;
+
+pub unsafe extern "C" fn aot_block_should_abort_thumb_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+) -> u32 {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    if cpu.aot_block_should_abort_thumb() { 1 } else { 0 }
+}
 
 /// K=2 abort cadence (per I2). Don't change without re-validating
 /// SDL divs — k=4 broke divs on both ROMs in the JIT branch.

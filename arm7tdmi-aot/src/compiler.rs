@@ -8,7 +8,7 @@ use inkwell::execution_engine::ExecutionEngine;
 #[cfg(test)]
 use inkwell::execution_engine::JitFunction;
 
-use crate::replay::AotReplayFn;
+use crate::replay::{AotAbortFn, AotReplayFn, AotStepFn};
 use crate::table::CompiledFn;
 
 /// Compiler handle. The `Context` is leaked to `'static` so the
@@ -22,6 +22,11 @@ pub struct LlvmCompiler {
     /// placeholder blocks call this; phase 1+ inline IR replaces
     /// the calls one format at a time.
     pub(crate) replay_thumb_fn: Option<AotReplayFn>,
+    /// Phase-1 per-instruction trampoline for unsupported formats
+    /// (anything not yet inlined). Set via register_step_thumb.
+    pub(crate) step_thumb_fn: Option<AotStepFn>,
+    /// Phase-1 mid-block abort check for K=2 cadence.
+    pub(crate) abort_thumb_fn: Option<AotAbortFn>,
 }
 
 impl LlvmCompiler {
@@ -40,13 +45,133 @@ impl LlvmCompiler {
             engine,
             next_id: 0,
             replay_thumb_fn: None,
+            step_thumb_fn: None,
+            abort_thumb_fn: None,
         })
     }
 
-    /// Register the per-I monomorphized phase-0 trampoline. Caller
-    /// must do this once before emitting placeholder blocks.
+    /// Register the per-I monomorphized phase-0 whole-block trampoline.
     pub fn register_replay_thumb(&mut self, f: AotReplayFn) {
         self.replay_thumb_fn = Some(f);
+    }
+
+    /// Register the phase-1 per-instruction trampoline + abort check.
+    pub fn register_step_thumb(&mut self, step: AotStepFn, abort: AotAbortFn) {
+        self.step_thumb_fn = Some(step);
+        self.abort_thumb_fn = Some(abort);
+    }
+
+    /// Phase-1 per-instruction Thumb block emit. Each opcode becomes
+    /// either inline IR (for supported formats — currently F3 MOV
+    /// imm8) or a call to the per-iter step trampoline (for everything
+    /// else). K=2 abort check between iters per I2.
+    ///
+    /// Returns the JIT'd CompiledFn matching the CompiledFn ABI
+    /// (`extern "C" fn(cpu_ctx, pc_out) -> u32`).
+    ///
+    /// `opcodes` is the raw u16 opcode list for the block.
+    /// `entry_pc` is the block's first-instruction exec_addr (NOT the
+    /// pipeline-head; the ABI for fetch_addr offset = entry_pc + 4).
+    pub fn emit_per_instr_thumb_block(
+        &mut self,
+        opcodes: &[u16],
+        entry_pc: u32,
+    ) -> Option<CompiledFn> {
+        use inkwell::AddressSpace;
+        use inkwell::IntPredicate;
+
+        let step_fn = self.step_thumb_fn?;
+        let abort_fn = self.abort_thumb_fn?;
+
+        let module = self.context.create_module("aot_blk_pi");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        // Imports: step + abort trampolines.
+        let step_sig = i32_t.fn_type(
+            &[ptr_t.into(), i32_t.into(), i32_t.into()],
+            false,
+        );
+        let step_ref = module.add_function("rba_aot_step", step_sig, None);
+        self.engine.add_global_mapping(&step_ref, step_fn as usize);
+
+        let abort_sig = i32_t.fn_type(&[ptr_t.into()], false);
+        let abort_ref = module.add_function("rba_aot_abort", abort_sig, None);
+        self.engine.add_global_mapping(&abort_ref, abort_fn as usize);
+
+        // Block fn.
+        let block_sig = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.next_id += 1;
+        let block_name = format!("aot_pi_blk_{}", self.next_id);
+        let block_fn = module.add_function(&block_name, block_sig, None);
+        let entry = self.context.append_basic_block(block_fn, "entry");
+        let exit_blk = self.context.append_basic_block(block_fn, "exit");
+        let abort_blk = self.context.append_basic_block(block_fn, "abort");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let cpu_ctx = block_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+        for (k, &opcode) in opcodes.iter().enumerate() {
+            // K=2 abort cadence: check before iters with k odd && k != 0.
+            if k != 0 && (k & 1) == 1 {
+                let acall = builder
+                    .build_call(abort_ref, &[cpu_ctx.into()], "abort_res")
+                    .ok()?;
+                let abort_v = acall.try_as_basic_value().unwrap_basic().into_int_value();
+                let zero = i32_t.const_int(0, false);
+                let nonzero = builder
+                    .build_int_compare(IntPredicate::NE, abort_v, zero, "abort_nz")
+                    .ok()?;
+                let after_abort = self.context.append_basic_block(block_fn, "after_abort");
+                builder
+                    .build_conditional_branch(nonzero, abort_blk, after_abort)
+                    .ok()?;
+                builder.position_at_end(after_abort);
+            }
+
+            // Compute fetch_addr at compile time (constant).
+            let exec_addr = entry_pc.wrapping_add((2 * k) as u32);
+            let fetch_addr = exec_addr.wrapping_add(4);
+
+            // Phase 1: just call the step trampoline. Per-format
+            // inline IR replaces this in the next sub-step.
+            let fa = i32_t.const_int(fetch_addr as u64, false);
+            let insn = i32_t.const_int(opcode as u64, false);
+            let scall = builder
+                .build_call(step_ref, &[cpu_ctx.into(), fa.into(), insn.into()], "step_res")
+                .ok()?;
+            let step_v = scall.try_as_basic_value().unwrap_basic().into_int_value();
+            // Branch on PipelineFlushed (returned 1) → exit_blk.
+            let zero = i32_t.const_int(0, false);
+            let flushed = builder
+                .build_int_compare(IntPredicate::NE, step_v, zero, "flushed")
+                .ok()?;
+            let cont_blk = self.context.append_basic_block(block_fn, "cont");
+            builder
+                .build_conditional_branch(flushed, exit_blk, cont_blk)
+                .ok()?;
+            builder.position_at_end(cont_blk);
+        }
+        // Fell through all opcodes — go to exit.
+        builder.build_unconditional_branch(exit_blk).ok()?;
+
+        // exit_blk: return 0 (per phase-0 ABI; handler updates cpu.pc
+        // on PipelineFlushed before reaching here).
+        builder.position_at_end(exit_blk);
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .ok()?;
+
+        // abort_blk: return 0b10.
+        builder.position_at_end(abort_blk);
+        builder
+            .build_return(Some(&i32_t.const_int(0b10, false)))
+            .ok()?;
+
+        self.engine.add_module(&module).ok()?;
+        let raw = self.engine.get_function_address(&block_name).ok()?;
+        Some(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
     }
 
     /// Phase-0 placeholder block emit. Creates an LLVM fn matching
