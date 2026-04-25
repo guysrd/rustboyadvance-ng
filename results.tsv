@@ -3,3 +3,4 @@ a4a6c0e	0	0.0	540.0	0.0	383.0	0	0	0	0.0	0	0	0	baseline	cache_interp scalar basel
 cac3181	-6	541.9	545.6	387.5	390.1	0	0	0	0.0	0	0	0	accept	phase 0 scaffold (sweep=0; AOT plumbed but no blocks emitted; coverage 0%)
 phase1c-pre	-6	553.5	556.2	400.0	402.8	0	0	0	0.0	0	0	0	accept	phase 1c F1+F4 inline fast paths in aot_thumb_step (sweep=0 baseline preserved)
 phase2-pre	3	539.0	534.8	383.7	384.6	0	0	0	0.0	0	0	0	accept	phase 2 inline F2/F5/F12/F13 (sweep=0; coverage=0%; pe +0.8% noise)
+trace-pc-fix	-8	547.5	550.2	395.2	400.6	0	0	0	0.0	0	0	0	accept	trace seed pc -4 fix (semantically correct; sweep=0 unchanged; --aot-trace-in coverage 74% -> 78%)

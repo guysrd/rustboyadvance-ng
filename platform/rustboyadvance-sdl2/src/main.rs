@@ -147,7 +147,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "arm" => arm7tdmi_aot::Mode::Arm,
                             _ => continue,
                         };
-                        v.push((pc, mode));
+                        // Trace pcs are pipeline-head (= exec_addr + 4 in
+                        // Thumb, +8 in ARM) because scalar's block_cache
+                        // key = self.pc at dispatch which is pipeline-head.
+                        // arm7tdmi-aot's scan treats `entry_pc` as exec_addr
+                        // (= halfword address of the first executed insn),
+                        // so we have to convert here. Without this the AOT
+                        // block scans opcodes 4 bytes ahead of where scalar
+                        // actually started, producing off-by-4 blocks that
+                        // happen to alias real lookup pcs and cause
+                        // divergent state on F19 lo orphan and similar
+                        // shapes. See docs/findings-phase1-trampoline-divs.md
+                        let exec_pc = match mode {
+                            arm7tdmi_aot::Mode::Thumb => pc.wrapping_sub(4),
+                            arm7tdmi_aot::Mode::Arm => pc.wrapping_sub(8),
+                        };
+                        v.push((exec_pc, mode));
                     }
                 }
             }

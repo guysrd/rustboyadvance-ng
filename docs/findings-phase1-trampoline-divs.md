@@ -106,3 +106,39 @@ c) Accept partial phase 1: ship Rust-level inline fast paths for
 Recommending (c) for now. The trampoline bug is real but is a
 multi-hour debugging task that doesn't block the architectural
 forward motion.
+
+## Update 2026-04-25: trace seed pc convention bug
+
+Found a separate bug: the `--aot-trace-out` writes pcs that are
+PIPELINE-HEAD pcs (= exec_addr + 4 in Thumb, +8 in ARM) because
+that's what `block_cache.key` stores. But arm7tdmi-aot's
+`scan_one_block(entry_pc)` interprets `entry_pc` as exec_addr
+(the halfword address of the FIRST executed insn). So scan reads
+opcodes 4 bytes ahead of where scalar actually starts the block,
+producing off-by-4 AOT blocks that:
+
+- Land at lookup_pc = trace_pc + 4 (one past where scalar
+  dispatches), so most miss at runtime.
+- Occasionally alias to a real cpu.pc value (block boundary
+  shared with static-scan reachability), where AOT's first
+  opcode-at-trace_pc may differ from scalar's first
+  opcode-at-(trace_pc-4), causing divergence.
+
+Fixed in main.rs trace-in by subtracting 4 (Thumb) / 8 (ARM)
+before passing seeds to `compile_rom_with_seeds_and_step`.
+
+Empirical (PE 24052-seed trace):
+- Before fix: 74.48% coverage, 32 divs.
+- After fix: 78.22% coverage, 31 divs.
+
+Marginal divs improvement; main F19 lo bug remains.
+
+The drift on full-trace went UP because more code now correctly
+dispatches through AOT, exposing the latent trampoline cycle
+accounting bug at higher rate. That's expected — fixing one bug
+exposes another, since the prior coverage-via-aliasing was
+masking the trampoline drift.
+
+Phase 1 partial-accept stays as the conclusion. Coverage-at-scale
+needs the trampoline cycle bug fixed OR phase 4 (LLVM IR inlines
+fetch) sidesteps it entirely.
