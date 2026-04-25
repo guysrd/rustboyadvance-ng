@@ -9,7 +9,7 @@ edition = "2024"
 #   export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
 
 [dependencies]
-arm7tdmi = { path = "../arm7tdmi", features = ["cached_interp"] }
+arm7tdmi = { path = "../arm7tdmi", features = ["cached_interp", "aot_dispatch"] }
 rustc-hash = "2"
 
 [dependencies.inkwell]

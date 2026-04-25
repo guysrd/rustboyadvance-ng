@@ -117,6 +117,24 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     /// `cached_interp` feature is on; zero-sized otherwise.
     #[cfg(feature = "cached_interp")]
     pub block_cache: super::cache::BlockCache<I>,
+
+    /// AOT dispatch hook (per I18 in docs/aot-llvm-program.md).
+    /// Opaque pointer to an AotTable defined in the arm7tdmi-aot
+    /// crate; we keep it as raw `*const u8` here so this crate
+    /// stays inkwell-free. `enable_aot_hook` (called by the AOT
+    /// crate) populates both fields.
+    ///
+    /// Lookup signature: `fn(table, pc) -> usize`. Returns the
+    /// CompiledFn address as a usize (cast back at dispatch site),
+    /// or 0 if no AOT block exists at that pc.
+    ///
+    /// CompiledFn signature (per I8): `extern "C" fn(*mut u8 cpu_ctx,
+    /// *mut u32 pc_out) -> u32` returning 0 / 0b01 (branch) / 0b10
+    /// (abort).
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_table: *const u8,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_lookup_fn: Option<fn(*const u8, u32) -> usize>,
 }
 
 // BlockCache holds handler function pointers keyed by entry-PC; cloning a CPU
@@ -139,6 +157,14 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             dbg: self.dbg.clone(),
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
+            // AOT hook intentionally NOT cloned: cloned CPUs are
+            // typically used for tests / save-states which don't
+            // share the AOT table state. Re-installing the hook is
+            // the caller's responsibility.
+            #[cfg(feature = "aot_dispatch")]
+            aot_table: std::ptr::null(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn: None,
         }
     }
 }
@@ -163,11 +189,80 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
 
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_table: std::ptr::null(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn: None,
         }
     }
 
     pub fn weak_ptr(&mut self) -> WeakPointer<Arm7tdmiCore<I>> {
         WeakPointer::new(self as *mut Arm7tdmiCore<I>)
+    }
+
+    /// Install the AOT dispatch hook (per I18). The arm7tdmi-aot
+    /// crate calls this with its `*const AotTable` (cast to
+    /// `*const u8`) and an `aot_lookup` fn that returns the
+    /// CompiledFn address as a `usize` (0 if no AOT block exists
+    /// at that pc).
+    ///
+    /// Caller MUST call this before the first `step_block` per I11
+    /// — otherwise the cold-start BIOS boot misses the AOT cache
+    /// and runs scalar.
+    #[cfg(feature = "aot_dispatch")]
+    pub fn install_aot_hook(
+        &mut self,
+        table: *const u8,
+        lookup_fn: fn(*const u8, u32) -> usize,
+    ) {
+        self.aot_table = table;
+        self.aot_lookup_fn = Some(lookup_fn);
+    }
+
+    /// Try to dispatch an AOT-compiled block at the current pc. Returns
+    /// `Some(can_chain)` on hit, `None` on miss (caller falls through
+    /// to block_cache + scalar replay).
+    ///
+    /// Per I8 ABI: CompiledFn returns
+    ///   0     → fall-through (caller chains).
+    ///   0b01  → branch fired; dispatcher reloads pipeline at *pc_out.
+    ///   0b10  → mid-block abort; caller yields to outer run loop.
+    ///
+    /// Per I15 cold-start: AOT lookup is gated on
+    /// `cpu.pipeline[0] != 0` (a zero pipeline means the CPU just
+    /// reset and scalar must bootstrap before AOT takes over). See
+    /// findings-pipeline-read.md for the rationale.
+    #[cfg(feature = "aot_dispatch")]
+    #[inline]
+    fn try_aot_dispatch(&mut self) -> Option<bool> {
+        let lookup = self.aot_lookup_fn?;
+        // Cold-start guard (I15): skip AOT until scalar has fetched
+        // at least one instruction. This avoids dispatching into an
+        // AOT block whose first iter would re-fetch pipeline[0] at
+        // a stale pc.
+        if self.pipeline[0] == 0 {
+            return None;
+        }
+        let fn_addr = lookup(self.aot_table, self.pc);
+        if fn_addr == 0 {
+            return None;
+        }
+        let f: unsafe extern "C" fn(*mut u8, *mut u32) -> u32 =
+            unsafe { std::mem::transmute(fn_addr) };
+        let cpu_ctx = self as *mut Arm7tdmiCore<I> as *mut u8;
+        let mut pc_out: u32 = 0;
+        let ret = unsafe { f(cpu_ctx, &mut pc_out) };
+        if ret & 0b10 != 0 {
+            return Some(false); // mid-block abort, yield
+        }
+        if ret & 0b01 != 0 {
+            // Branch fired. Apply mode + reload pipeline at target.
+            let thumb_bit = pc_out & 1 != 0;
+            self.cpsr.set_state(if thumb_bit { CpuState::THUMB } else { CpuState::ARM });
+            self.pc = pc_out & if thumb_bit { !1 } else { !3 };
+            if thumb_bit { self.reload_pipeline16() } else { self.reload_pipeline32() }
+        }
+        Some(true) // can chain
     }
 
     pub fn from_saved_state(bus: Shared<I>, state: SavedCpuState) -> Arm7tdmiCore<I> {
@@ -191,6 +286,12 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
 
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
+            // AOT hook is process-level state, not save-state state.
+            // Caller re-installs after restore.
+            #[cfg(feature = "aot_dispatch")]
+            aot_table: std::ptr::null(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn: None,
         }
     }
 
@@ -517,6 +618,22 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             if self.bus.take_block_cache_dirty() {
                 self.block_cache.flush();
                 return;
+            }
+
+            // AOT fast path (per I18). When a hook is installed and
+            // the current pc matches a compiled block, dispatch it
+            // directly without going through block_cache. On miss
+            // (None), fall through to the normal cache-or-record
+            // path.
+            #[cfg(feature = "aot_dispatch")]
+            if let Some(can_chain) = self.try_aot_dispatch() {
+                if !can_chain {
+                    return;
+                }
+                if self.bus.cached_block_should_abort() {
+                    return;
+                }
+                continue;
             }
 
             let thumb = matches!(self.cpsr.state(), CpuState::THUMB);
