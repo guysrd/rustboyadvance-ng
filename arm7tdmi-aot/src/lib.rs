@@ -10,6 +10,9 @@
 //! (Karpathy format) that drives the development of this crate.
 //! Invariants I1-I28 in that doc are NOT optional.
 
+pub mod bus;
 pub mod compiler;
+pub mod table;
 
 pub use compiler::LlvmCompiler;
+pub use table::{AotTable, CompiledFn, aot_lookup};
