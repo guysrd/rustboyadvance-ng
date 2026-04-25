@@ -671,6 +671,61 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             return 0; // AdvancePC
         }
 
+        // F14 PUSH/POP — raw & 0xf600 == 0xb400.
+        // Encoding: 1011_L_10_R_RRRRRRRR; L=bit 11 (1=POP), R=bit 8 (LR/PC).
+        // Mirrors thumb/exec.rs::exec_thumb_push_pop.
+        if (insn & 0xf600) == 0xb400 {
+            let pop = (insn >> 11) & 0x1 != 0;
+            let flag_r = (insn >> 8) & 0x1 != 0;
+            let rlist = (insn & 0xff) as u8;
+            if pop {
+                let mut access = MemoryAccess::NonSeq;
+                for r in 0..8 {
+                    if (rlist >> r) & 1 != 0 {
+                        let stack_addr = self.gpr[REG_SP] & !3;
+                        self.gpr[r] = self.load_32(stack_addr, access);
+                        access = MemoryAccess::Seq;
+                        self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_add(4);
+                    }
+                }
+                if flag_r {
+                    // pop! 1-arg in scalar uses Seq.
+                    let stack_addr = self.gpr[REG_SP] & !3;
+                    let val = self.load_32(stack_addr, MemoryAccess::Seq);
+                    self.set_reg(REG_PC, val);
+                    self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_add(4);
+                    self.pc &= !1;
+                    self.reload_pipeline16();
+                    self.idle_cycle();
+                    return 1; // PipelineFlushed
+                }
+                self.idle_cycle();
+                self.next_fetch_access = MemoryAccess::NonSeq;
+                self.pc = fetch_addr.wrapping_add(2);
+                return 0; // AdvancePC(NonSeq)
+            } else {
+                // PUSH
+                let mut access = MemoryAccess::NonSeq;
+                if flag_r {
+                    self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_sub(4);
+                    let stack_addr = self.gpr[REG_SP] & !3;
+                    self.store_32(stack_addr, self.gpr[REG_LR], access);
+                    access = MemoryAccess::Seq;
+                }
+                for r in (0..8).rev() {
+                    if (rlist >> r) & 1 != 0 {
+                        self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_sub(4);
+                        let stack_addr = self.gpr[REG_SP] & !3;
+                        self.store_32(stack_addr, self.gpr[r], access);
+                        access = MemoryAccess::Seq;
+                    }
+                }
+                self.next_fetch_access = MemoryAccess::NonSeq;
+                self.pc = fetch_addr.wrapping_add(2);
+                return 0; // AdvancePC(NonSeq)
+            }
+        }
+
         // F16 Bcc — raw & 0xf000 == 0xd000.
         // Encoding: 1101_CCCC_IIIIIIII where CCCC=cond, IIIIIIII signed imm8.
         // SWI (cond=0xF) and undefined (cond=0xE) handled via LUT below.

@@ -12,3 +12,4 @@ trampoline-fix	-8	532.4	537.3	383.1	386.1	0	0	0	0.0	0	0	0	accept	trampoline cycl
 phase1-accept	0	497.9	537.3	388.7	386.1	0	68	0	70.9	0	1	0	accept	PHASE 1 ACCEPT: sweep=64KB pe=0divs/0drift/71%cov, mk=1div/68drift/1%cov, trampoline cycle bug fixed
 phase1-f16f19hi	0	549.2	548.4	390.8	391.7	-78	0	0	0.0	0	0	0	accept	phase 1 expand: f16 bcc + f19 hi inline
 harness-sw64	-47	499.1	532.2	386.0	399.8	34	68	0	70.9	0	1	0	accept	harness sweep=64KB after trampoline fix: pe -6.2%, mk -3.5%, 0/1 divs (correct but not faster than scalar yet — phase 4 needed)
+phase1-f14	-9	537.0	543.7	383.6	385.8	0	0	0	0.0	0	0	0	accept	phase 1: f14 push/pop inline (16 thumb formats inlined total)
