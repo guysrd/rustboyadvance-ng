@@ -29,10 +29,30 @@ Phase 1 fps still 10% slower than scalar at 70% coverage (483 vs
 dispatch. Phase 4 (inline fetch + abort into LLVM IR) is needed
 for actual fps gain.
 
-**Next deliverable:** phase 4 — emit per-format LLVM IR replacing
-the per-iter trampoline call with direct LLVM ops. F3 MOV imm8 is
-the simplest starting point (4 stores: gpr[Rd], cpsr, pc,
-next_fetch_access; all constant-foldable from baked opcode bits).
+**Phase 4 step 1 done (commit 2999628)**: F3 MOV imm8 inline LLVM
+IR works correctly (0 divs at sweep=4KB and 64KB) but is 10 fps
+SLOWER than the phase-1 per-instr trampoline path (490 vs 501 at
+4KB). The trampoline's Rust-inlined F3 fast path is faster than
+equivalent IR ops + 1 fetch_only extern call.
+
+Lesson: inline IR is only a win when the equivalent Rust fast path
+has high overhead. F3 MOV imm8's Rust path is already 4 ops
+(`gpr[rd] = imm; cpsr.set_N(false); cpsr.set_Z(imm==0); pc += 2`).
+No room to improve.
+
+**Next deliverable:** phase 4 step 2 — try formats where the Rust
+fast path has higher overhead:
+- F4 ALU shifter: calls shift_by_register + idle_cycle (~15ns).
+  Inline IR could constant-fold the shift if amount is known.
+- F1 LSL/LSR/ASR imm5: similar.
+- F19 hi: gpr[LR] = self.pc + (off << 12). Constant-foldable!
+  Just one store of `(fetch_addr + (off << 12))`.
+
+OR pivot to a different approach:
+- batch multiple opcodes in one fetch_only call (amortize extern).
+- inline cycle accounting via direct scheduler.timestamp += K ops
+  (skip the bus.add_cycles extern). Requires offsetting through
+  Rc<UnsafeCell<SysBus>>.scheduler.timestamp.
 
 Plan for next turn:
 1. Add `CpuOffsets` struct in arm7tdmi-aot/src/lib.rs with pc_offset,
