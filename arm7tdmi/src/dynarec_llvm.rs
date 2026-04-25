@@ -381,6 +381,152 @@ impl LlvmCompiler {
         Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
     }
 
+    /// Emit a Thumb F7 LDR/STR with register offset
+    /// (`LDR/STR/LDRB/STRB Rd, [Rb, Ro]`).
+    /// addr = gpr[rb] + gpr[ro]. byte and load flags pick which
+    /// trampoline (load_with_idle_8/32 for LDR family, store_8/32
+    /// for STR). same shape as F9 but the offset comes from a
+    /// register instead of an immediate.
+    pub fn compile_thumb_format7(
+        &mut self,
+        rd: u8,
+        rb: u8,
+        ro: u8,
+        load: bool,
+        byte: bool,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let (load_ref, store_ref) = if load {
+            let name = if byte { "rba_load_idle_8" } else { "rba_load_idle_32" };
+            let fp = if byte {
+                self.trampolines
+                    .load_with_idle_8
+                    .ok_or_else(|| "load_with_idle_8 not registered".to_string())?
+            } else {
+                self.trampolines
+                    .load_with_idle_32
+                    .ok_or_else(|| "load_with_idle_32 not registered".to_string())?
+            };
+            (Some(self.import_load_trampoline(&module, name, fp)), None)
+        } else {
+            let name = if byte { "rba_store_8" } else { "rba_store_32" };
+            let fp = if byte {
+                self.trampolines
+                    .store_8
+                    .ok_or_else(|| "store_8 not registered".to_string())?
+            } else {
+                self.trampolines
+                    .store_32
+                    .ok_or_else(|| "store_32 not registered".to_string())?
+            };
+            (None, Some(self.import_store_trampoline(&module, name, fp)))
+        };
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
+
+        // addr = gpr[rb] + gpr[ro]
+        let rb_idx = i32_t.const_int(rb as u64, false);
+        let rb_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rb_idx], "rb_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rb_val = builder
+            .build_load(i32_t, rb_addr, "rb_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+        let ro_idx = i32_t.const_int(ro as u64, false);
+        let ro_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[ro_idx], "ro_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let ro_val = builder
+            .build_load(i32_t, ro_addr, "ro_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+        let addr_val = builder
+            .build_int_add(rb_val, ro_val, "addr")
+            .map_err(|e| format!("iadd: {}", e))?;
+
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+
+        if load {
+            let call = builder
+                .build_call(
+                    load_ref.unwrap(),
+                    &[cpu_ctx.into(), addr_val.into()],
+                    "ldr_val",
+                )
+                .map_err(|e| format!("call: {}", e))?;
+            let val = call.try_as_basic_value().unwrap_basic().into_int_value();
+            let final_val = if byte {
+                builder
+                    .build_and(val, i32_t.const_int(0xFF, false), "byte_mask")
+                    .map_err(|e| format!("and: {}", e))?
+            } else {
+                val
+            };
+            builder
+                .build_store(rd_addr, final_val)
+                .map_err(|e| format!("store: {}", e))?;
+        } else {
+            let rd_val = builder
+                .build_load(i32_t, rd_addr, "rd_val")
+                .map_err(|e| format!("load: {}", e))?
+                .into_int_value();
+            let store_val = if byte {
+                builder
+                    .build_and(rd_val, i32_t.const_int(0xFF, false), "byte_val")
+                    .map_err(|e| format!("and: {}", e))?
+            } else {
+                rd_val
+            };
+            builder
+                .build_call(
+                    store_ref.unwrap(),
+                    &[cpu_ctx.into(), addr_val.into(), store_val.into()],
+                    "",
+                )
+                .map_err(|e| format!("call: {}", e))?;
+        }
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
     /// Emit a Thumb F10 LDRH/STRH (`LDRH/STRH Rd, [Rb, #imm5*2]`).
     /// addr = gpr[rb] + imm5*2 (halfword stride).
     /// LDRH uses load_with_idle_16; STRH uses store_16.
@@ -2012,6 +2158,64 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F7 LDR reg-offset: addr = gpr[rb] + gpr[ro], stub echoes addr.
+    #[test]
+    fn thumb_f7_ldr_reg_offset() {
+        unsafe extern "C" fn fake_load(_ctx: *mut u8, addr: u32) -> u32 {
+            addr
+        }
+        let mut compiler = LlvmCompiler::new().expect("new");
+        compiler.register_trampolines(LlvmBusTrampolines {
+            load_with_idle_32: Some(fake_load),
+            ..Default::default()
+        });
+        let func = compiler
+            .compile_thumb_format7(2, 3, 4, /*load*/ true, /*byte*/ false)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[3] = 0x0200_0000;
+        gpr[4] = 0x100;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[2], 0x0200_0100);
+    }
+
+    /// F7 STRB reg-offset.
+    #[test]
+    fn thumb_f7_strb_reg_offset() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static A: AtomicU32 = AtomicU32::new(0);
+        static V: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn fake_store(_ctx: *mut u8, addr: u32, val: u32) {
+            A.store(addr, Ordering::Relaxed);
+            V.store(val, Ordering::Relaxed);
+        }
+        let mut compiler = LlvmCompiler::new().expect("new");
+        compiler.register_trampolines(LlvmBusTrampolines {
+            store_8: Some(fake_store),
+            ..Default::default()
+        });
+        let func = compiler
+            .compile_thumb_format7(0, 1, 2, /*load*/ false, /*byte*/ true)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[1] = 0x0300_0000;
+        gpr[2] = 0x10;
+        gpr[0] = 0x1234_56AB;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(A.load(Ordering::Relaxed), 0x0300_0010);
+        assert_eq!(V.load(Ordering::Relaxed), 0xAB);
     }
 
     /// F10 LDRH: stub returns 0xAABB_CCDD; verify only low 16 bits
