@@ -486,6 +486,60 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             return 0; // AdvancePC
         }
 
+        // F9 LDR/STR with imm5 offset — raw & 0xe000 == 0x6000.
+        // Encoding: 011_BL_IIIII_BBB_DDD; B=bit 12 (1 → byte), L=bit 11 (1 → load).
+        // Mirrors thumb/exec.rs::exec_thumb_ldr_str_imm_offset → do_exec_thumb_ldr_str.
+        if (insn & 0xe000) == 0x6000 {
+            let byte = (insn >> 12) & 0x1 != 0;
+            let load = (insn >> 11) & 0x1 != 0;
+            let imm5 = ((insn >> 6) & 0x1f) as u32;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let offset = if byte { imm5 } else { imm5 << 2 };
+            let addr = self.gpr[rb].wrapping_add(offset);
+            if load {
+                let data = if byte {
+                    self.load_8(addr, MemoryAccess::NonSeq) as u32
+                } else {
+                    self.ldr_word(addr, MemoryAccess::NonSeq)
+                };
+                self.gpr[rd] = data;
+                self.idle_cycle();
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                let value = self.gpr[rd];
+                if byte {
+                    self.store_8(addr, value as u8, MemoryAccess::NonSeq);
+                } else {
+                    self.store_aligned_32(addr, value, MemoryAccess::NonSeq);
+                }
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F11 LDR/STR SP-relative (word) — raw & 0xf000 == 0x9000.
+        // Encoding: 1001_L_DDD_IIIIIIII; L=bit 11 (1 → load).
+        // word8 = imm << 2. Mirrors thumb/exec.rs::exec_thumb_ldr_str_sp.
+        if (insn & 0xf000) == 0x9000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let word8 = ((insn & 0xff) << 2) as u32;
+            let addr = self.gpr[REG_SP].wrapping_add(word8);
+            if load {
+                let data = self.ldr_word(addr, MemoryAccess::NonSeq);
+                self.idle_cycle();
+                self.gpr[rd] = data;
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                self.store_aligned_32(addr, self.gpr[rd], MemoryAccess::NonSeq);
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
         // F12 LoadAddress (ADD Rd, [PC|SP], #imm8) — raw & 0xf000 == 0xa000.
         // Encoding: 1010_S_DDD_IIIIIIII; S=bit 11 (1 → SP, 0 → PC).
         // Mirrors thumb/exec.rs::exec_thumb_load_address.
