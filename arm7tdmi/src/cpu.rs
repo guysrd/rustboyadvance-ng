@@ -267,20 +267,33 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // handler in arm7tdmi/src/thumb/exec.rs (verified by SDL replay
         // diff). Add formats here as their bit-exact equivalent is
         // ported.
-        let top5 = (insn >> 11) & 0x1F;
-        if top5 == 0b00100 {
-            // F3 MOV Rd, #imm8 — bits 15:11 = 0b00100.
-            // Encoding: 001_00_RRR_IIIIIIII.
-            // Effect: gpr[Rd] = imm8 (zero-extended).
-            //   N = 0 (imm8 fits in 8 bits, sign bit clear).
-            //   Z = (imm8 == 0).
-            //   C, V unchanged.
-            //   AdvancePC(Seq).
+        let top3 = (insn >> 13) & 0x7;
+        if top3 == 0b001 {
+            // F3 MOV/CMP/ADD/SUB Rd, #imm8 — bits 15:13 = 0b001.
+            // Encoding: 001_oo_RRR_IIIIIIII (oo selects op).
+            //   00 MOV: Rd = imm8        (bit-exact with exec_thumb_data_process_imm<0,RD>)
+            //   01 CMP: temp = Rd - imm8 (no writeback) (op=1)
+            //   10 ADD: Rd = Rd + imm8                  (op=2)
+            //   11 SUB: Rd = Rd - imm8                  (op=3)
+            // Mirrors thumb/exec.rs::exec_thumb_data_process_imm — same
+            // helpers (alu_add_flags / alu_sub_flags / alu_update_flags).
+            let op = ((insn >> 11) & 0x3) as u8;
             let rd = ((insn >> 8) & 0x7) as usize;
             let imm = (insn & 0xff) as u32;
-            self.gpr[rd] = imm;
-            self.cpsr.set_N(false);
-            self.cpsr.set_Z(imm == 0);
+            let op1 = self.gpr[rd];
+            let mut carry = self.cpsr.C();
+            let mut overflow = self.cpsr.V();
+            let result = match op {
+                0 => imm,                                                       // MOV
+                1 | 3 => self.alu_sub_flags(op1, imm, &mut carry, &mut overflow), // CMP / SUB
+                2 => self.alu_add_flags(op1, imm, &mut carry, &mut overflow),   // ADD
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            };
+            let arithmetic = op == 2 || op == 3; // ADD / SUB
+            self.alu_update_flags(result, arithmetic, carry, overflow);
+            if op != 1 {
+                self.gpr[rd] = result; // skip writeback for CMP
+            }
             self.next_fetch_access = MemoryAccess::Seq;
             self.pc = fetch_addr.wrapping_add(2);
             return 0; // AdvancePC
