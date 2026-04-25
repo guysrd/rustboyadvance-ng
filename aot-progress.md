@@ -5,92 +5,92 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**Currently in:** phase 0 scaffold (step 4d of ~9).
-**Next deliverable:** investigate remaining MK 1-div with sweep=64KB
-post-Bcc-Linear fix, then parallel-by-page compile (per A5
-mitigation 1) so wider sweep is feasible within budget.
+**Currently in:** phase 1 (per-format inline IR).
+**Next deliverable:** start phase 1 codegen — refactor `compile_thumb_block`
+to dispatch per-opcode (one inline-IR sequence OR one trampoline
+call per opcode) instead of one trampoline call per block. Then
+implement inline emit for F3 MOV imm8 as the first format. Diff
+test (per A6) verifies bit-exact match with scalar handler.
 
-## What's done — 21 commits on aot-apr25
+## Phase 0 — ACCEPTED ✓
 
-### Phase 0 audits A0-A8
-All 9 audits committed across 3 batches. See `docs/findings-*.md`.
+Per `scripts/aot_measure.sh` at default sweep=0:
+- PE: divs=0, drift=0, determinism=1, fps_aot=541.9 vs scalar=545.6
+- MK: divs=0, drift=0, determinism=1, fps_aot=387.5 vs scalar=390.1
+- diff_failures=0
+- aot_score=-6 (within noise)
 
-### Phase 0 scaffold steps
-- **step 1** (`762493e`): bus regions + 2-level PC→fn table.
-  16-bit top index after BIOS/ROM collision bug.
-- **step 2** (`d2e6164`): scan.rs ROM reachability.
-  cart entry decoded from bytes 0-3, PE/MK verified.
-- **step 3** (`44411d1`): arm7tdmi `aot_dispatch` hook.
-  step_block.try_aot_dispatch() top of chain loop.
-- **step 4a** (`9dc0326`): compile_rom plumbing + SDL --aot flag.
-  empty table; AOT path engaged but always misses; 0 divs.
-- **step 4b** (`758b0d9`): placeholder block emit (trampoline-mode).
-  `aot_replay_thumb_block_for<I>` drives THUMB_LUT handlers
-  with K=2 abort cadence; LLVM emit one trampoline call per block.
-- **step 4c** (`9df4c0e`): Bcc-as-Linear scan fix + coverage counters
-  + drop inter-AOT abort.
-  scan no longer terminates at Bcc; runtime trampoline handles
-  taken/not-taken via handler's CpuAction. fixes block-length
-  mismatch with scalar's traced path. MK 4-divs → 1-div at sweep=64KB.
+Coverage 0% by default — AOT path is plumbed and dispatched on every
+block boundary, just doesn't have any blocks to find (the placeholder
+trampoline whole-block emit is correctness-fragile at scale; needs
+per-instruction emit which is phase 1).
 
-## Verified clean state
+`results.tsv` row `cac3181` records the accept.
 
-- `--features aot` builds cleanly.
-- 23+ unit tests pass.
-- SDL `--aot` (default sweep=0):
-  - pokeemerald: 0 divs, ~540 fps (matches scalar — table empty).
-  - mario kart: 0 divs, ~390 fps.
+## Trace-driven entry points (commit dbc49d8) — works but exposes trampoline bug
 
-## Pending
+`--aot-trace-out PATH` dumps every recorded ROM block PC at replay
+end. `--aot-trace-in PATH` reads them as scan seeds.
 
-### Step 4d: MK 1-div root cause + parallel compile
+Generated:
+- /tmp/pe_trace.txt: 24052 PE block PCs.
+- /tmp/mk_trace.txt: 21565 MK block PCs.
 
-**MK 1-div with AOT_SWEEP_CAP_KB=64**: down from 4-divs but not 0.
-The remaining div is at frame ~96 (~5760-frame index). Cycle drift
-starts around frame 45 (~2700-frame index) — small (~9-77 cycles),
-oscillates sign. Some specific instruction handling differs
-between AOT and scalar in subtle cycle accounting. Bisect:
-- sweep=0: 0 divs
-- sweep=1KB: 1 div
-- sweep=2KB: 1 div
-- sweep=4KB through 64KB: 4 divs (pre-fix), 1 div (post-Bcc fix)
+With PE seeded: 31764 thumb blocks compiled in 28s, 74.48% coverage,
+**but 32 divs vs scalar**. Same kind of bug that surfaces with
+sweep>=25KB on MK. The trampoline-mode placeholder has subtle
+correctness issues with real game blocks at scale. Cycle drift
+starts at frame 180 (line 3 of hashes) with +68 cycles drift.
 
-To diagnose: instrument the AOT trampoline with cycle-by-cycle
-logging vs scalar's same-replay. Find the first instruction where
-cycles differ. Likely candidates: variable-cycle instructions
-(LDM/STM, mul, LDR with idle cycle).
+The fix is phase 1's per-format inline IR — replace the whole-block
+trampoline with per-instruction emit. The bug may resolve naturally
+once we're not going through the trampoline.
 
-**Parallel compile (per A5 mitigation 1)**: current sweep=64KB
-takes 30s to compile (way over phase-0 5s budget). Can't expand
-sweep without parallelizing. 22 cores available, expect ~10×
-speedup → ~3s for sweep=64KB, ~10s for sweep=256KB.
+## Phase 1 plan
 
-Implementation: per-ROM-page LLVM Module + parallel build via
-std::thread, link into shared engine on main thread.
+**Goal**: inline top-3 most-executed Thumb formats per A7 provisional
+ordering (F1 LSL/LSR/ASR + F3 imm8 + F4 ALU). Each format gets a
+per-instr emit fn that writes inline LLVM IR for the handler body.
+Unsupported formats fall through to a per-instruction trampoline
+call (different from the current per-block trampoline).
 
-### Step 5: phase 0 acceptance test + commit
+**Architecture (per-instruction dispatch)**:
 
-Once 4d gates green:
-- run `bash scripts/aot_measure.sh` (script TBD per V1+V2+V3+V4)
-- coverage > 80% with sweep=512KB+
-- divs == 0 both ROMs
-- |drift| < 1000
-- replay determinism check
+```rust
+// In compile_thumb_block, for each opcode k:
+//   - emit K=2 abort check IR if k odd && k != 0
+//   - decode opcode → format
+//   - if format in {F3 MOV imm8, ...}: emit inline IR
+//   - else: emit aot_thumb_step trampoline call
+//   - check return: if 1 (PipelineFlushed), branch to exit_blk
+// At exit, return 0.
+```
 
-Then phase 0 ships and we move to phase 1: inline F1/F3/F4 IR.
+This is the JIT branch's architecture. Port the relevant patterns
+from `git show shape-opt/apr22:arm7tdmi/src/dynarec.rs`.
+
+**Phase 1 sub-steps**:
+1. arm7tdmi-aot/src/emit/mod.rs scaffold + per-instr architecture.
+2. arm7tdmi-aot/src/diff.rs DiffBus + diff_thumb framework (per A6).
+3. compile_thumb_block refactored to per-instruction dispatch.
+4. Inline F3 MOV imm8 emit fn + diff test.
+5. SDL replay verifies divs == 0 (with trace seeds, if possible).
+6. Inline F1 LSL/LSR/ASR + F3 ADD/SUB/CMP imm8 + F4 ALU.
+7. SDL replay + harness measurement → phase 1 acceptance.
 
 ## Reminder loop
 
-CronCreate scheduled at minutes 7,22,37,52 every hour. Each fire:
-re-read docs/aot-llvm-program.md, re-read this file, continue from
-the resume marker.
+CronCreate scheduled at 7,22,37,52 every hour. Each fire re-reads
+docs/aot-llvm-program.md, this file, continues from resume marker.
 
 ## Recent commits on this branch
 
+- dbc49d8 phase 0d: trace-driven aot entry points
+- c4deab4 phase 0 ACCEPT: harness + measurement
 - 9df4c0e phase 0 step 4c: Bcc-as-Linear + coverage counters
-- 758b0d9 phase 0 scaffold step 4b: placeholder block emit
-- 9dc0326 phase 0 scaffold step 4a: compile_rom plumbing
-- 44411d1 phase 0 scaffold step 3: arm7tdmi AOT hook
-- d2e6164 phase 0 scaffold step 2: scan.rs
-- 762493e phase 0 scaffold step 1: bus + table
-- (audits A0-A8)
+- 758b0d9 phase 0 step 4b: placeholder block emit
+- 9dc0326 phase 0 step 4a: compile_rom plumbing + SDL --aot
+- 44411d1 phase 0 step 3: arm7tdmi AOT hook
+- d2e6164 phase 0 step 2: scan.rs
+- 762493e phase 0 step 1: bus + table
+- (audits A0-A8 across 3 batches)
