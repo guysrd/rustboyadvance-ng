@@ -259,6 +259,34 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // time IS `fetch_addr` (= exec_addr + 4). After AdvancePC
         // scalar advances pc by 2 → exec_addr + 6 = fetch_addr + 2.
         self.pc = fetch_addr;
+
+        // Phase-1 Rust-level inline fast paths: skip THUMB_LUT + indirect
+        // handler call for opcodes the AOT path explicitly knows how to
+        // execute. Saves ~3-5ns per inlined instr (one indirect call).
+        // Each fast path is bit-exact with the corresponding scalar
+        // handler in arm7tdmi/src/thumb/exec.rs (verified by SDL replay
+        // diff). Add formats here as their bit-exact equivalent is
+        // ported.
+        let top5 = (insn >> 11) & 0x1F;
+        if top5 == 0b00100 {
+            // F3 MOV Rd, #imm8 — bits 15:11 = 0b00100.
+            // Encoding: 001_00_RRR_IIIIIIII.
+            // Effect: gpr[Rd] = imm8 (zero-extended).
+            //   N = 0 (imm8 fits in 8 bits, sign bit clear).
+            //   Z = (imm8 == 0).
+            //   C, V unchanged.
+            //   AdvancePC(Seq).
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let imm = (insn & 0xff) as u32;
+            self.gpr[rd] = imm;
+            self.cpsr.set_N(false);
+            self.cpsr.set_Z(imm == 0);
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // Fallback: LUT + handler dispatch (unsupported format).
         let thumb_info = &Self::THUMB_LUT[((insn >> 6) as usize) & 0x3FF];
         match (thumb_info.handler_fn)(self, insn as u16) {
             CpuAction::AdvancePC(next_access) => {
