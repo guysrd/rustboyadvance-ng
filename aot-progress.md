@@ -57,6 +57,15 @@ inline IR was a fps regression, default per-instr is preserved.
 AOT_INLINE_F3=1 to opt in (for correctness verification + further
 iteration).
 
+**Latest measurement (2026-04-26 post dead-code cleanup):**
+- sweep=0 baseline: 0/0 divs both ROMs, score=+2 (noise).
+- sweep=64KB whole-block: PE 521.2 / scalar 565.4 = -7.8% gap;
+  MK 403.5 / scalar 406.5 = -0.7% gap (near-equal). 0/1 divs gate.
+- score=-47 at sweep=64KB.
+
+The PE gap at high coverage is the main concern. MK is essentially
+parity since AOT coverage is only 1.16% there (ARM-heavy code).
+
 Open observations:
 - `compile_rom_with_seeds_step_offsets` at sweep=64KB takes ~70-76s
   to compile via LLVM JIT (regardless of phase-4 changes). LLVM is
