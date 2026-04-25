@@ -27,6 +27,10 @@ debugger = ["rustboyadvance-core/debugger"]
 # real ROMs.
 cached_interp = ["rustboyadvance-core/cached_interp"]
 dynarec = ["rustboyadvance-core/dynarec"]
+# LLVM-via-inkwell JIT backend, in migration. Currently not wired
+# into the dispatch path — feature just pulls the dep so SDL builds
+# end-to-end. Build env needs LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
+dynarec_llvm = ["rustboyadvance-core/dynarec_llvm"]
 # Per-shape execution-count profiler, gated through to the arm7tdmi
 # crate. When on, the SDL frontend dumps the counter table at replay
 # exit so the measure harness can retrain `W_*` weights from real

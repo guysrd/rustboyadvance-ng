@@ -65,6 +65,9 @@ cached_interp = ["arm7tdmi/cached_interp"]
 # Enables Cranelift-backed dynarec on the CPU's block cache. Implies
 # cached_interp (which provides the block cache scaffolding).
 dynarec = ["arm7tdmi/dynarec", "cached_interp"]
+# LLVM-via-inkwell JIT backend, side-by-side with Cranelift during the
+# migration. cached_interp stays as the always-on scalar fallback.
+dynarec_llvm = ["arm7tdmi/dynarec_llvm", "cached_interp"]
 # Per-shape execution-count profiler. Implies `dynarec` (the counter
 # only makes sense when there are compiled blocks to classify). No-op
 # on the default build. Drives weighted_cycles retraining for the
