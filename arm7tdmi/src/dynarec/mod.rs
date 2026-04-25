@@ -168,6 +168,21 @@ pub mod trampolines {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.load_32(addr, MemoryAccess::Seq)
     }
+    /// Plain 16-bit fetch trampolines without the +1I idle of the
+    /// `load_with_idle_16` LDR variant. Used by the inlined per-iter
+    /// fetch path: codegen calls one of these directly (statically
+    /// chosen by the per-iter access hint) and emits the pipeline-
+    /// shift + pc-advance as Cranelift IR. Avoids the wrapper-
+    /// trampoline (`thumb_fetch_charge_shift`) call boundary on the
+    /// hot path.
+    pub unsafe extern "C" fn load_16<I: MemoryInterface>(ctx: *mut u8, addr: u32) -> u32 {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.load_16(addr, MemoryAccess::NonSeq) as u32
+    }
+    pub unsafe extern "C" fn load_16_seq<I: MemoryInterface>(ctx: *mut u8, addr: u32) -> u32 {
+        let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
+        cpu.load_16(addr, MemoryAccess::Seq) as u32
+    }
     pub unsafe extern "C" fn store_32_seq<I: MemoryInterface>(ctx: *mut u8, addr: u32, value: u32) {
         let cpu = unsafe { &mut *(ctx as *mut Arm7tdmiCore<I>) };
         cpu.store_32(addr, value, MemoryAccess::Seq);
@@ -475,6 +490,8 @@ pub mod trampolines {
             store_8: store_8::<I>,
             load_32_seq: load_32_seq::<I>,
             store_32_seq: store_32_seq::<I>,
+            load_16: load_16::<I>,
+            load_16_seq: load_16_seq::<I>,
             store_16: store_16::<I>,
             load_with_idle_16: load_with_idle_16::<I>,
             load_with_idle_sh: load_with_idle_sh::<I>,
@@ -493,6 +510,8 @@ pub mod trampolines {
                 Arm7tdmiCore<I>,
                 next_fetch_access
             ) as u32,
+            pipeline_offset: std::mem::offset_of!(Arm7tdmiCore<I>, pipeline) as u32,
+            pc_offset: std::mem::offset_of!(Arm7tdmiCore<I>, pc) as u32,
         }
     }
 }
@@ -511,6 +530,13 @@ pub struct BusTrampolines {
     /// NonSeq variants; internal trampoline switches access mode.
     pub load_32_seq: BusLoad32Fn,
     pub store_32_seq: BusStore32Fn,
+    /// 16-bit fetch trampolines for the inlined per-iter Thumb fetch
+    /// path. Same `(*mut u8, u32) -> u32` shape as `load_32`; codegen
+    /// chooses NonSeq vs Seq statically by the per-iter access hint
+    /// and the wrapper trampoline (`thumb_fetch_charge_shift`) is
+    /// only invoked on the first iter when hint=2 (read state).
+    pub load_16: BusLoad32Fn,
+    pub load_16_seq: BusLoad32Fn,
     /// 16-bit halfword access for Thumb format 10 LDRH / STRH imm.
     pub store_16: BusStore32Fn,
     pub load_with_idle_16: BusLoadIdle32Fn,
@@ -553,6 +579,12 @@ pub struct BusTrampolines {
     /// uses this to emit a direct `store I8` for the per-iter access
     /// hint update, avoiding the extern-C trampoline call cost.
     pub next_fetch_access_offset: u32,
+    /// Byte offset of `Arm7tdmiCore<I>.pipeline`. Used by the inlined
+    /// per-iter fetch path to emit pipeline shift as IR stores.
+    pub pipeline_offset: u32,
+    /// Byte offset of `Arm7tdmiCore<I>.pc`. Inlined fetch sets pc
+    /// directly post-shift.
+    pub pc_offset: u32,
 }
 
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
@@ -583,6 +615,13 @@ pub struct DynarecCompiler {
 #[derive(Clone, Copy, Default)]
 struct CpuFieldOffsets {
     next_fetch_access: u32,
+    /// Offset of `pipeline: [u32; 2]`. Inlined fetch path stores the
+    /// loaded instruction word into `pipeline[1]` and shifts
+    /// `pipeline[0] = pipeline[1]_old` directly via Cranelift IR.
+    pipeline: u32,
+    /// Offset of `pc: u32`. Inlined fetch sets `pc = addr + 2` (Thumb)
+    /// or `pc = addr + 4` (ARM) post-shift.
+    pc: u32,
 }
 
 /// Imported function handles registered with the JITModule for the bus
@@ -600,6 +639,8 @@ struct BusImports {
     store_8: FuncId,
     load_32_seq: FuncId,
     store_32_seq: FuncId,
+    load_16: FuncId,
+    load_16_seq: FuncId,
     store_16: FuncId,
     load_with_idle_16: FuncId,
     load_with_idle_sh: FuncId,
@@ -663,6 +704,8 @@ impl DynarecCompiler {
             jit_builder.symbol("rba_bus_store_8",            b.store_8              as *const u8);
             jit_builder.symbol("rba_bus_load_32_seq",        b.load_32_seq          as *const u8);
             jit_builder.symbol("rba_bus_store_32_seq",       b.store_32_seq         as *const u8);
+            jit_builder.symbol("rba_bus_load_16",            b.load_16              as *const u8);
+            jit_builder.symbol("rba_bus_load_16_seq",        b.load_16_seq          as *const u8);
             jit_builder.symbol("rba_bus_store_16",           b.store_16             as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_16",  b.load_with_idle_16    as *const u8);
             jit_builder.symbol("rba_bus_load_with_idle_sh",  b.load_with_idle_sh    as *const u8);
@@ -690,6 +733,8 @@ impl DynarecCompiler {
             .as_ref()
             .map(|b| CpuFieldOffsets {
                 next_fetch_access: b.next_fetch_access_offset,
+                pipeline: b.pipeline_offset,
+                pc: b.pc_offset,
             })
             .unwrap_or_default();
 
@@ -748,6 +793,15 @@ impl DynarecCompiler {
             let store_32_seq = module
                 .declare_function("rba_bus_store_32_seq", Linkage::Import, &sig_store_32)
                 .expect("declare store_32_seq failed");
+            // bus_load_16 / bus_load_16_seq: plain 16-bit fetches
+            // (no +1I), same signature as load_32. Used by the inlined
+            // per-iter Thumb fetch path.
+            let load_16 = module
+                .declare_function("rba_bus_load_16", Linkage::Import, &sig_load_32)
+                .expect("declare load_16 failed");
+            let load_16_seq = module
+                .declare_function("rba_bus_load_16_seq", Linkage::Import, &sig_load_32)
+                .expect("declare load_16_seq failed");
 
             // 16-bit halfword access (Thumb format 10 LDRH/STRH imm)
             let store_16 = module
@@ -863,6 +917,8 @@ impl DynarecCompiler {
                 store_8,
                 load_32_seq,
                 store_32_seq,
+                load_16,
+                load_16_seq,
                 store_16,
                 load_with_idle_16,
                 load_with_idle_sh,
@@ -2769,6 +2825,16 @@ impl DynarecCompiler {
             let set_access_ref = self
                 .module
                 .declare_func_in_func(imports.set_next_fetch_access, builder.func);
+            // Inlined fetch-fast-path uses these directly so Cranelift
+            // can statically pick load_16 (NonSeq) vs load_16_seq (Seq)
+            // at codegen time per the per-iter access hint, dropping
+            // the wrapper trampoline call boundary.
+            let load_16_ref = self
+                .module
+                .declare_func_in_func(imports.load_16, builder.func);
+            let load_16_seq_ref = self
+                .module
+                .declare_func_in_func(imports.load_16_seq, builder.func);
             let _ = abort_mid_ref; // unused in per-iter path
 
             // Helper: AdvancePC access hint for a body item (0=NonSeq, 1=Seq).
@@ -2802,19 +2868,75 @@ impl DynarecCompiler {
                     _ => 1,
                 }
             }
-            // Helper: emit fetch_charge_shift for a specific iter.
+            // Helper: emit per-iter Thumb fetch.
             // `prev_access_hint` = 2 for iter 0 (read cpu.next_fetch_access);
             // else 0/1 from previous body's AdvancePC return.
+            //
+            // Fast path (hint=0/1, offsets known): bypass the
+            // `thumb_fetch_charge_shift` wrapper trampoline. Call the
+            // smaller `bus_load_16` / `bus_load_16_seq` directly,
+            // emit `pipeline[0] = pipeline[1]; pipeline[1] = val;
+            // pc = addr + 2` as IR. One cross-boundary call eliminated
+            // per fetch — biggest single perf lever of this session.
+            //
+            // Fallback (hint=2 or offsets=0): keep the wrapper
+            // trampoline. Hint=2 reads cpu.next_fetch_access at
+            // runtime, used only for iter 0 of each block where the
+            // wrapper's runtime branch is cheaper than emitting the
+            // same branch in IR. Offsets=0 means tests that pass a
+            // TestBus instead of an Arm7tdmiCore — direct stores
+            // would clobber test memory.
+            let pipeline_offset = self.cpu_offsets.pipeline;
+            let pc_offset = self.cpu_offsets.pc;
+            let inline_fetch_ok = pipeline_offset != 0 && pc_offset != 0;
             let emit_fetch_iter =
                 |builder: &mut FunctionBuilder, iter: usize, prev_access_hint: u32| {
                     let addr = entry_pc
                         .wrapping_add(4)
                         .wrapping_add((2 * iter) as u32);
                     let addr_val = builder.ins().iconst(types::I32, addr as i64);
-                    let hint_val = builder.ins().iconst(types::I32, prev_access_hint as i64);
-                    builder
-                        .ins()
-                        .call(fetch_cs_ref, &[cpu_ctx, addr_val, hint_val]);
+                    if inline_fetch_ok && prev_access_hint <= 1 {
+                        let load_ref = if prev_access_hint == 0 {
+                            load_16_ref
+                        } else {
+                            load_16_seq_ref
+                        };
+                        let call = builder.ins().call(load_ref, &[cpu_ctx, addr_val]);
+                        let val = builder.inst_results(call)[0];
+                        // pipeline[0] = pipeline[1] (shift)
+                        let p1 = builder.ins().load(
+                            types::I32,
+                            MemFlags::trusted(),
+                            cpu_ctx,
+                            Offset32::new(pipeline_offset.wrapping_add(4) as i32),
+                        );
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            p1,
+                            cpu_ctx,
+                            Offset32::new(pipeline_offset as i32),
+                        );
+                        // pipeline[1] = fetched val
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            val,
+                            cpu_ctx,
+                            Offset32::new(pipeline_offset.wrapping_add(4) as i32),
+                        );
+                        // pc = addr + 2 (Thumb pipeline-head advance)
+                        let new_pc = builder.ins().iadd_imm(addr_val, 2);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            new_pc,
+                            cpu_ctx,
+                            Offset32::new(pc_offset as i32),
+                        );
+                    } else {
+                        let hint_val = builder.ins().iconst(types::I32, prev_access_hint as i64);
+                        builder
+                            .ins()
+                            .call(fetch_cs_ref, &[cpu_ctx, addr_val, hint_val]);
+                    }
                 };
             // Inline `cpu.next_fetch_access = hint` as a direct I8 store
             // into `cpu_ctx + offset`, avoiding the extern-C trampoline
@@ -6572,17 +6694,21 @@ mod tests {
             abort_mid_block: test_abort_mid_block,
             load_32_seq: test_load_32,
             store_32_seq: test_store_32,
+            load_16: test_load_32,
+            load_16_seq: test_load_32,
             store_16: test_store_32,
             load_with_idle_16: test_load_with_idle_32,
             load_with_idle_sh: test_load_with_idle_32,
             thumb_fetch_charge_shift: test_thumb_fetch_charge_shift,
             arm_fetch_charge_shift: test_thumb_fetch_charge_shift,
             set_next_fetch_access: test_set_next_fetch_access,
-            // Tests don't use a real Arm7tdmiCore, so the inlined-store
-            // codegen would clobber random TestBus memory. Tests pass
-            // chain_slot=None which gates the inlined store off; this
-            // value is unread under that path. Set to 0 defensively.
+            // Tests don't use a real Arm7tdmiCore, so the inlined
+            // codegen paths (set_next_fetch_access, fetch wrapper)
+            // would clobber random TestBus memory. Codegen falls back
+            // to the trampoline calls when these are 0.
             next_fetch_access_offset: 0,
+            pipeline_offset: 0,
+            pc_offset: 0,
         }
     }
 
