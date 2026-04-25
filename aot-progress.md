@@ -93,7 +93,8 @@ that phase 4+ builds on.
 ## Phase 1b/1c/2/5 (rust-inline) — incremental accept
 
 `aot_thumb_step` in arm7tdmi/src/cpu.rs now has Rust-level inline
-fast paths for 13 Thumb formats:
+fast paths for 17 Thumb formats — every format that goes through
+the per-iter dispatch path:
 - F1 MoveShiftedReg LSL/LSR/ASR Rd, Rs, #imm5
 - F2 AddSub ADD/SUB Rd, Rs, Rn or #imm3
 - F3 DataProcessImm MOV/CMP/ADD/SUB Rd, #imm8
@@ -107,10 +108,15 @@ fast paths for 13 Thumb formats:
 - F11 LdrStrSp LDR/STR sp-relative word
 - F12 LoadAddress ADD Rd, [PC|SP], #imm8
 - F13 AddSp ADD/SUB SP, #imm7<<2
+- F14 PushPop PUSH/POP {rlist, +LR/PC}
+- F15 LdmStm LDMIA/STMIA Rb!, {rlist} (incl. empty-rlist GBATEK quirk)
+- F16 Bcc (taken/not-taken paths; SWI/undef fall to LUT)
+- F19 hi (linear half of BL pair)
 
-Missing (deferred): F14 PUSH/POP, F15 LDM/STM (variable-len reg list).
-F16 Bcc, F18 B, F19 BL pair are block terminators handled by the AOT
-emit, not by aot_thumb_step.
+Block terminators handled by the AOT emit (not by aot_thumb_step):
+F17 SWI, F18 B unconditional, F19 lo.
+
+THUMB_LUT fallback in aot_thumb_step now only fires for SWI / undef.
 
 Each is bit-exact with its scalar handler — same alu helpers, same
 idle_cycle calls, same PipelineFlushed/AdvancePC semantics, same
@@ -175,6 +181,10 @@ regression.
 
 ## Recent commits on this branch
 
+- c6443dd phase 1: f15 ldm/stm inline (incl. empty-rlist gbatek quirk)
+- 389fe26 phase 1: f14 push/pop inline
+- d765aa4 phase 1: f16 bcc + f19 hi inline
+- 56d1877 phase 1 ACCEPTED: 13 thumb formats inlined + at-scale divs fix
 - 82d4170 fix: re-enable inter-block abort after aot dispatch — kills at-scale divs ★
 - 5be090f aot-progress: f8 inline + sweep coverage discontinuity note
 - 21b0003 phase 5: inline f8 strh/ldrh/ldsb/ldsh reg-offset
