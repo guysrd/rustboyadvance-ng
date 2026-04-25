@@ -470,6 +470,22 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             return 0; // AdvancePC
         }
 
+        // F6 LDR PC-relative (load from literal pool) — raw & 0xf800 == 0x4800.
+        // Encoding: 01001_DDD_IIIIIIII (Rd, word8 = imm << 2).
+        // Mirrors thumb/exec.rs::exec_thumb_ldr_pc which uses (pc & !3) + ofs
+        // where pc is pipeline-head (= exec_addr + 4).
+        if (insn & 0xf800) == 0x4800 {
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let imm = ((insn & 0xff) << 2) as u32;
+            let addr = (self.pc & !3).wrapping_add(imm);
+            self.gpr[rd] = self.ldr_word(addr, MemoryAccess::NonSeq);
+            self.idle_cycle();
+            // F6 returns AdvancePC(NonSeq), not Seq.
+            self.next_fetch_access = MemoryAccess::NonSeq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
         // F12 LoadAddress (ADD Rd, [PC|SP], #imm8) — raw & 0xf000 == 0xa000.
         // Encoding: 1010_S_DDD_IIIIIIII; S=bit 11 (1 → SP, 0 → PC).
         // Mirrors thumb/exec.rs::exec_thumb_load_address.
