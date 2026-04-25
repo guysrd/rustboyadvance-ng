@@ -5,92 +5,96 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**Currently in:** phase 1 (per-format inline IR).
-**Next deliverable:** start phase 1 codegen — refactor `compile_thumb_block`
-to dispatch per-opcode (one inline-IR sequence OR one trampoline
-call per opcode) instead of one trampoline call per block. Then
-implement inline emit for F3 MOV imm8 as the first format. Diff
-test (per A6) verifies bit-exact match with scalar handler.
+**Currently in:** phase 1 (per-format inline IR) — phase 1a done
+but has a divergence bug at scale; phase 1b (inline F3 MOV imm8)
+blocked on debugging the scale issue.
+
+**Next deliverable:** debug the per-instr emit divs-at-scale bug.
+Likely options:
+1. Emit ALL blocks into ONE shared LLVM module (vs one-per-block).
+2. Use the A8 dump-ir flag on a divergent block to see the IR.
+3. Compare phase-1 emit vs phase-0 whole-block on a single test
+   block — they should produce semantically identical state.
+
+Once the bug is fixed, phase 1b inlines F3 MOV imm8 (replaces a step
+trampoline call with direct gpr write + cpsr update IR for that
+opcode).
 
 ## Phase 0 — ACCEPTED ✓
 
 Per `scripts/aot_measure.sh` at default sweep=0:
 - PE: divs=0, drift=0, determinism=1, fps_aot=541.9 vs scalar=545.6
 - MK: divs=0, drift=0, determinism=1, fps_aot=387.5 vs scalar=390.1
-- diff_failures=0
-- aot_score=-6 (within noise)
+- diff_failures=0, aot_score=-6 (within noise)
 
-Coverage 0% by default — AOT path is plumbed and dispatched on every
-block boundary, just doesn't have any blocks to find (the placeholder
-trampoline whole-block emit is correctness-fragile at scale; needs
-per-instruction emit which is phase 1).
+Coverage 0% by default — the trampoline-mode whole-block emit is
+correctness-fragile at scale, so default sweep=0 ships clean.
 
-`results.tsv` row `cac3181` records the accept.
+## Phase 1a — partial
 
-## Trace-driven entry points (commit dbc49d8) — works but exposes trampoline bug
+Architecture (commit 634aa1f):
+- `arm7tdmi-aot::replay::aot_thumb_step_for<I>` per-iter trampoline
+- `arm7tdmi-aot::replay::aot_block_should_abort_thumb_for<I>` K=2
+  abort check trampoline
+- `LlvmCompiler::register_step_thumb` registers them
+- `LlvmCompiler::emit_per_instr_thumb_block` emits LLVM IR with one
+  step call per opcode + abort check at K=2 cadence
+- `compile_rom_with_seeds_and_step` variant takes step+abort fns
+- SDL `AOT_USE_PER_INSTR=1` env var toggles between phase-0
+  whole-block (default) and phase-1 per-instr
 
-`--aot-trace-out PATH` dumps every recorded ROM block PC at replay
-end. `--aot-trace-in PATH` reads them as scan seeds.
+Empirical results:
+- PE sweep<=2KB phase-1: 0 divs ✓ (small scale works)
+- PE sweep=4KB phase-1: 36 divs (regression)
+- PE sweep=8KB phase-1: 36 divs
+- PE sweep=64KB phase-1: 89 divs
+- PE trace-in (24052 entries) phase-1: 255 divs (every frame)
 
-Generated:
-- /tmp/pe_trace.txt: 24052 PE block PCs.
-- /tmp/mk_trace.txt: 21565 MK block PCs.
+Tried fixes (didn't help):
+- Per-module unique extern names (commit 74b3e15) — didn't fix divs.
+- Disabled abort check — got WORSE (152 divs); confirms abort path
+  isn't the bug source.
 
-With PE seeded: 31764 thumb blocks compiled in 28s, 74.48% coverage,
-**but 32 divs vs scalar**. Same kind of bug that surfaces with
-sweep>=25KB on MK. The trampoline-mode placeholder has subtle
-correctness issues with real game blocks at scale. Cycle drift
-starts at frame 180 (line 3 of hashes) with +68 cycles drift.
+Bug is structurally in the multi-extern-call emit path. The
+trampoline `aot_thumb_step_for` delegates to `cpu.aot_thumb_step`
+which is the same code the whole-block trampoline calls in its
+loop — so the per-call SEMANTICS should match. But empirically
+many sequential extern calls from LLVM IR produce divergent state.
 
-The fix is phase 1's per-format inline IR — replace the whole-block
-trampoline with per-instruction emit. The bug may resolve naturally
-once we're not going through the trampoline.
+Hypothesis: LLVM JIT engine's symbol/state management bug at
+scale, OR a calling-convention issue, OR a memory aliasing
+inference issue.
 
-## Phase 1 plan
+## Pending
 
-**Goal**: inline top-3 most-executed Thumb formats per A7 provisional
-ordering (F1 LSL/LSR/ASR + F3 imm8 + F4 ALU). Each format gets a
-per-instr emit fn that writes inline LLVM IR for the handler body.
-Unsupported formats fall through to a per-instruction trampoline
-call (different from the current per-block trampoline).
+### Debug phase 1a divergence (next)
 
-**Architecture (per-instruction dispatch)**:
+Steps:
+1. Pick one divergent block. Use `--dump-ir <pc>` (per A8) to see
+   what LLVM emitted. Compare against expected pattern.
+2. Use `--dump-asm <pc>` to see native instructions.
+3. Try emitting all blocks into one shared module (avoids
+   per-module-state issues).
 
-```rust
-// In compile_thumb_block, for each opcode k:
-//   - emit K=2 abort check IR if k odd && k != 0
-//   - decode opcode → format
-//   - if format in {F3 MOV imm8, ...}: emit inline IR
-//   - else: emit aot_thumb_step trampoline call
-//   - check return: if 1 (PipelineFlushed), branch to exit_blk
-// At exit, return 0.
-```
+### Phase 1b: inline F3 MOV imm8
 
-This is the JIT branch's architecture. Port the relevant patterns
-from `git show shape-opt/apr22:arm7tdmi/src/dynarec.rs`.
-
-**Phase 1 sub-steps**:
-1. arm7tdmi-aot/src/emit/mod.rs scaffold + per-instr architecture.
-2. arm7tdmi-aot/src/diff.rs DiffBus + diff_thumb framework (per A6).
-3. compile_thumb_block refactored to per-instruction dispatch.
-4. Inline F3 MOV imm8 emit fn + diff test.
-5. SDL replay verifies divs == 0 (with trace seeds, if possible).
-6. Inline F1 LSL/LSR/ASR + F3 ADD/SUB/CMP imm8 + F4 ALU.
-7. SDL replay + harness measurement → phase 1 acceptance.
+After 1a is debugged, replace the step trampoline call for F3
+MOV imm8 opcodes with direct LLVM IR (gpr[rd] = imm8 + flag
+update). Diff test per A6.
 
 ## Reminder loop
 
-CronCreate scheduled at 7,22,37,52 every hour. Each fire re-reads
-docs/aot-llvm-program.md, this file, continues from resume marker.
+CronCreate `c1a9dd9e` at minutes 7,22,37,52 every hour. Each fire:
+re-read docs/aot-llvm-program.md, this file, continue from resume
+marker.
 
 ## Recent commits on this branch
 
+- 74b3e15 phase 1a debug: per-module unique extern names (didnt fix)
+- 634aa1f phase 1a: per-instr dispatch architecture (gated)
 - dbc49d8 phase 0d: trace-driven aot entry points
 - c4deab4 phase 0 ACCEPT: harness + measurement
 - 9df4c0e phase 0 step 4c: Bcc-as-Linear + coverage counters
 - 758b0d9 phase 0 step 4b: placeholder block emit
-- 9dc0326 phase 0 step 4a: compile_rom plumbing + SDL --aot
-- 44411d1 phase 0 step 3: arm7tdmi AOT hook
-- d2e6164 phase 0 step 2: scan.rs
-- 762493e phase 0 step 1: bus + table
+- 9dc0326 phase 0 step 4a: compile_rom plumbing
 - (audits A0-A8 across 3 batches)
