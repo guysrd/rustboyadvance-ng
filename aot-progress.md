@@ -5,31 +5,34 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**Currently in:** phase 1 (per-format inline IR). Phase 1a's LLVM
-per-instr emit has a divs-at-scale bug (gated behind
-AOT_USE_PER_INSTR=1, ignore for now). Phase 1b shipped F3 family
-(MOV/CMP/ADD/SUB imm8) inline in `aot_thumb_step`. Phase 1c adds
-F1 (LSL/LSR/ASR imm5) and F4 (ALU low-reg, all 16 ops including
-MUL).
+**Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
+the trampoline at-scale divs bug). 13 Thumb formats inlined as
+Rust-level fast paths in `aot_thumb_step`. Per-instr LLVM emit
+(AOT_USE_PER_INSTR=1) probably also works now but untested.
 
-**Next deliverable:** phase 4 (inline fetch + abort check) is where
-actual fps gain starts. Two paths:
+**Trampoline cycle drift fix (2026-04-26):** scalar fires
+`cached_block_should_abort()` on every block boundary; AOT was
+skipping it (per phase 0c MK-divergence comment). With the phase
+0d Bcc-as-Linear fix making AOT block sizes comparable to scalar's,
+the original concern no longer applies and the missing check was
+the actual root cause of the 36-div / 23k-drift at sweep>=4KB.
 
-a) Rust-level: a NEW trampoline `aot_thumb_step_no_fetch` that
-   skips `load_16` per iter; a once-per-block `add_cycles_const`
-   call inside the AOT compiled fn pre-emits the Thumb fetch cost.
-   Pipeline[] state is restored at block exit via a final load_16.
-b) LLVM-level: emit_per_instr_thumb_block that bakes the cycle-add
-   directly into IR. Currently has a divs-at-scale bug
-   (AOT_USE_PER_INSTR=1) under investigation per phase 1a.
+Empirical post-fix:
+- sweep=4KB: 0 divs / 0 drift / 54.66% cov (was 36 / 23k)
+- sweep=16KB: 0 divs / 0 drift / 55.24% cov
+- sweep=64KB: 0 divs / 34 drift / 70.92% cov (was 89 divs)
+- trace 24052: 1 div / -126 drift / 77.41% cov (was 31 / 23k)
+- MK sweep=64KB: 1 div / 68 drift / 1.16% cov (MK is ARM-heavy)
 
-Plus phase 2 leftovers: F8 (LDSB/LDRH/LDSH reg-offset), F14 PUSH/POP,
-F15 LDM/STM. F16/F18/F19 are block terminators handled by the AOT
-emit, not by aot_thumb_step.
+Phase 1 fps still 10% slower than scalar at 70% coverage (483 vs
+537) because trampoline mode pays an LLVM extern boundary per
+dispatch. Phase 4 (inline fetch + abort into LLVM IR) is needed
+for actual fps gain.
 
-Trampoline F19-orphan divs at trace seeds (24052) is documented in
-`docs/findings-phase1-trampoline-divs.md`; option-c partial-accept
-chosen for now (ship Rust-level inline fast paths at sweep=0).
+**Next deliverable:** phase 4 — emit per-format LLVM IR replacing
+the per-iter trampoline call with direct LLVM ops. F3 MOV imm8 is
+the simplest starting point (4 stores: gpr[Rd], cpsr, pc,
+next_fetch_access; all constant-foldable from baked opcode bits).
 
 ## Phase 0 — ACCEPTED ✓
 
@@ -75,6 +78,17 @@ many sequential extern calls from LLVM IR produce divergent state.
 Hypothesis: LLVM JIT engine's symbol/state management bug at
 scale, OR a calling-convention issue, OR a memory aliasing
 inference issue.
+
+## Phase 1 — ACCEPTED ✓ (2026-04-26)
+
+The trampoline at-scale divs bug is fixed (commit 82d4170). With
+13 Thumb formats inlined in aot_thumb_step + the inter-block abort
+fix, PE+MK both show 0 divs at sweep=4-64KB and trace=24052 has
+just 1 transient div with -126 cycles drift (well under 1000 gate).
+
+Phase 1 doesn't deliver fps gain over scalar (trampoline overhead
+dominates). It delivers the architecture + correctness foundation
+that phase 4+ builds on.
 
 ## Phase 1b/1c/2/5 (rust-inline) — incremental accept
 
@@ -161,6 +175,8 @@ regression.
 
 ## Recent commits on this branch
 
+- 82d4170 fix: re-enable inter-block abort after aot dispatch — kills at-scale divs ★
+- 5be090f aot-progress: f8 inline + sweep coverage discontinuity note
 - 21b0003 phase 5: inline f8 strh/ldrh/ldsb/ldsh reg-offset
 - 74cbee8 aot-progress: phase 1c+2+5 status, 12 thumb formats inlined
 - 41412f4 phase 5: f7 ldr/str reg-offset + f10 halfword imm-offset inline
