@@ -1125,18 +1125,24 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 if !can_chain {
                     return;
                 }
-                // No inter-block abort check after AOT dispatch.
-                // AOT scan splits at every Bcc / direct branch /
-                // exception, producing many small blocks. Adding the
-                // dispatcher's `cached_block_should_abort` here would
-                // fire it MORE frequently than scalar's cadence
-                // (scalar's blocks are larger because they're traced
-                // along the actually-executed path). The frequency
-                // mismatch caused MK divergence on a multi-hour
-                // soak — see `findings-phase0c-abort-cadence.md`.
-                // The K=2 intra-block check inside the NEXT AOT
-                // block (or scalar block) still services pending
-                // IRQs / scheduler events with bounded latency.
+                // Inter-block abort check (matches scalar's
+                // replay_cached_block exit). Without this, AOT
+                // accumulates ~0.0001 cycles drift per dispatch
+                // because scalar yields to the outer loop on every
+                // block boundary while AOT chains blindly to the next
+                // block — IRQs/DMA events fire ~1 instr late on AOT
+                // vs scalar. Bisected to seed 0x080008ca (a hot 7-instr
+                // loop); 18950 cycles drift over the PE replay with
+                // just that seed enabled.
+                //
+                // Phase 0c worried this would fire too often vs scalar
+                // because AOT's scan splits at Bcc-as-Branch making
+                // smaller blocks. Phase 0d's Bcc-as-Linear fix made
+                // AOT's blocks comparable to scalar's recorded blocks,
+                // so the cadence concern no longer applies.
+                if self.bus.cached_block_should_abort() {
+                    return;
+                }
                 continue;
             }
             #[cfg(feature = "aot_dispatch")]

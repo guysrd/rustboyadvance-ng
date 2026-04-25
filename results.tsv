@@ -8,3 +8,4 @@ phase5-f6-pre	-6	544.9	545.9	389.4	394.3	0	0	0	0.0	0	0	0	accept	phase 5 f6 ldr p
 phase5-f9f11	-3	548.5	551.3	394.6	394.7	0	0	0	0.0	0	0	0	accept	phase 5: f9 ldr/str imm-offset + f11 ldr/str sp-rel inline
 phase5-f7f10	-8	538.5	544.8	388.0	389.7	0	0	0	0.0	0	0	0	accept	phase 5: f7 ldr/str reg-offset + f10 ldrh/strh imm-offset inline
 phase5-f8	-6	549.4	554.4	396.1	396.7	0	0	0	0.0	0	0	0	accept	phase 5: f8 ldr/str sign-extended halfword reg-offset inline
+trampoline-fix	-8	532.4	537.3	383.1	386.1	0	0	0	0.0	0	0	0	accept	trampoline cycle drift fix: re-enable inter-block abort check after AOT dispatch (sweep=4-64KB now 0 divs; full trace 24052 → 1 div from 31)
