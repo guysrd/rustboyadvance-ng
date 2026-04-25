@@ -17,7 +17,7 @@ use super::reg_string;
 use super::{Addr, CpuMode, CpuState, arm::ArmCond, psr::RegPSR};
 
 use super::memory::{MemoryAccess, MemoryInterface};
-use super::registers_consts::{REG_PC, REG_SP};
+use super::registers_consts::{REG_LR, REG_PC, REG_SP};
 use MemoryAccess::*;
 
 use cfg_if::cfg_if;
@@ -669,6 +669,47 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             self.next_fetch_access = MemoryAccess::Seq;
             self.pc = fetch_addr.wrapping_add(2);
             return 0; // AdvancePC
+        }
+
+        // F16 Bcc — raw & 0xf000 == 0xd000.
+        // Encoding: 1101_CCCC_IIIIIIII where CCCC=cond, IIIIIIII signed imm8.
+        // SWI (cond=0xF) and undefined (cond=0xE) handled via LUT below.
+        // Mirrors thumb/exec.rs::exec_thumb_branch_with_cond.
+        if (insn & 0xf000) == 0xd000 {
+            let cond = ((insn >> 8) & 0xf) as u8;
+            if cond < 0xe {
+                let cond_enum = match num::FromPrimitive::from_u8(cond) {
+                    Some(c) => c,
+                    None => unsafe { std::hint::unreachable_unchecked() },
+                };
+                if !self.check_arm_cond(cond_enum) {
+                    // Not taken — AdvancePC(Seq).
+                    self.next_fetch_access = MemoryAccess::Seq;
+                    self.pc = fetch_addr.wrapping_add(2);
+                    return 0;
+                }
+                // Taken — same offset math as bcond_offset(): sign-extend
+                // the 8-bit imm to 32 bits then shift left by 1 so it's a
+                // halfword offset.
+                let offset = ((((insn & 0xff) as u32) << 24) as i32) >> 23;
+                self.pc = (self.pc as i32).wrapping_add(offset) as u32;
+                self.reload_pipeline16();
+                return 1; // PipelineFlushed
+            }
+            // SWI / undefined — fall through to LUT.
+        }
+
+        // F19 hi (top5=11110) — Linear part of BL pair. Sets gpr[LR].
+        // Mirrors thumb/exec.rs::exec_thumb_branch_long_with_link<false>.
+        // F19 lo (top5=11111) is the terminator and goes through LUT
+        // for now (handler does reload_pipeline16 + flag setup).
+        if (insn >> 11) == 0b11110 {
+            // off = (insn.offset11() << 21) >> 9 (sign-extend 11-bit to 32-bit then << 12)
+            let off = (((insn & 0x7ff) as u32) << 21) as i32 >> 9;
+            self.gpr[REG_LR] = (self.pc as i32).wrapping_add(off) as u32;
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC(Seq)
         }
 
         // Fallback: LUT + handler dispatch (unsupported format).
