@@ -671,6 +671,75 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             return 0; // AdvancePC
         }
 
+        // F15 LDM/STM — raw & 0xf000 == 0xc000.
+        // Encoding: 1100_L_BBB_RRRRRRRR; L=bit 11 (load), B=Rb (bits 10:8).
+        // Mirrors thumb/exec.rs::exec_thumb_ldm_stm. Always returns
+        // AdvancePC(NonSeq) unless empty-rlist LDM (which flushes pipeline).
+        if (insn & 0xf000) == 0xc000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let rb = ((insn >> 8) & 0x7) as usize;
+            let rlist = (insn & 0xff) as u8;
+            let align_preserve = self.gpr[rb] & 3;
+            let mut addr = self.gpr[rb] & !3;
+            if rlist != 0 {
+                if load {
+                    let mut access = MemoryAccess::NonSeq;
+                    for r in 0..8 {
+                        if (rlist >> r) & 1 != 0 {
+                            let val = self.load_32(addr, access);
+                            access = MemoryAccess::Seq;
+                            addr = addr.wrapping_add(4);
+                            self.gpr[r] = val;
+                        }
+                    }
+                    self.idle_cycle();
+                    if (rlist >> rb) & 1 == 0 {
+                        self.gpr[rb] = addr.wrapping_add(align_preserve);
+                    }
+                } else {
+                    let mut first = true;
+                    let mut access = MemoryAccess::NonSeq;
+                    let count = (rlist.count_ones() as u32).wrapping_sub(1);
+                    for r in 0..8 {
+                        if (rlist >> r) & 1 != 0 {
+                            let v = if r != rb {
+                                self.gpr[r]
+                            } else if first {
+                                addr
+                            } else {
+                                addr.wrapping_add(count.wrapping_mul(4))
+                            };
+                            self.store_32(addr, v, access);
+                            access = MemoryAccess::Seq;
+                            addr = addr.wrapping_add(4);
+                            first = false;
+                        }
+                        // Mirrors scalar's quirky "set rb every iter" pattern.
+                        self.gpr[rb] = addr.wrapping_add(align_preserve);
+                    }
+                }
+            } else {
+                // Empty rlist edge case (GBATEK ARMv4 quirk):
+                // LDM empty: loads PC from addr; STM empty: stores PC+2 at addr.
+                // Both: rb += 0x40.
+                if load {
+                    let val = self.load_32(addr, MemoryAccess::NonSeq);
+                    self.pc = val & !1;
+                    self.reload_pipeline16();
+                    addr = addr.wrapping_add(0x40);
+                    self.gpr[rb] = addr.wrapping_add(align_preserve);
+                    return 1; // PipelineFlushed
+                } else {
+                    self.store_32(addr, self.pc.wrapping_add(2), MemoryAccess::NonSeq);
+                    addr = addr.wrapping_add(0x40);
+                    self.gpr[rb] = addr.wrapping_add(align_preserve);
+                }
+            }
+            self.next_fetch_access = MemoryAccess::NonSeq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC(NonSeq)
+        }
+
         // F14 PUSH/POP — raw & 0xf600 == 0xb400.
         // Encoding: 1011_L_10_R_RRRRRRRR; L=bit 11 (1=POP), R=bit 8 (LR/PC).
         // Mirrors thumb/exec.rs::exec_thumb_push_pop.

@@ -13,3 +13,4 @@ phase1-accept	0	497.9	537.3	388.7	386.1	0	68	0	70.9	0	1	0	accept	PHASE 1 ACCEPT:
 phase1-f16f19hi	0	549.2	548.4	390.8	391.7	-78	0	0	0.0	0	0	0	accept	phase 1 expand: f16 bcc + f19 hi inline
 harness-sw64	-47	499.1	532.2	386.0	399.8	34	68	0	70.9	0	1	0	accept	harness sweep=64KB after trampoline fix: pe -6.2%, mk -3.5%, 0/1 divs (correct but not faster than scalar yet — phase 4 needed)
 phase1-f14	-9	537.0	543.7	383.6	385.8	0	0	0	0.0	0	0	0	accept	phase 1: f14 push/pop inline (16 thumb formats inlined total)
+phase1-f15	-9	530.2	537.4	384.3	386.4	0	0	0	0.0	0	0	0	accept	phase 1: f15 ldm/stm inline (17 thumb formats inlined)
