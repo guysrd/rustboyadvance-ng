@@ -587,6 +587,137 @@ pub struct BusTrampolines {
     pub pc_offset: u32,
 }
 
+/// Per-block cache of GBA general-purpose register values, backed by
+/// Cranelift Variables. Lazily declares + loads on first access; tracks
+/// a dirty bit for flush-on-exit. Lets Cranelift's regalloc keep hot
+/// gprs in host registers across the whole compiled body, eliminating
+/// the per-instruction memory traffic that the old `gpr_ptr`-direct
+/// codegen produced.
+///
+/// Confirmed via emulator-JIT research (Tarmac, Dolphin, melonDS, gpsp)
+/// as the standard mechanism by which dynarecs beat their interpreters.
+/// The `cpsr_var` Variable already gets this treatment — extending the
+/// same trick to gprs is the single biggest expected speedup.
+///
+/// Cache size: 16 entries for R0..R15, even though `cpu.gpr` is only
+/// `[u32; 15]` (R15 lives in `cpu.pc`). The R15 slot must NEVER be
+/// touched via this cache — emit functions read PC via the compile-
+/// time-folded `instr_pc` constant, not via `gpr[15]`.
+struct GprCache {
+    /// Per-register lazy-allocated Cranelift Variable. None = never
+    /// read or written within this block; memory has the canonical
+    /// value and we won't touch it.
+    vars: [Option<Variable>; 16],
+    /// Dirty bit — set on `write`. Flush only stores dirty regs back.
+    dirty: [bool; 16],
+    /// Bisect knob: when true, every read/write emits a direct
+    /// gpr_ptr load/store (no Variable indirection), matching the
+    /// legacy pre-cache codegen exactly. Lets `DYNAREC_DEBUG=no-gpr-cache`
+    /// roll back to old behavior without reverting the refactor.
+    passthrough: bool,
+}
+
+impl GprCache {
+    fn new(passthrough: bool) -> Self {
+        Self {
+            vars: [None; 16],
+            dirty: [false; 16],
+            passthrough,
+        }
+    }
+
+    /// Read `gpr[idx]`. Panics if `idx == 15` — PC is in `cpu.pc`,
+    /// not the gpr array, so reading R15 from gpr_ptr would corrupt
+    /// the next field (cpsr) on real Arm7tdmiCore layout.
+    fn read(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        gpr_ptr: Value,
+        idx: usize,
+    ) -> Value {
+        debug_assert!(idx < 15, "gpr[15] = cpu.pc, not in gpr array");
+        if self.passthrough {
+            return builder.ins().load(
+                types::I32,
+                MemFlags::trusted(),
+                gpr_ptr,
+                Offset32::new((idx * 4) as i32),
+            );
+        }
+        let var = match self.vars[idx] {
+            Some(v) => v,
+            None => {
+                let v = builder.declare_var(types::I32);
+                let val = builder.ins().load(
+                    types::I32,
+                    MemFlags::trusted(),
+                    gpr_ptr,
+                    Offset32::new((idx * 4) as i32),
+                );
+                builder.def_var(v, val);
+                self.vars[idx] = Some(v);
+                v
+            }
+        };
+        builder.use_var(var)
+    }
+
+    /// Write `gpr[idx] = val`. Marks the register dirty for flush.
+    fn write(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        gpr_ptr: Value,
+        idx: usize,
+        val: Value,
+    ) {
+        debug_assert!(idx < 15, "gpr[15] = cpu.pc, not in gpr array");
+        if self.passthrough {
+            builder.ins().store(
+                MemFlags::trusted(),
+                val,
+                gpr_ptr,
+                Offset32::new((idx * 4) as i32),
+            );
+            return;
+        }
+        let var = match self.vars[idx] {
+            Some(v) => v,
+            None => {
+                let v = builder.declare_var(types::I32);
+                self.vars[idx] = Some(v);
+                v
+            }
+        };
+        builder.def_var(var, val);
+        self.dirty[idx] = true;
+    }
+
+    /// Flush all dirty Variables back to `gpr_ptr`. Call before any
+    /// exit point (return, mid-block abort, branch tail) so the
+    /// dispatcher and next block see the latest values. Does NOT
+    /// reset dirty/vars — the IR keeps using them after the flush
+    /// (e.g., chain epilogue still wants the values in regs for the
+    /// tail-call's body to re-read).
+    fn flush(&self, builder: &mut FunctionBuilder, gpr_ptr: Value) {
+        if self.passthrough {
+            return;
+        }
+        for idx in 0..16 {
+            if self.dirty[idx] {
+                if let Some(v) = self.vars[idx] {
+                    let val = builder.use_var(v);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        val,
+                        gpr_ptr,
+                        Offset32::new((idx * 4) as i32),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
 ///
 /// Wrapping the Cranelift state here keeps the module lifetime tied to the

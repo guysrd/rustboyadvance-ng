@@ -281,6 +281,10 @@ struct DynarecDebug {
     /// is gated here for regression bisection while ARM support is
     /// being rolled out.
     pub no_arm_jit: bool,
+    /// If set, GprCache runs in passthrough mode — every read/write
+    /// emits a direct gpr_ptr load/store (legacy behavior). For
+    /// bisecting any regressions caused by the Variable-based caching.
+    pub no_gpr_cache: bool,
     max_len: Option<usize>,
 }
 
@@ -298,6 +302,13 @@ pub(crate) fn dynarec_no_per_iter_fetch() -> bool {
 #[cfg(feature = "dynarec")]
 fn dynarec_no_arm_jit() -> bool {
     dynarec_debug().no_arm_jit
+}
+
+/// Accessor for `no-gpr-cache`. When true, GprCache runs in passthrough
+/// mode (direct gpr_ptr loads/stores, same as pre-cache codegen).
+#[cfg(feature = "dynarec")]
+pub(crate) fn dynarec_no_gpr_cache() -> bool {
+    dynarec_debug().no_gpr_cache
 }
 
 #[cfg(feature = "dynarec")]
@@ -332,6 +343,7 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "no-f5" => d.no_f5 = true,
                     "no-per-iter-fetch" => d.no_per_iter_fetch = true,
                     "no-arm-jit" => d.no_arm_jit = true,
+                    "no-gpr-cache" => d.no_gpr_cache = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
                             d.max_len = Some(n);
