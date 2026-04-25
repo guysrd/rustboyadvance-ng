@@ -716,6 +716,28 @@ impl GprCache {
             }
         }
     }
+
+    /// Flush dirty Variables to gpr_ptr AND clear all cache state.
+    /// Use before any emit that does direct gpr_ptr access (memory
+    /// ops, tail emits not yet converted) so that:
+    ///   1. Anything dirty is committed to memory before the uncached
+    ///      emit reads it.
+    ///   2. Subsequent reads after the uncached emit re-load from
+    ///      memory (which the uncached emit may have updated).
+    /// This is the bridge that lets a partial cache rollout coexist
+    /// with not-yet-converted emit functions without aliasing.
+    fn flush_and_invalidate(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        gpr_ptr: Value,
+    ) {
+        if self.passthrough {
+            return;
+        }
+        self.flush(builder, gpr_ptr);
+        self.vars = [None; 16];
+        self.dirty = [false; 16];
+    }
 }
 
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
@@ -1771,6 +1793,10 @@ impl DynarecCompiler {
                 }
             }
 
+            // Test path — passthrough cache shared across the loop.
+            // Production try_compile_thumb_mem_block_with_branch owns
+            // the real Variable-caching one.
+            let mut tmp_cache = GprCache::new(true);
             for (k, item) in items.iter().enumerate() {
                 let skip_fu = skip[k];
                 match item {
@@ -1779,10 +1805,6 @@ impl DynarecCompiler {
                         if skip_fu {
                             emit_thumb_format2_no_flags(&mut builder, gpr_ptr, *d);
                         } else {
-                            // Test path — passthrough cache, no Variable
-                            // caching (production try_compile_thumb_mem_block_with_branch
-                            // owns the real cache).
-                            let mut tmp_cache = GprCache::new(true);
                             emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d);
                         }
                     }
@@ -1790,7 +1812,7 @@ impl DynarecCompiler {
                         if skip_fu {
                             emit_thumb_format3_no_flags(&mut builder, gpr_ptr, *d);
                         } else {
-                            emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d);
+                            emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d);
                         }
                     }
                     ThumbItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
@@ -1925,7 +1947,7 @@ impl DynarecCompiler {
                 match item {
                     MemItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
-                    MemItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d),
+                    MemItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     MemItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F9(d) => emit_thumb_format9(
@@ -2340,7 +2362,7 @@ impl DynarecCompiler {
                 match item {
                     BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
                     BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
-                    BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d),
+                    BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
                     BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
                 }
@@ -2391,7 +2413,7 @@ impl DynarecCompiler {
                 match item {
                     BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, d),
                     BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
-                    BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, d),
+                    BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
                     BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, d),
                     BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, d),
                 }
@@ -2915,7 +2937,7 @@ impl DynarecCompiler {
                         if skip_flag_write {
                             emit_thumb_format3_no_flags(builder, gpr_ptr, *d);
                         } else {
-                            emit_thumb_format3(builder, gpr_ptr, cpsr_var, *d);
+                            emit_thumb_format3(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
                         }
                     }
                     Body::F4(d) => emit_thumb_format4_logical(builder, gpr_ptr, cpsr_var, *d),
@@ -5885,6 +5907,7 @@ fn emit_thumb_format3_no_flags(
 fn emit_thumb_format3(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     cpsr_var: Variable,
     dec: DecodedThumb3,
 ) {
@@ -5895,12 +5918,7 @@ fn emit_thumb_format3(
     // general emit_flag_update + skip the rd_val load (MOV doesn't
     // read rd).
     if let Thumb3Op::Mov = dec.op {
-        builder.ins().store(
-            MemFlags::trusted(),
-            imm8,
-            gpr_ptr,
-            Offset32::new(dec.rd * 4),
-        );
+        gpr_cache.write(builder, gpr_ptr, dec.rd as usize, imm8);
         let cpsr = builder.use_var(cpsr_var);
         let cleared = builder.ins().band_imm(cpsr, 0x3fff_ffff);
         let new_cpsr = if dec.imm8 == 0 {
@@ -5917,12 +5935,7 @@ fn emit_thumb_format3(
     //   ADD V = ~rd & result & 0x8000_0000  (4 CLIF ops vs 6 general)
     //   SUB V = rd & ~result & 0x8000_0000  (4 CLIF ops vs 6 general)
     // Saves 2 ops per instruction on this hot shape.
-    let rd_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rd * 4),
-    );
+    let rd_val = gpr_cache.read(builder, gpr_ptr, dec.rd as usize);
     let zero = builder.ins().iconst(types::I32, 0);
 
     let (result, c_bool, v_shifted, writeback) = match dec.op {
@@ -5952,12 +5965,7 @@ fn emit_thumb_format3(
     };
 
     if writeback {
-        builder.ins().store(
-            MemFlags::trusted(),
-            result,
-            gpr_ptr,
-            Offset32::new(dec.rd * 4),
-        );
+        gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
     }
 
     // N/Z pack via the same icmp+uextend+ishl pattern emit_flag_update
