@@ -66,21 +66,32 @@ Hypothesis: LLVM JIT engine's symbol/state management bug at
 scale, OR a calling-convention issue, OR a memory aliasing
 inference issue.
 
-## Phase 1b (rust-inline) — partial accept
+## Phase 1b/1c/2 (rust-inline) — incremental accept
 
 `aot_thumb_step` in arm7tdmi/src/cpu.rs now has Rust-level inline
-fast paths for the format-3 family (MOV/CMP/ADD/SUB imm8) and as
-of phase 1c F1 (MoveShiftedReg LSL/LSR/ASR imm5) and F4 (AluOps
-low-reg, all 16 ops including MUL). These skip the THUMB_LUT
-indirect call when the block is dispatched through AOT.
+fast paths for:
+- F1: LSL/LSR/ASR Rd, Rs, #imm5 (MoveShiftedReg)
+- F2: ADD/SUB Rd, Rs, Rn or #imm3 (AddSub)
+- F3: MOV/CMP/ADD/SUB Rd, #imm8 (DataProcessImm)
+- F4: AND/EOR/LSL/LSR/ASR/ADC/SBC/ROR/TST/NEG/CMP/CMN/ORR/MUL/BIC/MVN
+  (AluOps; all 16 ops, MUL has variable-latency idle_cycle replication)
+- F5: ADD/CMP/MOV/BX hi-reg (Rd=R15 → PipelineFlushed)
+- F12: ADD Rd, [PC|SP], #imm8 (LoadAddress)
+- F13: ADD/SUB SP, #imm7<<2 (AddSp)
 
-PE 100-seed trace-in: 0 divs, 0.77% coverage.
-sweep=0: 0 divs both ROMs (baseline preserved).
+These skip the THUMB_LUT indirect call when the block is dispatched
+through AOT. Each is bit-exact with its scalar handler — same alu
+helpers, same idle_cycle calls, same PipelineFlushed semantics.
 
-Phase 1 full accept blocked by the F19-orphan trampoline bug
-documented in docs/findings-phase1-trampoline-divs.md. Coverage
-stays low until that's fixed OR phase 4 inlines fetch into the
-LLVM IR (which sidesteps the per-iter trampoline path).
+Empirical:
+- PE 100-seed trace-in: 0 divs, 0.77% coverage.
+- sweep=0: 0 divs both ROMs, score=+3 (noise, gray zone).
+
+Phase 1 full accept (and any meaningful fps gain) blocked by the
+F19-orphan trampoline bug documented in
+docs/findings-phase1-trampoline-divs.md. Coverage stays low until
+that's fixed OR phase 4 inlines fetch into the LLVM IR (which
+sidesteps the per-iter trampoline path entirely).
 
 ## Pending
 

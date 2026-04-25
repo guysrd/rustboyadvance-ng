@@ -17,6 +17,7 @@ use super::reg_string;
 use super::{Addr, CpuMode, CpuState, arm::ArmCond, psr::RegPSR};
 
 use super::memory::{MemoryAccess, MemoryInterface};
+use super::registers_consts::{REG_PC, REG_SP};
 use MemoryAccess::*;
 
 use cfg_if::cfg_if;
@@ -292,7 +293,29 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 self.pc = fetch_addr.wrapping_add(2);
                 return 0; // AdvancePC
             }
-            // bs_op_bits == 0b11 → F2 AddSub; falls through to LUT below.
+            // F2 AddSub — bits 15:11 = 00011 (the 0b11 case above).
+            // Encoding: 00011_I_S_NNN_SSS_DDD where:
+            //   I=bit 10 (1 → imm3), S=bit 9 (1 → SUB), NNN=bits 8:6 (Rn or imm3).
+            // Mirrors thumb/exec.rs::exec_thumb_add_sub.
+            let sub = (insn >> 9) & 0x1 != 0;
+            let imm_flag = (insn >> 10) & 0x1 != 0;
+            let rn_or_imm = ((insn >> 6) & 0x7) as u32;
+            let rs = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let op1 = self.gpr[rs];
+            let op2 = if imm_flag { rn_or_imm } else { self.gpr[rn_or_imm as usize] };
+            let mut carry = self.cpsr.C();
+            let mut overflow = self.cpsr.V();
+            let result = if sub {
+                self.alu_sub_flags(op1, op2, &mut carry, &mut overflow)
+            } else {
+                self.alu_add_flags(op1, op2, &mut carry, &mut overflow)
+            };
+            self.alu_update_flags(result, true, carry, overflow);
+            self.gpr[rd] = result;
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
         }
 
         if top3 == 0b001 {
@@ -389,6 +412,96 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             if !setting_flags {
                 self.gpr[rd] = result;
             }
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F5 HiRegOpOrBranchExchange — raw & 0xfc00 == 0x4400.
+        // Encoding: 010001_OO_H1_H2_SSS_DDD where OO ∈ {ADD=0, CMP=1, MOV=2, BX=3}.
+        // Mirrors thumb/exec.rs::exec_thumb_hi_reg_op_or_bx. PipelineFlushed
+        // cases (BX always; ADD/MOV with Rd=R15) return 1 — same as scalar.
+        if (insn & 0xfc00) == 0x4400 {
+            let op = ((insn >> 8) & 0x3) as u8;
+            let h1 = ((insn >> 7) & 0x1) as usize;
+            let h2 = ((insn >> 6) & 0x1) as usize;
+            let rs_low = ((insn >> 3) & 0x7) as usize;
+            let rd_low = (insn & 0x7) as usize;
+            let dst_reg = if h1 == 1 { rd_low + 8 } else { rd_low };
+            let src_reg = if h2 == 1 { rs_low + 8 } else { rs_low };
+            // Per pc_thumb / get_reg semantics: at this point self.pc =
+            // fetch_addr (pipeline-head pc), so get_reg(15) returns the
+            // pipeline-head pc which is what scalar's handler also sees.
+            if op == 3 {
+                // BX — always pipeline flush.
+                self.branch_exchange(self.get_reg(src_reg));
+                return 1; // PipelineFlushed
+            }
+            let op1 = self.get_reg(dst_reg);
+            let op2 = self.get_reg(src_reg);
+            match op {
+                0 => {
+                    // ADD
+                    self.set_reg(dst_reg, op1.wrapping_add(op2));
+                    if dst_reg == REG_PC {
+                        self.reload_pipeline16();
+                        return 1; // PipelineFlushed
+                    }
+                }
+                1 => {
+                    // CMP
+                    let mut carry = self.cpsr.C();
+                    let mut overflow = self.cpsr.V();
+                    let result = self.alu_sub_flags(op1, op2, &mut carry, &mut overflow);
+                    self.alu_update_flags(result, true, carry, overflow);
+                }
+                2 => {
+                    // MOV
+                    self.set_reg(dst_reg, op2);
+                    if dst_reg == REG_PC {
+                        self.reload_pipeline16();
+                        return 1; // PipelineFlushed
+                    }
+                }
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            }
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F12 LoadAddress (ADD Rd, [PC|SP], #imm8) — raw & 0xf000 == 0xa000.
+        // Encoding: 1010_S_DDD_IIIIIIII; S=bit 11 (1 → SP, 0 → PC).
+        // Mirrors thumb/exec.rs::exec_thumb_load_address.
+        if (insn & 0xf000) == 0xa000 {
+            let sp = (insn >> 11) & 0x1 != 0;
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let imm = ((insn & 0xff) << 2) as u32; // word8: imm << 2
+            // self.pc here is fetch_addr = exec_addr + 4. pc_thumb() = pc - 4.
+            // Per scalar: (pc_thumb() & !2) + 4 + imm = ((fetch_addr - 4) & !2) + 4 + imm.
+            let val = if sp {
+                self.gpr[REG_SP].wrapping_add(imm)
+            } else {
+                ((self.pc.wrapping_sub(4)) & !0b10).wrapping_add(4).wrapping_add(imm)
+            };
+            self.gpr[rd] = val;
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F13 AddSp (ADD/SUB SP, #imm7<<2) — raw & 0xff00 == 0xb000.
+        // Encoding: 10110000_S_IIIIIII; S=bit 7 (1 → SUB).
+        // Mirrors thumb/exec.rs::exec_thumb_add_sp.
+        if (insn & 0xff00) == 0xb000 {
+            let sub = (insn >> 7) & 0x1 != 0;
+            let offset = ((insn & 0x7f) << 2) as i32;
+            let sp = self.gpr[REG_SP] as i32;
+            self.gpr[REG_SP] = if sub {
+                sp.wrapping_sub(offset) as u32
+            } else {
+                sp.wrapping_add(offset) as u32
+            };
             self.next_fetch_access = MemoryAccess::Seq;
             self.pc = fetch_addr.wrapping_add(2);
             return 0; // AdvancePC
