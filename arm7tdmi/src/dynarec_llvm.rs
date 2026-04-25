@@ -100,6 +100,12 @@ pub struct LlvmBusTrampolines {
     pub store_32: Option<BusStoreFn>,
     /// Byte store, no +1I.
     pub store_8: Option<BusStoreFn>,
+    /// Halfword load with +1I idle (LDRH).
+    pub load_with_idle_16: Option<BusLoadFn>,
+    /// Signed halfword load with +1I idle (LDSH — sign-extend).
+    pub load_with_idle_sh: Option<BusLoadFn>,
+    /// Halfword store, no +1I.
+    pub store_16: Option<BusStoreFn>,
 }
 
 /// LLVM JIT compiler. One per CPU instance; freed on Drop, which releases
@@ -368,6 +374,130 @@ impl LlvmCompiler {
         self.engine
             .add_module(&module)
             .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F10 LDRH/STRH (`LDRH/STRH Rd, [Rb, #imm5*2]`).
+    /// addr = gpr[rb] + imm5*2 (halfword stride).
+    /// LDRH uses load_with_idle_16; STRH uses store_16.
+    /// Note: this implementation handles the aligned case. Misaligned
+    /// LDRH (addr & 1) requires CPSR.C update via ROR — the cranelift
+    /// backend has special handling at `crate::dynarec::emit_thumb_format10`.
+    /// Mirrored in this file's TODO list; needed for full SDL parity.
+    pub fn compile_thumb_format10(
+        &mut self,
+        rd: u8,
+        rb: u8,
+        imm5: u8,
+        load: bool,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let (load_ref, store_ref) = if load {
+            let fp = self
+                .trampolines
+                .load_with_idle_16
+                .ok_or_else(|| "load_with_idle_16 not registered".to_string())?;
+            (
+                Some(self.import_load_trampoline(&module, "rba_load_idle_16", fp)),
+                None,
+            )
+        } else {
+            let fp = self
+                .trampolines
+                .store_16
+                .ok_or_else(|| "store_16 not registered".to_string())?;
+            (
+                None,
+                Some(self.import_store_trampoline(&module, "rba_store_16", fp)),
+            )
+        };
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
+
+        let rb_idx = i32_t.const_int(rb as u64, false);
+        let rb_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rb_idx], "rb_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rb_val = builder
+            .build_load(i32_t, rb_addr, "rb_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+        let off = i32_t.const_int((imm5 as u64) * 2, false);
+        let addr_val = builder
+            .build_int_add(rb_val, off, "addr")
+            .map_err(|e| format!("iadd: {}", e))?;
+
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+
+        if load {
+            let call = builder
+                .build_call(
+                    load_ref.unwrap(),
+                    &[cpu_ctx.into(), addr_val.into()],
+                    "ldrh_val",
+                )
+                .map_err(|e| format!("call: {}", e))?;
+            let val = call.try_as_basic_value().unwrap_basic().into_int_value();
+            // LDRH zero-extends to u32; mask just in case the trampoline
+            // returns garbage upper bits.
+            let masked = builder
+                .build_and(val, i32_t.const_int(0xFFFF, false), "halfword_mask")
+                .map_err(|e| format!("and: {}", e))?;
+            builder
+                .build_store(rd_addr, masked)
+                .map_err(|e| format!("store: {}", e))?;
+        } else {
+            let rd_val = builder
+                .build_load(i32_t, rd_addr, "rd_val")
+                .map_err(|e| format!("load: {}", e))?
+                .into_int_value();
+            let store_val = builder
+                .build_and(rd_val, i32_t.const_int(0xFFFF, false), "halfword_val")
+                .map_err(|e| format!("and: {}", e))?;
+            builder
+                .build_call(
+                    store_ref.unwrap(),
+                    &[cpu_ctx.into(), addr_val.into(), store_val.into()],
+                    "",
+                )
+                .map_err(|e| format!("call: {}", e))?;
+        }
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
         let raw = self
             .engine
             .get_function_address(&name)
@@ -1882,6 +2012,62 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F10 LDRH: stub returns 0xAABB_CCDD; verify only low 16 bits
+    /// land in gpr[rd].
+    #[test]
+    fn thumb_f10_ldrh_zero_extends() {
+        unsafe extern "C" fn fake_ldrh(_ctx: *mut u8, _addr: u32) -> u32 {
+            0xAABB_CCDD
+        }
+        let mut compiler = LlvmCompiler::new().expect("new");
+        compiler.register_trampolines(LlvmBusTrampolines {
+            load_with_idle_16: Some(fake_ldrh),
+            ..Default::default()
+        });
+        let func = compiler
+            .compile_thumb_format10(0, 1, 4, /*load*/ true)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0xCCDD);
+    }
+
+    /// F10 STRH: stub captures (addr, val); verify val is masked to 16 bits.
+    #[test]
+    fn thumb_f10_strh_captures_halfword() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CAPTURED_ADDR: AtomicU32 = AtomicU32::new(0);
+        static CAPTURED_VAL: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn fake_strh(_ctx: *mut u8, addr: u32, val: u32) {
+            CAPTURED_ADDR.store(addr, Ordering::Relaxed);
+            CAPTURED_VAL.store(val, Ordering::Relaxed);
+        }
+        let mut compiler = LlvmCompiler::new().expect("new");
+        compiler.register_trampolines(LlvmBusTrampolines {
+            store_16: Some(fake_strh),
+            ..Default::default()
+        });
+        let func = compiler
+            .compile_thumb_format10(2, 5, 8, /*load*/ false)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[5] = 0x0300_2000;
+        gpr[2] = 0x1234_5678;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(CAPTURED_ADDR.load(Ordering::Relaxed), 0x0300_2010);
+        assert_eq!(CAPTURED_VAL.load(Ordering::Relaxed), 0x5678);
     }
 
     /// F11 LDR SP-rel: thin wrapper over F9 with rb=SP, offset=imm8*4.
