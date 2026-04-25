@@ -51,12 +51,20 @@ pub enum DecodedInstr<I: MemoryInterface> {
 /// ARM entry PCs are 4-byte aligned so bit 0 is always 0 in ARM mode;
 /// Thumb entry PCs are 2-byte aligned so bit 0 is free for us.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockKey(u32);
+pub struct BlockKey(pub u32);
 
 impl BlockKey {
     #[inline]
     pub fn new(pc: u32, thumb: bool) -> Self {
         BlockKey(pc | (thumb as u32))
+    }
+    #[inline]
+    pub fn pc(&self) -> u32 {
+        self.0 & !1
+    }
+    #[inline]
+    pub fn is_thumb(&self) -> bool {
+        (self.0 & 1) != 0
     }
 }
 
@@ -167,6 +175,13 @@ impl<I: MemoryInterface> BlockCache<I> {
     #[inline]
     pub fn begin_record(&mut self, key: BlockKey) {
         self.recording = Some((key, Block::new(key.0)));
+    }
+
+    /// Iterate over (pc, is_thumb) of every ROM-region recorded
+    /// block. Used by the AOT trace-out path to seed AOT scan with
+    /// runtime-observed block entry points.
+    pub fn rom_block_keys(&self) -> impl Iterator<Item = (u32, bool)> + '_ {
+        self.rom_blocks.keys().map(|k| (k.pc(), k.is_thumb()))
     }
 
     /// Append one executed instruction to the in-progress recording, if any.

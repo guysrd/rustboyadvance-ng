@@ -74,6 +74,20 @@ pub fn compile_rom(
     entry_mode: Mode,
     replay_thumb_fn: replay::AotReplayFn,
 ) -> AotTable {
+    compile_rom_with_seeds(rom, rom_base, entry_pc, entry_mode, &[], replay_thumb_fn)
+}
+
+/// Variant that takes additional seed entry points (typically from a
+/// trace-out file). Each seed adds a (pc, mode) pair to the scan
+/// queue alongside the static entry_pc + sweep candidates.
+pub fn compile_rom_with_seeds(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
     // coverage on the SDL replay we ALSO sweep aligned halfwords as
@@ -88,6 +102,12 @@ pub fn compile_rom(
     // larger cap, OR phase 9 trace-pass (per A3) replaces sweep with
     // runtime-observed PCs.
     let mut entries: Vec<(u32, Mode)> = vec![(entry_pc, entry_mode)];
+    // Trace-driven seeds (typically from --aot-trace-in). These are
+    // runtime-observed block entry pcs — they're real entries, no
+    // sweep-style false positives. THE primary path for getting
+    // coverage > 80%.
+    entries.extend_from_slice(seeds);
+    eprintln!("AOT: {} seed entry points (from --aot-trace-in)", seeds.len());
     // Sweep cap: 0 = disabled (table only contains the static-reachable
     // entry; coverage near 0% but divs == 0 trivially). Default 0 for
     // phase 0 step 4b — empirical: sweep > 0 causes MK to diverge by

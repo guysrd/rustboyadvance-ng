@@ -75,6 +75,21 @@ pub struct Options {
     #[arg(long = "aot")]
     pub aot: bool,
 
+    /// At replay end, write every recorded ROM-block entry pc to PATH
+    /// (one hex per line, "08001234 thumb"). The AOT dispatcher
+    /// reads this on subsequent runs to seed its static scan with
+    /// runtime-observed entry points — gets coverage > 80% without
+    /// needing the unreliable sweep-mode approximation. Use
+    /// alongside (not with) --aot.
+    #[arg(long = "aot-trace-out", value_name = "PATH")]
+    pub aot_trace_out: Option<PathBuf>,
+
+    /// Read seed entry points from PATH (format: hex pc + "thumb"
+    /// or "arm" per line) and feed them to compile_rom in addition
+    /// to the cart entry. Use alongside --aot.
+    #[arg(long = "aot-trace-in", value_name = "PATH")]
+    pub aot_trace_in: Option<PathBuf>,
+
     /// Print an FNV-1a hash of the framebuffer every N frames while
     /// replaying (format: `fb_hash: frame=N cycle=C hash=HHHHHHHH`).
     /// Used to diff scalar vs jit output on real SDL without going

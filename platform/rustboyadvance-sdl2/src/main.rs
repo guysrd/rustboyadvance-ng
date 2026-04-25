@@ -133,14 +133,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rom_bytes = std::fs::read(&opts.rom)?;
         let entry_pc = arm7tdmi_aot::scan::cart_entry_pc(&rom_bytes)
             .ok_or("ROM bytes 0..3 don't decode as ARM B (cart entry); not a valid GBA ROM?")?;
+        // Read seed entry pcs from the trace-in file (if any). Format:
+        // one line per entry, "08001234 thumb" or "0800abcd arm".
+        let seeds: Vec<(u32, arm7tdmi_aot::Mode)> = if let Some(path) = &opts.aot_trace_in {
+            let s = std::fs::read_to_string(path)?;
+            let mut v = Vec::new();
+            for line in s.lines() {
+                let mut it = line.split_whitespace();
+                if let (Some(hex), Some(mode_str)) = (it.next(), it.next()) {
+                    if let Ok(pc) = u32::from_str_radix(hex, 16) {
+                        let mode = match mode_str {
+                            "thumb" => arm7tdmi_aot::Mode::Thumb,
+                            "arm" => arm7tdmi_aot::Mode::Arm,
+                            _ => continue,
+                        };
+                        v.push((pc, mode));
+                    }
+                }
+            }
+            eprintln!("--aot-trace-in: loaded {} seed entries from {:?}", v.len(), path);
+            v
+        } else {
+            Vec::new()
+        };
         // Per-I monomorphized trampoline. SDL frontend uses
         // SysBus from rustboyadvance-core.
         use rustboyadvance_core::sysbus::SysBus;
-        let table = Box::new(arm7tdmi_aot::compile_rom(
+        let table = Box::new(arm7tdmi_aot::compile_rom_with_seeds(
             &rom_bytes,
             0x0800_0000,
             entry_pc,
             arm7tdmi_aot::Mode::Arm,
+            &seeds,
             arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
         ));
         eprintln!(
@@ -353,6 +377,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "aot dispatch: {} hits, {} misses, {:.2}% coverage",
                         h, m, pct
                     );
+                }
+                if let Some(path) = &opts.aot_trace_out {
+                    let mut lines = String::new();
+                    let mut count = 0;
+                    for (pc, thumb) in gba.cpu.block_cache.rom_block_keys() {
+                        lines.push_str(&format!(
+                            "{:08x} {}\n",
+                            pc,
+                            if thumb { "thumb" } else { "arm" }
+                        ));
+                        count += 1;
+                    }
+                    std::fs::write(path, lines)?;
+                    eprintln!("--aot-trace-out: wrote {} ROM block entries to {:?}", count, path);
                 }
                 break 'running;
             }
