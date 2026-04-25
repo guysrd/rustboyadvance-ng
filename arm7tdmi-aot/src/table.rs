@@ -48,6 +48,17 @@ pub struct AotTable {
     /// keeps the leaf allocation stable so we can hand out raw
     /// pointers via the I18 inlined lookup.
     pages: Box<[Option<Box<Leaf>>]>,
+    /// Arena of per-block opcode buffers. Each phase-0 placeholder
+    /// block has a stable raw ptr into this arena baked into its
+    /// LLVM IR (the trampoline call argument). Box<[u32]> keeps
+    /// each buffer's address fixed for the AotTable's lifetime.
+    /// Drop ordering: AotTable owns this; when AotTable drops, the
+    /// associated ExecutionEngine should already have been dropped
+    /// (if any) so no in-flight calls reference these buffers.
+    pub(crate) thumb_opcode_arena: Vec<Box<[u32]>>,
+    /// Compiled-block count, maintained as inserts happen so we
+    /// don't have to walk all 65536 leaves to report it.
+    pub(crate) compiled_count: usize,
 }
 
 impl AotTable {
@@ -56,6 +67,8 @@ impl AotTable {
         let v: Vec<Option<Box<Leaf>>> = (0..TOP_LEVEL_SIZE).map(|_| None).collect();
         Self {
             pages: v.into_boxed_slice(),
+            thumb_opcode_arena: Vec::new(),
+            compiled_count: 0,
         }
     }
 
@@ -70,16 +83,26 @@ impl AotTable {
             // 32768 None slots.
             Box::new(std::array::from_fn(|_| None))
         });
+        if leaf[leaf_idx].is_none() {
+            self.compiled_count += 1;
+        }
         leaf[leaf_idx] = Some(f);
     }
 
-    /// Diagnostic: total compiled-block count.
+    /// Add an opcode buffer to the arena and return a stable raw
+    /// pointer. Caller bakes the pointer into the LLVM IR for a
+    /// per-block trampoline call.
+    pub fn intern_opcodes(&mut self, opcodes: &[u32]) -> *const u32 {
+        let boxed: Box<[u32]> = opcodes.to_vec().into_boxed_slice();
+        let ptr = boxed.as_ptr();
+        self.thumb_opcode_arena.push(boxed);
+        ptr
+    }
+
+    /// Diagnostic: total compiled-block count. Maintained as
+    /// inserts happen so this is O(1).
     pub fn block_count(&self) -> usize {
-        self.pages
-            .iter()
-            .filter_map(|p| p.as_ref())
-            .map(|leaf| leaf.iter().filter(|s| s.is_some()).count())
-            .sum()
+        self.compiled_count
     }
 
     /// Diagnostic: number of allocated pages (sparsity indicator).

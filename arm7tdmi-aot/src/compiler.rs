@@ -8,13 +8,20 @@ use inkwell::execution_engine::ExecutionEngine;
 #[cfg(test)]
 use inkwell::execution_engine::JitFunction;
 
+use crate::replay::AotReplayFn;
+use crate::table::CompiledFn;
+
 /// Compiler handle. The `Context` is leaked to `'static` so the
 /// `ExecutionEngine` and modules can borrow it for the process
 /// lifetime — same idiom the JIT branch used.
 pub struct LlvmCompiler {
-    context: &'static Context,
-    engine: ExecutionEngine<'static>,
-    next_id: u64,
+    pub(crate) context: &'static Context,
+    pub(crate) engine: ExecutionEngine<'static>,
+    pub(crate) next_id: u64,
+    /// Per-I trampoline registered at construction. Phase-0
+    /// placeholder blocks call this; phase 1+ inline IR replaces
+    /// the calls one format at a time.
+    pub(crate) replay_thumb_fn: Option<AotReplayFn>,
 }
 
 impl LlvmCompiler {
@@ -32,7 +39,94 @@ impl LlvmCompiler {
             context,
             engine,
             next_id: 0,
+            replay_thumb_fn: None,
         })
+    }
+
+    /// Register the per-I monomorphized phase-0 trampoline. Caller
+    /// must do this once before emitting placeholder blocks.
+    pub fn register_replay_thumb(&mut self, f: AotReplayFn) {
+        self.replay_thumb_fn = Some(f);
+    }
+
+    /// Phase-0 placeholder block emit. Creates an LLVM fn matching
+    /// the `CompiledFn` ABI (`extern "C" fn(cpu_ctx, pc_out) -> u32`)
+    /// that calls the registered Thumb replay trampoline with the
+    /// supplied opcodes_ptr/len/entry_pc baked in as constants.
+    ///
+    /// `opcodes_ptr` must point to a stable memory location that
+    /// outlives the AotTable (caller arena: `AotTable.thumb_arena`).
+    pub fn emit_placeholder_thumb_block(
+        &mut self,
+        opcodes_ptr: *const u32,
+        opcodes_len: u32,
+        entry_pc: u32,
+    ) -> Option<CompiledFn> {
+        use inkwell::AddressSpace;
+
+        let replay_fn = self.replay_thumb_fn?;
+
+        let module = self.context.create_module("aot_blk");
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        // Import the replay trampoline as
+        //   extern "C" fn(cpu_ctx: ptr, opcodes: ptr, len: i32, pc: i32) -> i32
+        let trampoline_sig = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i32_t.into(), i32_t.into()],
+            false,
+        );
+        let trampoline_ref =
+            module.add_function("rba_aot_replay_thumb", trampoline_sig, None);
+        self.engine
+            .add_global_mapping(&trampoline_ref, replay_fn as usize);
+
+        // Block fn: extern "C" fn(*mut u8 cpu_ctx, *mut u32 pc_out) -> u32
+        let block_sig = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.next_id += 1;
+        let block_name = format!("aot_blk_{}", self.next_id);
+        let block_fn = module.add_function(&block_name, block_sig, None);
+        let entry = self.context.append_basic_block(block_fn, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let cpu_ctx = block_fn.get_nth_param(0).unwrap().into_pointer_value();
+        // pc_out unused for phase-0 placeholder (handler updates cpu.pc
+        // directly on PipelineFlushed; the dispatcher reads cpu.pc).
+
+        // Bake opcodes_ptr as a constant ptr-sized integer cast to ptr.
+        let opcodes_ptr_const =
+            i64_t.const_int(opcodes_ptr as u64, false);
+        let opcodes_ptr_v = builder
+            .build_int_to_ptr(opcodes_ptr_const, ptr_t, "opc_ptr")
+            .ok()?;
+        let len_v = i32_t.const_int(opcodes_len as u64, false);
+        let entry_pc_v = i32_t.const_int(entry_pc as u64, false);
+
+        // ret = call rba_aot_replay_thumb(cpu_ctx, opcodes_ptr, len, entry_pc)
+        let call = builder
+            .build_call(
+                trampoline_ref,
+                &[
+                    cpu_ctx.into(),
+                    opcodes_ptr_v.into(),
+                    len_v.into(),
+                    entry_pc_v.into(),
+                ],
+                "ret",
+            )
+            .ok()?;
+        let ret = call
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        builder.build_return(Some(&ret)).ok()?;
+
+        // Add module + look up the JITed fn pointer.
+        self.engine.add_module(&module).ok()?;
+        let raw = self.engine.get_function_address(&block_name).ok()?;
+        Some(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
     }
 
     /// A0 pre-flight ABI sanity test. Compile a function that returns

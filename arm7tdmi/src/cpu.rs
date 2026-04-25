@@ -219,6 +219,61 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.aot_lookup_fn = Some(lookup_fn);
     }
 
+    /// AOT-side helper: per-iter Thumb step (fetch + pipeline shift +
+    /// THUMB_LUT handler dispatch + AdvancePC bookkeeping). Mirrors
+    /// what scalar `replay_cached_block` does for one iteration.
+    /// arm7tdmi-aot's phase-0 trampoline calls this once per opcode.
+    ///
+    /// Returns:
+    ///   0 → AdvancePC (continue to next instruction).
+    ///   1 → PipelineFlushed (handler updated cpu.pc + cpu.pipeline
+    ///       at branch target; caller exits the block).
+    ///
+    /// Per A1 audit: no Thumb handler reads `pipeline[]`, so the
+    /// `read_16` fetch is for cycle accounting only. Phase 0 keeps
+    /// the actual load to match scalar exactly; phase 4 (per the
+    /// ladder) inlines `add_cycles` and elides the load.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_thumb_step(&mut self, fetch_addr: u32, insn: u32) -> u32 {
+        let access = self.next_fetch_access;
+        let val = self.load_16(fetch_addr, access);
+        self.pipeline[0] = self.pipeline[1];
+        self.pipeline[1] = val as u32;
+        // Pipeline-head pc convention: scalar's self.pc at handler-call
+        // time IS `fetch_addr` (= exec_addr + 4). After AdvancePC
+        // scalar advances pc by 2 → exec_addr + 6 = fetch_addr + 2.
+        self.pc = fetch_addr;
+        let thumb_info = &Self::THUMB_LUT[((insn >> 6) as usize) & 0x3FF];
+        match (thumb_info.handler_fn)(self, insn as u16) {
+            CpuAction::AdvancePC(next_access) => {
+                self.next_fetch_access = next_access;
+                self.pc = fetch_addr.wrapping_add(2);
+                0
+            }
+            CpuAction::PipelineFlushed => 1,
+        }
+    }
+
+    /// AOT-side helper: mid-block abort check (K=2 cadence per I2).
+    /// Mirrors the scalar `replay_cached_block` per-iter abort guard.
+    /// Returns true if the AOT block should yield to the dispatcher.
+    ///
+    /// The block was recorded as Thumb only (per phase-0 scope); the
+    /// mode-flip check fires if cpu.cpsr.state() flipped to ARM.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_block_should_abort_thumb(&mut self) -> bool {
+        if !matches!(self.cpsr.state(), CpuState::THUMB) {
+            return true;
+        }
+        if self.bus.take_block_cache_dirty() {
+            self.block_cache.flush();
+            return true;
+        }
+        self.bus.cached_block_should_abort()
+    }
+
     /// Try to dispatch an AOT-compiled block at the current pc. Returns
     /// `Some(can_chain)` on hit, `None` on miss (caller falls through
     /// to block_cache + scalar replay).
@@ -241,6 +296,13 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // AOT block whose first iter would re-fetch pipeline[0] at
         // a stale pc.
         if self.pipeline[0] == 0 {
+            return None;
+        }
+        // Phase 0 only emits Thumb blocks. Skip AOT lookup in ARM
+        // mode to avoid PC-key collisions (ARM 4-byte aligned pcs
+        // can match Thumb (entry_pc + 4) keys when entry_pc is
+        // 4-byte aligned).
+        if !matches!(self.cpsr.state(), CpuState::THUMB) {
             return None;
         }
         let fn_addr = lookup(self.aot_table, self.pc);

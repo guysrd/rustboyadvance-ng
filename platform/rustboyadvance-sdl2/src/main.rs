@@ -133,11 +133,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rom_bytes = std::fs::read(&opts.rom)?;
         let entry_pc = arm7tdmi_aot::scan::cart_entry_pc(&rom_bytes)
             .ok_or("ROM bytes 0..3 don't decode as ARM B (cart entry); not a valid GBA ROM?")?;
+        // Per-I monomorphized trampoline. SDL frontend uses
+        // SysBus from rustboyadvance-core.
+        use rustboyadvance_core::sysbus::SysBus;
         let table = Box::new(arm7tdmi_aot::compile_rom(
             &rom_bytes,
             0x0800_0000,
             entry_pc,
             arm7tdmi_aot::Mode::Arm,
+            arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
         ));
         eprintln!(
             "--aot: scan/compile done in {} ms; {} blocks compiled, {} pages allocated",
