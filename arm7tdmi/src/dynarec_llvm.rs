@@ -39,6 +39,21 @@ pub enum Thumb2Operand {
     Reg(u8),
 }
 
+/// Thumb format 4 logical / compare ops. All write flags; only some
+/// write back to Rd. Most preserve C, V; CMP/CMN/NEG compute full NZCV.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thumb4Op {
+    And,
+    Eor,
+    Orr,
+    Bic,
+    Mvn,
+    Tst,
+    Cmp,
+    Cmn,
+    Neg,
+}
+
 /// Function signature shared by every compiled block. Mirrors the Cranelift
 /// shape (`*mut u32 gpr, *mut u32 cpsr, *mut u32 pc_out, *mut u8 cpu_ctx -> u32`).
 /// Return value is the same `took` bit-encoding the dispatcher already
@@ -260,6 +275,230 @@ impl LlvmCompiler {
         self.engine
             .add_module(&module)
             .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F4 logical / compare op. Per Thumb4Op:
+    ///   And/Eor/Orr/Bic/Mvn:  writeback Rd, NZ flags, preserve C/V.
+    ///   Tst:                    no writeback, NZ flags, preserve C/V.
+    ///   Cmp:                    no writeback, full NZCV from rd - rs.
+    ///   Cmn:                    no writeback, full NZCV from rd + rs.
+    ///   Neg:                    writeback Rd = -rs, full NZCV.
+    ///
+    /// `rd` is the dest/lhs (loaded as left operand), `rs` is the
+    /// source. For Mvn the lhs is unused (rd loaded then ignored,
+    /// keeps the load uniform).
+    pub fn compile_thumb_format4(
+        &mut self,
+        op: Thumb4Op,
+        rd: u8,
+        rs: u8,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+        use inkwell::IntPredicate;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rd_val = builder
+            .build_load(i32_t, rd_addr, "rd_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        let rs_idx = i32_t.const_int(rs as u64, false);
+        let rs_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rs_idx], "rs_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rs_val = builder
+            .build_load(i32_t, rs_addr, "rs_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        let zero_const = i32_t.const_int(0, false);
+        let writeback = matches!(
+            op,
+            Thumb4Op::And
+                | Thumb4Op::Eor
+                | Thumb4Op::Orr
+                | Thumb4Op::Bic
+                | Thumb4Op::Mvn
+                | Thumb4Op::Neg
+        );
+        let full_nzcv = matches!(op, Thumb4Op::Cmp | Thumb4Op::Cmn | Thumb4Op::Neg);
+
+        // Compute the result
+        let result = match op {
+            Thumb4Op::And | Thumb4Op::Tst => builder
+                .build_and(rd_val, rs_val, "result")
+                .map_err(|e| format!("and: {}", e))?,
+            Thumb4Op::Eor => builder
+                .build_xor(rd_val, rs_val, "result")
+                .map_err(|e| format!("xor: {}", e))?,
+            Thumb4Op::Orr => builder
+                .build_or(rd_val, rs_val, "result")
+                .map_err(|e| format!("or: {}", e))?,
+            Thumb4Op::Bic => {
+                let not_rs = builder
+                    .build_not(rs_val, "not_rs")
+                    .map_err(|e| format!("not: {}", e))?;
+                builder
+                    .build_and(rd_val, not_rs, "result")
+                    .map_err(|e| format!("and: {}", e))?
+            }
+            Thumb4Op::Mvn => builder
+                .build_not(rs_val, "result")
+                .map_err(|e| format!("not: {}", e))?,
+            Thumb4Op::Cmp => builder
+                .build_int_sub(rd_val, rs_val, "result")
+                .map_err(|e| format!("isub: {}", e))?,
+            Thumb4Op::Cmn => builder
+                .build_int_add(rd_val, rs_val, "result")
+                .map_err(|e| format!("iadd: {}", e))?,
+            Thumb4Op::Neg => builder
+                .build_int_sub(zero_const, rs_val, "result")
+                .map_err(|e| format!("isub: {}", e))?,
+        };
+
+        if writeback {
+            builder
+                .build_store(rd_addr, result)
+                .map_err(|e| format!("store rd: {}", e))?;
+        }
+
+        // N, Z always come from result.
+        let n_bit = builder
+            .build_and(result, i32_t.const_int(0x8000_0000, false), "n")
+            .map_err(|e| format!("and: {}", e))?;
+        let z_bool = builder
+            .build_int_compare(IntPredicate::EQ, result, zero_const, "z")
+            .map_err(|e| format!("icmp: {}", e))?;
+        let z_u32 = builder
+            .build_int_z_extend(z_bool, i32_t, "z_u32")
+            .map_err(|e| format!("zext: {}", e))?;
+        let z_shifted = builder
+            .build_left_shift(z_u32, i32_t.const_int(30, false), "z_sh")
+            .map_err(|e| format!("shl: {}", e))?;
+
+        // C, V handling depends on op category.
+        let cpsr_old = builder
+            .build_load(i32_t, cpsr_ptr, "cpsr_old")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        let (c_shifted, v_shifted) = if full_nzcv {
+            // Full NZCV (Cmp/Cmn/Neg). Neg has rn=0 for flag computation.
+            let (lhs, rhs, is_sub) = match op {
+                Thumb4Op::Cmp => (rd_val, rs_val, true),
+                Thumb4Op::Cmn => (rd_val, rs_val, false),
+                Thumb4Op::Neg => (zero_const, rs_val, true),
+                _ => unreachable!(),
+            };
+            let c_bool = if is_sub {
+                builder
+                    .build_int_compare(IntPredicate::UGE, lhs, rhs, "c")
+                    .map_err(|e| format!("icmp: {}", e))?
+            } else {
+                builder
+                    .build_int_compare(IntPredicate::ULT, result, lhs, "c")
+                    .map_err(|e| format!("icmp: {}", e))?
+            };
+            let c_u32 = builder
+                .build_int_z_extend(c_bool, i32_t, "c_u32")
+                .map_err(|e| format!("zext: {}", e))?;
+            let c_sh = builder
+                .build_left_shift(c_u32, i32_t.const_int(29, false), "c_sh")
+                .map_err(|e| format!("shl: {}", e))?;
+            // V (sub):  (lhs ^ rhs) & (lhs ^ result) >> 31
+            // V (add):  ~(lhs ^ rhs) & (lhs ^ result) >> 31
+            let xor1 = builder
+                .build_xor(lhs, rhs, "x1")
+                .map_err(|e| format!("xor: {}", e))?;
+            let xor2 = builder
+                .build_xor(lhs, result, "x2")
+                .map_err(|e| format!("xor: {}", e))?;
+            let v_bits = if is_sub {
+                builder
+                    .build_and(xor1, xor2, "vb")
+                    .map_err(|e| format!("and: {}", e))?
+            } else {
+                let not_xor1 = builder
+                    .build_not(xor1, "nx1")
+                    .map_err(|e| format!("not: {}", e))?;
+                builder
+                    .build_and(not_xor1, xor2, "vb")
+                    .map_err(|e| format!("and: {}", e))?
+            };
+            let v_top = builder
+                .build_and(v_bits, i32_t.const_int(0x8000_0000, false), "vt")
+                .map_err(|e| format!("and: {}", e))?;
+            let v_sh = builder
+                .build_right_shift(v_top, i32_t.const_int(3, false), false, "vs")
+                .map_err(|e| format!("lshr: {}", e))?;
+            (c_sh, v_sh)
+        } else {
+            // Logical: preserve C and V from cpsr_old.
+            let c_pres = builder
+                .build_and(cpsr_old, i32_t.const_int(0x2000_0000, false), "c_pr")
+                .map_err(|e| format!("and: {}", e))?;
+            let v_pres = builder
+                .build_and(cpsr_old, i32_t.const_int(0x1000_0000, false), "v_pr")
+                .map_err(|e| format!("and: {}", e))?;
+            (c_pres, v_pres)
+        };
+
+        let cpsr_cleared = builder
+            .build_and(cpsr_old, i32_t.const_int(0x0FFF_FFFF, false), "cpsr_cl")
+            .map_err(|e| format!("and: {}", e))?;
+        let nz = builder
+            .build_or(n_bit, z_shifted, "nz")
+            .map_err(|e| format!("or: {}", e))?;
+        let cv = builder
+            .build_or(c_shifted, v_shifted, "cv")
+            .map_err(|e| format!("or: {}", e))?;
+        let flags = builder
+            .build_or(nz, cv, "flags")
+            .map_err(|e| format!("or: {}", e))?;
+        let cpsr_new = builder
+            .build_or(cpsr_cleared, flags, "cpsr_new")
+            .map_err(|e| format!("or: {}", e))?;
+        builder
+            .build_store(cpsr_ptr, cpsr_new)
+            .map_err(|e| format!("store: {}", e))?;
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
         let raw = self
             .engine
             .get_function_address(&name)
@@ -1014,6 +1253,151 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F4 AND: r0 = 0xFF00, r1 = 0x0FF0, AND r0, r0, r1 → r0 = 0x0F00.
+    /// Logical, NZ updated, C/V preserved.
+    #[test]
+    fn thumb_f4_and() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::And, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 0xFF00;
+        gpr[1] = 0x0FF0;
+        // Pre-set C+V in cpsr to verify they're preserved.
+        let mut cpsr: u32 = 0x3000_0000;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0x0F00);
+        // C, V preserved (bits 29, 28). N=0, Z=0.
+        assert_eq!(cpsr & 0xF000_0000, 0x3000_0000);
+    }
+
+    /// F4 EOR: bitwise XOR.
+    #[test]
+    fn thumb_f4_eor() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::Eor, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 0xAAAA;
+        gpr[1] = 0x5555;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0xFFFF);
+    }
+
+    /// F4 BIC (bit clear): r0 & ~r1.
+    #[test]
+    fn thumb_f4_bic() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::Bic, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 0xFFFF;
+        gpr[1] = 0x00F0;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0xFF0F);
+    }
+
+    /// F4 MVN: bitwise not. rs's source value.
+    #[test]
+    fn thumb_f4_mvn() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::Mvn, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[1] = 0x0000_FFFF;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0xFFFF_0000);
+        // N=1 (top bit set after invert).
+        assert_eq!(cpsr & 0x8000_0000, 0x8000_0000);
+    }
+
+    /// F4 TST: AND but no writeback. Sets flags from result.
+    #[test]
+    fn thumb_f4_tst_zero() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::Tst, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 0xFF00;
+        gpr[1] = 0x00FF;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // r0 unchanged (no writeback).
+        assert_eq!(gpr[0], 0xFF00);
+        // Z=1 (AND result is 0).
+        assert_eq!(cpsr & 0x4000_0000, 0x4000_0000);
+    }
+
+    /// F4 NEG: 0 - rs, full NZCV.
+    #[test]
+    fn thumb_f4_neg() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::Neg, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[1] = 5;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], (-5_i32) as u32);
+        // N=1 (negative result), C=0 (0 < 5 unsigned, borrow).
+        assert_eq!(cpsr & 0x8000_0000, 0x8000_0000);
+        assert_eq!(cpsr & 0x2000_0000, 0);
+    }
+
+    /// F4 CMP: rd - rs without writeback.
+    #[test]
+    fn thumb_f4_cmp_equal() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format4(Thumb4Op::Cmp, 0, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 42;
+        gpr[1] = 42;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // r0 unchanged. Z=1, C=1.
+        assert_eq!(gpr[0], 42);
+        assert_eq!(cpsr & 0xF000_0000, 0x6000_0000);
     }
 
     /// F2 ADD reg: r0 = 100, r1 = 50, ADD r2, r0, r1 → r2=150, no flags.
