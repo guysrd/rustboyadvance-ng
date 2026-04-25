@@ -518,6 +518,45 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             return 0; // AdvancePC
         }
 
+        // F8 LDR/STR sign-extended/halfword reg-offset — raw & 0xf200 == 0x5200.
+        // Encoding: 0101_HS_1_OOO_BBB_DDD; H=bit 11 (halfword), S=bit 10 (sign-ext).
+        //   (S,H) = (0,0) STRH, (0,1) LDRH, (1,0) LDSB, (1,1) LDSH
+        // Mirrors thumb/exec.rs::exec_thumb_ldr_str_shb. Always returns
+        // AdvancePC(NonSeq).
+        if (insn & 0xf200) == 0x5200 {
+            let halfword = (insn >> 11) & 0x1 != 0;
+            let sign_extend = (insn >> 10) & 0x1 != 0;
+            let ro = ((insn >> 6) & 0x7) as usize;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let addr = self.gpr[rb].wrapping_add(self.gpr[ro]);
+            match (sign_extend, halfword) {
+                (false, false) => {
+                    // STRH
+                    self.store_aligned_16(addr, self.gpr[rd] as u16, MemoryAccess::NonSeq);
+                }
+                (false, true) => {
+                    // LDRH
+                    self.gpr[rd] = self.ldr_half(addr, MemoryAccess::NonSeq);
+                    self.idle_cycle();
+                }
+                (true, false) => {
+                    // LDSB — load_8 then sign-extend i8 → i32 → u32
+                    let val = self.load_8(addr, MemoryAccess::NonSeq) as i8 as i32 as u32;
+                    self.gpr[rd] = val;
+                    self.idle_cycle();
+                }
+                (true, true) => {
+                    // LDSH
+                    self.gpr[rd] = self.ldr_sign_half(addr, MemoryAccess::NonSeq);
+                    self.idle_cycle();
+                }
+            }
+            self.next_fetch_access = MemoryAccess::NonSeq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
         // F10 LDRH/STRH with imm5*2 offset — raw & 0xf000 == 0x8000.
         // Encoding: 1000_L_IIIII_BBB_DDD; L=bit 11 (load).
         // offset = imm5 << 1. Mirrors thumb/exec.rs::exec_thumb_ldr_str_halfword.
