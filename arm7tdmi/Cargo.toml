@@ -39,6 +39,11 @@ cached_interp = []
 # host machine code. Cranelift is a heavy dep, so gate strictly behind this
 # feature; the default build is unchanged.
 dynarec = ["cached_interp", "dep:cranelift", "dep:cranelift-module", "dep:cranelift-jit", "dep:cranelift-native"]
+# LLVM-via-inkwell backend, side-by-side with Cranelift. Goal: better
+# per-instruction codegen quality (rustc parity since LLVM is rustcs
+# backend), in exchange for slower compile time. Implies cached_interp.
+# Currently a proof-of-concept — not all Thumb formats are wired up yet.
+dynarec_llvm = ["cached_interp", "dep:inkwell"]
 # Enables the Cranelift-disasm dump helper (arm7tdmi::dynarec::dump) for
 # the shape-optimization research loop. Implies dynarec. Pulls in capstone
 # for arm64 disassembly.
@@ -65,6 +70,11 @@ optional = true
 
 [dependencies.cranelift-native]
 version = "0.122"
+optional = true
+
+[dependencies.inkwell]
+version = "0.9"
+features = ["llvm18-1-prefer-dynamic"]
 optional = true
 
 [dependencies.capstone]

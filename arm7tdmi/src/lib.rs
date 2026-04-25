@@ -19,6 +19,11 @@ use thumb::ThumbInstruction;
 pub mod cache;
 #[cfg(feature = "dynarec")]
 pub mod dynarec;
+/// LLVM-via-inkwell JIT backend, side-by-side with Cranelift during the
+/// migration. Goal: per-instruction codegen quality at rustc-LTO parity
+/// (LLVM IS rustc's backend, so it's the natural ceiling).
+#[cfg(feature = "dynarec_llvm")]
+pub mod dynarec_llvm;
 pub mod cpu;
 pub use cpu::*;
 pub mod alu;
