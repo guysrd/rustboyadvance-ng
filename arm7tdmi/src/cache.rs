@@ -445,11 +445,24 @@ fn try_compile_thumb<I: MemoryInterface>(
         let func = func_opt?;
         return Some(CompileResult { func, chain_slot });
     }
+    // First instr was Thumb (else `arm_block` branch above handled it).
+    // Reject any mid-block ARM instruction defensively — scalar's
+    // mode-flip detection should prevent these from being recorded,
+    // but some unit tests construct mixed-mode blocks to verify the
+    // rejection path. Single-mode invariant.
     let mut raws: Vec<u16> = Vec::with_capacity(block.instrs.len());
     for instr in &block.instrs {
         match instr {
             DecodedInstr::Thumb { raw, .. } => raws.push(*raw),
-            DecodedInstr::Arm { .. } => unreachable!("arm_block handled above"),
+            DecodedInstr::Arm { .. } => {
+                if std::env::var_os("DYNAREC_REJECT_REPORT").is_some() {
+                    eprintln!(
+                        "REJECT_MIXED_MODE entry_pc=0x{:x}",
+                        block.entry_pc
+                    );
+                }
+                return None;
+            }
         }
     }
     if raws.is_empty() {

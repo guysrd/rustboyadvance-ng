@@ -4,10 +4,11 @@ use std::fmt;
 pub type Addr = u32;
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, Default)]
+#[repr(u8)]
 pub enum MemoryAccess {
     #[default]
     NonSeq = 0,
-    Seq,
+    Seq = 1,
 }
 
 impl fmt::Display for MemoryAccess {

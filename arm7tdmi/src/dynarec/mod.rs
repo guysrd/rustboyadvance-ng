@@ -489,6 +489,10 @@ pub mod trampolines {
             thumb_fetch_charge_shift: thumb_fetch_charge_shift::<I>,
             arm_fetch_charge_shift: arm_fetch_charge_shift::<I>,
             set_next_fetch_access: set_next_fetch_access::<I>,
+            next_fetch_access_offset: std::mem::offset_of!(
+                Arm7tdmiCore<I>,
+                next_fetch_access
+            ) as u32,
         }
     }
 }
@@ -540,7 +544,15 @@ pub struct BusTrampolines {
     /// Write `cpu.next_fetch_access`. Called by per-iter codegen after
     /// each body emit to mirror scalar's handler-driven update of
     /// `self.next_fetch_access` from `AdvancePC(access)` returns.
+    /// Kept as a fallback; the codegen now inlines this as a direct
+    /// `store I8` into `cpu_ctx + next_fetch_access_offset`.
     pub set_next_fetch_access: BusSetNextFetchAccessFn,
+    /// Byte offset of `Arm7tdmiCore<I>.next_fetch_access` within the CPU
+    /// struct. Computed at trampoline-construction time via
+    /// `offset_of!`, so it captures the I-dependent layout once. Codegen
+    /// uses this to emit a direct `store I8` for the per-iter access
+    /// hint update, avoiding the extern-C trampoline call cost.
+    pub next_fetch_access_offset: u32,
 }
 
 /// Handle to a Cranelift JIT module. One per CPU instance; freed on CPU drop.
@@ -557,6 +569,20 @@ pub struct DynarecCompiler {
     /// for the lifetime of this compiler and can be re-referenced in every
     /// compiled function via `module.declare_func_in_func`.
     bus_imports: Option<BusImports>,
+    /// Cached field offsets within `Arm7tdmiCore<I>`. Populated from
+    /// the `BusTrampolines` once at compiler construction so codegen
+    /// can emit direct stores instead of trampoline calls for tiny
+    /// field updates (e.g., `next_fetch_access`).
+    cpu_offsets: CpuFieldOffsets,
+}
+
+/// Offsets of frequently-updated `Arm7tdmiCore<I>` fields. Captured at
+/// compiler-build time so the JIT can emit direct memory ops keyed off
+/// the `cpu_ctx` pointer rather than calling extern-C trampolines for
+/// single-store updates.
+#[derive(Clone, Copy, Default)]
+struct CpuFieldOffsets {
+    next_fetch_access: u32,
 }
 
 /// Imported function handles registered with the JITModule for the bus
@@ -659,6 +685,13 @@ impl DynarecCompiler {
 
         let mut module = JITModule::new(jit_builder);
         let ctx = module.make_context();
+
+        let cpu_offsets = bus
+            .as_ref()
+            .map(|b| CpuFieldOffsets {
+                next_fetch_access: b.next_fetch_access_offset,
+            })
+            .unwrap_or_default();
 
         let bus_imports = bus.map(|_| {
             let ptr_ty = module.isa().pointer_type();
@@ -853,6 +886,7 @@ impl DynarecCompiler {
             ctx,
             next_id: 0,
             bus_imports,
+            cpu_offsets,
         }
     }
 
@@ -2782,10 +2816,27 @@ impl DynarecCompiler {
                         .ins()
                         .call(fetch_cs_ref, &[cpu_ctx, addr_val, hint_val]);
                 };
+            // Inline `cpu.next_fetch_access = hint` as a direct I8 store
+            // into `cpu_ctx + offset`, avoiding the extern-C trampoline
+            // call. The offset is captured at compiler-build time via
+            // `offset_of!(Arm7tdmiCore<I>, next_fetch_access)`. Tests
+            // that pass a TestBus instead of a real CPU set the offset
+            // to 0 — fall back to the trampoline there.
+            let access_offset = self.cpu_offsets.next_fetch_access;
             let emit_set_access =
                 |builder: &mut FunctionBuilder, hint: u32| {
-                    let hint_val = builder.ins().iconst(types::I32, hint as i64);
-                    builder.ins().call(set_access_ref, &[cpu_ctx, hint_val]);
+                    if access_offset != 0 {
+                        let v = builder.ins().iconst(types::I8, hint as i64);
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            v,
+                            cpu_ctx,
+                            Offset32::new(access_offset as i32),
+                        );
+                    } else {
+                        let hint_val = builder.ins().iconst(types::I32, hint as i64);
+                        builder.ins().call(set_access_ref, &[cpu_ctx, hint_val]);
+                    }
                 };
             let _ = (&emit_fetch_iter, &emit_set_access); // silence unused when per_iter_fetch is off
 
@@ -3650,11 +3701,22 @@ impl DynarecCompiler {
                 // pc was already advanced by the per-iter fetch.
                 builder.switch_to_block(fallthrough_blk);
                 builder.seal_block(fallthrough_blk);
-                let set_access_ref = self
-                    .module
-                    .declare_func_in_func(imports.set_next_fetch_access, builder.func);
-                let seq_hint = builder.ins().iconst(types::I32, 1);
-                builder.ins().call(set_access_ref, &[cpu_ctx, seq_hint]);
+                let access_offset = self.cpu_offsets.next_fetch_access;
+                if access_offset != 0 {
+                    let seq = builder.ins().iconst(types::I8, 1);
+                    builder.ins().store(
+                        MemFlags::trusted(),
+                        seq,
+                        cpu_ctx,
+                        Offset32::new(access_offset as i32),
+                    );
+                } else {
+                    let set_access_ref = self
+                        .module
+                        .declare_func_in_func(imports.set_next_fetch_access, builder.func);
+                    let seq_hint = builder.ins().iconst(types::I32, 1);
+                    builder.ins().call(set_access_ref, &[cpu_ctx, seq_hint]);
+                }
                 builder.ins().jump(merge_blk, &[]);
 
                 builder.switch_to_block(merge_blk);
@@ -6516,6 +6578,11 @@ mod tests {
             thumb_fetch_charge_shift: test_thumb_fetch_charge_shift,
             arm_fetch_charge_shift: test_thumb_fetch_charge_shift,
             set_next_fetch_access: test_set_next_fetch_access,
+            // Tests don't use a real Arm7tdmiCore, so the inlined-store
+            // codegen would clobber random TestBus memory. Tests pass
+            // chain_slot=None which gates the inlined store off; this
+            // value is unread under that path. Set to 0 defensively.
+            next_fetch_access_offset: 0,
         }
     }
 
