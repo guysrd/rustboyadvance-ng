@@ -226,7 +226,9 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             thumb_step_with_fetch: Some(
                 crate::dynarec::thumb_step_with_fetch_for::<I>,
             ),
-            abort_check: Some(crate::dynarec::cached_block_should_abort_for::<I>),
+            thumb_step_with_fetch_and_abort: Some(
+                crate::dynarec::thumb_step_with_fetch_and_abort_for::<I>,
+            ),
             cpsr_offset: std::mem::offset_of!(Arm7tdmiCore<I>, cpsr) as u32,
             ..Default::default()
         });

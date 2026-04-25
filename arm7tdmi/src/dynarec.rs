@@ -23,8 +23,53 @@ use inkwell::execution_engine::JitFunction;
 /// and the THUMB_LUT handler table, both gated on that feature.
 /// Caller monomorphizes for `I = SysBus` (or any `MemoryInterface`)
 /// and registers via `LlvmBusTrampolines::thumb_step_with_fetch`.
+///
+/// Return:
+///   0  = AdvancePC handled, continue
+///   1  = PipelineFlushed (handler updated cpu.pc + cpu.pipeline)
 #[cfg(feature = "cached_interp")]
 pub unsafe extern "C" fn thumb_step_with_fetch_for<I: crate::memory::MemoryInterface>(
+    ctx: *mut u8,
+    fetch_addr: u32,
+    insn: u32,
+) -> u32 {
+    unsafe { thumb_step_inner::<I>(ctx, fetch_addr, insn) }
+}
+
+/// Variant that does the abort check FIRST, returns 0b10 immediately
+/// on yield-needed, otherwise falls through to the same step body
+/// as `thumb_step_with_fetch_for`. Used at the every-other-iter
+/// abort cadence in compiled blocks. Two specialized trampolines
+/// (instead of one with a runtime `abort_check` arg) so the inline
+/// path stays branchless on the call boundary.
+#[cfg(feature = "cached_interp")]
+pub unsafe extern "C" fn thumb_step_with_fetch_and_abort_for<
+    I: crate::memory::MemoryInterface,
+>(
+    ctx: *mut u8,
+    fetch_addr: u32,
+    insn: u32,
+) -> u32 {
+    use crate::CpuState;
+    let cpu = unsafe { &mut *(ctx as *mut crate::Arm7tdmiCore<I>) };
+    // Block was recorded as Thumb (only Thumb blocks reach the
+    // LLVM compiler). Bail if mode flipped.
+    if !matches!(cpu.cpsr.state(), CpuState::THUMB) {
+        return 0b10;
+    }
+    if cpu.bus.take_block_cache_dirty() {
+        cpu.block_cache.flush();
+        return 0b10;
+    }
+    if cpu.bus.cached_block_should_abort() {
+        return 0b10;
+    }
+    unsafe { thumb_step_inner::<I>(ctx, fetch_addr, insn) }
+}
+
+#[cfg(feature = "cached_interp")]
+#[inline(always)]
+unsafe fn thumb_step_inner<I: crate::memory::MemoryInterface>(
     ctx: *mut u8,
     fetch_addr: u32,
     insn: u32,
@@ -127,45 +172,6 @@ pub type BusStoreFn = unsafe extern "C" fn(*mut u8, u32, u32);
 /// dispatcher round-trip between blocks).
 pub type ThumbStepFn = unsafe extern "C" fn(*mut u8, u32, u32) -> u32;
 
-/// Mid-block abort check trampoline. Called between compiled
-/// instructions (every other call, mirroring scalar
-/// `replay_cached_block`) so a pending IRQ / DMA / dirtied RAM
-/// gets serviced with at most ~1 instruction of latency. Returns
-/// non-zero when the LLVM block should yield to the dispatcher
-/// (which then breaks the chain via the `0b10` return bit).
-pub type AbortCheckFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
-
-/// Generic abort-check trampoline. The two arguments mirror what
-/// scalar `replay_cached_block` checks at iteration boundaries:
-///   ctx          → *mut Arm7tdmiCore<I>
-///   entry_thumb  → 1 if the block was recorded in Thumb mode
-///
-/// Returns 1 if any of these are true:
-///   * cpu state flipped ARM<->Thumb since block entry
-///   * RAM was written by a previous instruction in this block
-///     (`take_block_cache_dirty`) — also flushes the cache
-///   * scheduler / IRQ / halt etc. requests a yield
-///     (`cached_block_should_abort`)
-#[cfg(feature = "cached_interp")]
-pub unsafe extern "C" fn cached_block_should_abort_for<
-    I: crate::memory::MemoryInterface,
->(
-    ctx: *mut u8,
-    entry_thumb: u32,
-) -> u32 {
-    use crate::CpuState;
-    let cpu = unsafe { &mut *(ctx as *mut crate::Arm7tdmiCore<I>) };
-    let was_thumb = entry_thumb != 0;
-    if matches!(cpu.cpsr.state(), CpuState::THUMB) != was_thumb {
-        return 1;
-    }
-    if cpu.bus.take_block_cache_dirty() {
-        cpu.block_cache.flush();
-        return 1;
-    }
-    if cpu.bus.cached_block_should_abort() { 1 } else { 0 }
-}
-
 /// Set of bus trampolines the LLVM JIT links against. Caller fills
 /// these (typically with monomorphized helper fns parameterized over
 /// the concrete `MemoryInterface` impl) and passes the struct to
@@ -190,13 +196,16 @@ pub struct LlvmBusTrampolines {
     pub load_with_idle_sh: Option<BusLoadFn>,
     /// Halfword store, no +1I.
     pub store_16: Option<BusStoreFn>,
-    /// Per-iter Thumb step (fetch + handler dispatch). Drives the
-    /// trampoline-mode block compile in `compile_thumb_block`.
+    /// Per-iter Thumb step (fetch + handler dispatch). Used on
+    /// even iterations of the compiled block (k = 0, 2, 4, ...).
     pub thumb_step_with_fetch: Option<ThumbStepFn>,
-    /// Mid-block yield check. Called between trampoline steps so the
-    /// block bails on IRQ / DMA / RAM-dirty conditions with the same
-    /// granularity the scalar replay loop uses.
-    pub abort_check: Option<AbortCheckFn>,
+    /// Same as `thumb_step_with_fetch` but does the mid-block abort
+    /// check FIRST and returns 0b10 if a yield is needed. Used on
+    /// odd iterations (k = 1, 3, 5, ...) — the every-other-iter
+    /// cadence scalar replay uses. Two specialized trampolines so
+    /// the per-iter path makes one extern C call, no runtime branch
+    /// on whether to abort-check.
+    pub thumb_step_with_fetch_and_abort: Option<ThumbStepFn>,
     /// Byte offset of `Arm7tdmiCore<I>.cpsr` within the cpu struct.
     /// LLVM block exit emits a direct load+store from cpu_ctx+offset
     /// to *cpsr_ptr so the dispatcher's `RegPSR::new(cpsr_word)`
@@ -315,7 +324,11 @@ impl LlvmCompiler {
         entry_pc: u32,
     ) -> Option<CompiledFn> {
         use inkwell::AddressSpace;
-        if opcodes.is_empty() {
+        // Compile every block; scalar fallback is faster on short
+        // blocks today, but per-format inline IR work is meant to
+        // close that gap.
+        const DYNAREC_MIN_BLOCK_LEN: usize = 1;
+        if opcodes.len() < DYNAREC_MIN_BLOCK_LEN {
             return None;
         }
         let step_fn = self.trampolines.thumb_step_with_fetch?;
@@ -324,23 +337,26 @@ impl LlvmCompiler {
             return None;
         }
 
-        let abort_fn = self.trampolines.abort_check?;
+        let step_abort_fn = self.trampolines.thumb_step_with_fetch_and_abort?;
         let module = self.context.create_module("thumb_block");
         let i32_t = self.context.i32_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
 
-        // Import thumb_step_with_fetch as `(*mut u8, u32, u32) -> u32`.
+        // Import the two step trampolines as `(*mut u8, u32, u32) -> u32`.
+        // step_ref is used on even iters (no abort check). step_abort_ref
+        // is used on odd iters (abort check folded in). Two specialized
+        // fns instead of one with a runtime arg → no extra branch on
+        // the call boundary, branch predictor doesn't care.
         let step_sig = i32_t.fn_type(
             &[ptr_t.into(), i32_t.into(), i32_t.into()],
             false,
         );
         let step_ref = module.add_function("rba_thumb_step", step_sig, None);
         self.engine.add_global_mapping(&step_ref, step_fn as usize);
-
-        // Import cached_block_should_abort as `(*mut u8, u32) -> u32`.
-        let abort_sig = i32_t.fn_type(&[ptr_t.into(), i32_t.into()], false);
-        let abort_ref = module.add_function("rba_abort_check", abort_sig, None);
-        self.engine.add_global_mapping(&abort_ref, abort_fn as usize);
+        let step_abort_ref =
+            module.add_function("rba_thumb_step_abort", step_sig, None);
+        self.engine
+            .add_global_mapping(&step_abort_ref, step_abort_fn as usize);
 
         let fn_ty = i32_t.fn_type(
             &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
@@ -350,9 +366,9 @@ impl LlvmCompiler {
         let name = format!("dynarec_block_{}", self.next_id);
         let func = module.add_function(&name, fn_ty, None);
         let entry = self.context.append_basic_block(func, "entry");
-        // Two exit blocks: one for normal end-of-block / PipelineFlushed
-        // (return 0), and one for mid-block yield (return 0b10) so the
-        // dispatcher breaks the chain.
+        // Three terminal blocks: normal end-of-block (return 0),
+        // PipelineFlushed early exit (return 0), mid-block abort
+        // (return 0b10 so dispatcher breaks the chain).
         let exit_blk = self.context.append_basic_block(func, "exit");
         let abort_blk = self.context.append_basic_block(func, "abort");
         let builder = self.context.create_builder();
@@ -361,71 +377,66 @@ impl LlvmCompiler {
         let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
         let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
 
-        let entry_thumb_v = i32_t.const_int(1, false);
-
-        // Emit one step call per recorded instruction. After each call,
-        // brif on result == 1 (PipelineFlushed) → exit early. Insert
-        // an abort-check between iterations so a yield-needed condition
-        // gets serviced within ~1 extra instr — same cadence as scalar
-        // replay's per-iter check.
+        // Emit one step call per recorded instruction. Pick the
+        // abort-aware trampoline on odd iters (k=1,3,5,...) so the
+        // mid-block yield check fires at the same cadence as scalar
+        // replay. Branch on the return:
+        //   0     → continue
+        //   0b01  → PipelineFlushed → exit
+        //   0b10  → mid-block abort → abort_blk
         for (k, &raw) in opcodes.iter().enumerate() {
-            // Mid-block abort check before iteration k (skip k=0 so
-            // the block always makes forward progress, matching scalar).
-            if k != 0 && (k & 1 == 1) {
-                let abort_call = builder
-                    .build_call(
-                        abort_ref,
-                        &[cpu_ctx.into(), entry_thumb_v.into()],
-                        "abort_res",
-                    )
-                    .ok()?;
-                let abort_res = abort_call
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                let zero = i32_t.const_int(0, false);
-                let abort_now = builder
-                    .build_int_compare(
-                        inkwell::IntPredicate::NE,
-                        abort_res,
-                        zero,
-                        "abort_now",
-                    )
-                    .ok()?;
-                let after_abort = self.context.append_basic_block(func, "after_abort");
-                builder
-                    .build_conditional_branch(abort_now, abort_blk, after_abort)
-                    .ok()?;
-                builder.position_at_end(after_abort);
-            }
-            // exec_addr = entry_pc + 2*k. fetch_addr = exec_addr + 4
-            // (Thumb pipeline-head convention).
             let exec_addr = entry_pc.wrapping_add((2 * k) as u32);
             let fetch_addr = exec_addr.wrapping_add(4);
             let fetch_addr_v = i32_t.const_int(fetch_addr as u64, false);
             let insn_v = i32_t.const_int(raw as u64, false);
+            let do_abort = k != 0 && (k & 1 == 1);
+            let callee = if do_abort { step_abort_ref } else { step_ref };
             let call = builder
                 .build_call(
-                    step_ref,
+                    callee,
                     &[cpu_ctx.into(), fetch_addr_v.into(), insn_v.into()],
                     "step_res",
                 )
                 .ok()?;
             let res = call.try_as_basic_value().unwrap_basic().into_int_value();
-            // brif res != 0 → exit_blk; else continue
-            let cont_blk = self.context.append_basic_block(func, "cont");
             let zero = i32_t.const_int(0, false);
-            let flushed = builder
+            // Fast path: if res == 0, continue. Else route by bits.
+            let nonzero = builder
                 .build_int_compare(
                     inkwell::IntPredicate::NE,
                     res,
                     zero,
-                    "flushed",
+                    "nonzero",
                 )
                 .ok()?;
+            let cont_blk = self.context.append_basic_block(func, "cont");
+            let stop_blk = self.context.append_basic_block(func, "stop");
             builder
-                .build_conditional_branch(flushed, exit_blk, cont_blk)
+                .build_conditional_branch(nonzero, stop_blk, cont_blk)
                 .ok()?;
+            // stop_blk: route to abort if bit 1 set, else exit (PipelineFlushed).
+            // Only emit the abort branch on iters that could have
+            // returned 0b10 — the even-iter step trampoline only
+            // returns 0 or 1, never 0b10.
+            builder.position_at_end(stop_blk);
+            if do_abort {
+                let two = i32_t.const_int(0b10, false);
+                let bit1 = builder.build_and(res, two, "bit1").ok()?;
+                let is_abort = builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        bit1,
+                        zero,
+                        "is_abort",
+                    )
+                    .ok()?;
+                builder
+                    .build_conditional_branch(is_abort, abort_blk, exit_blk)
+                    .ok()?;
+            } else {
+                // Even iter trampoline only returns 0/1. Nonzero == flushed.
+                builder.build_unconditional_branch(exit_blk).ok()?;
+            }
             builder.position_at_end(cont_blk);
         }
         // Fell through all iters — jump to exit.
