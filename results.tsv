@@ -14,3 +14,4 @@ phase1-f16f19hi	0	549.2	548.4	390.8	391.7	-78	0	0	0.0	0	0	0	accept	phase 1 expan
 harness-sw64	-47	499.1	532.2	386.0	399.8	34	68	0	70.9	0	1	0	accept	harness sweep=64KB after trampoline fix: pe -6.2%, mk -3.5%, 0/1 divs (correct but not faster than scalar yet — phase 4 needed)
 phase1-f14	-9	537.0	543.7	383.6	385.8	0	0	0	0.0	0	0	0	accept	phase 1: f14 push/pop inline (16 thumb formats inlined total)
 phase1-f15	-9	530.2	537.4	384.3	386.4	0	0	0	0.0	0	0	0	accept	phase 1: f15 ldm/stm inline (17 thumb formats inlined)
+phase4-f3-inline	0	490.9	537.3	388.0	386.4	0	0	0	54.7	0	0	0	accept	phase 4 step 1: f3 mov imm8 inline llvm ir (sw=4KB 0/0 div/drift, 64KB 0/34, but ~10fps SLOWER than per-instr — extern fetch_only + IR ops costs more than the trampoline's rust inline fast path)

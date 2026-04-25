@@ -16,7 +16,7 @@ pub mod replay;
 pub mod scan;
 pub mod table;
 
-pub use compiler::LlvmCompiler;
+pub use compiler::{CpuOffsets, LlvmCompiler};
 pub use scan::{BlockEnd, BlockSpec, Mode, scan_rom};
 pub use table::{AotTable, CompiledFn, aot_lookup};
 
@@ -115,6 +115,30 @@ pub fn compile_rom_with_seeds_and_step(
     step_thumb_fn: Option<replay::AotStepFn>,
     abort_thumb_fn: Option<replay::AotAbortFn>,
 ) -> AotTable {
+    compile_rom_with_seeds_step_offsets(
+        rom, rom_base, entry_pc, entry_mode, seeds,
+        replay_thumb_fn, step_thumb_fn, abort_thumb_fn, None, None,
+    )
+}
+
+/// Phase-4 variant of compile_rom_with_seeds_and_step that ALSO
+/// takes optional cpu state offsets and a fetch-only trampoline.
+/// When both `cpu_offsets` and `fetch_only_thumb_fn` are Some,
+/// emit_per_instr_thumb_block can emit inline LLVM IR for selected
+/// formats (F3 MOV imm8 first; more to come). When either is None,
+/// falls back to per-iter trampoline calls (phase 1 behavior).
+pub fn compile_rom_with_seeds_step_offsets(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+    cpu_offsets: Option<CpuOffsets>,
+    fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
+) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
     // coverage on the SDL replay we ALSO sweep aligned halfwords as
@@ -182,6 +206,12 @@ pub fn compile_rom_with_seeds_and_step(
         }
         _ => false,
     };
+    if let Some(off) = cpu_offsets {
+        compiler.register_cpu_offsets(off);
+    }
+    if let Some(fo) = fetch_only_thumb_fn {
+        compiler.register_fetch_only_thumb(fo);
+    }
 
     let mut table = AotTable::new();
     let mut emitted = 0usize;

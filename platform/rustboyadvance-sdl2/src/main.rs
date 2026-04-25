@@ -184,7 +184,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(false);
         let table = if use_per_instr {
             eprintln!("--aot: phase-1 per-instruction dispatch (AOT_USE_PER_INSTR=1)");
-            Box::new(arm7tdmi_aot::compile_rom_with_seeds_and_step(
+            // Phase-4 cpu state offsets for inline IR. arm7tdmi exposes
+            // them via Arm7tdmiCore::aot_field_offsets to keep the
+            // `next_fetch_access` field's pub(crate) visibility intact.
+            use arm7tdmi::Arm7tdmiCore;
+            let (pc_off, gpr_off, cpsr_off, nfa_off) =
+                Arm7tdmiCore::<SysBus>::aot_field_offsets();
+            let cpu_offsets = arm7tdmi_aot::CpuOffsets {
+                pc: pc_off as u32,
+                gpr: gpr_off as u32,
+                cpsr: cpsr_off as u32,
+                next_fetch_access: nfa_off as u32,
+            };
+            eprintln!(
+                "--aot: phase-4 cpu offsets pc={} gpr={} cpsr={} nfa={}",
+                cpu_offsets.pc, cpu_offsets.gpr, cpu_offsets.cpsr, cpu_offsets.next_fetch_access,
+            );
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_step_offsets(
                 &rom_bytes,
                 0x0800_0000,
                 entry_pc,
@@ -193,6 +209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
                 Some(arm7tdmi_aot::replay::aot_thumb_step_for::<SysBus>),
                 Some(arm7tdmi_aot::replay::aot_block_should_abort_thumb_for::<SysBus>),
+                Some(cpu_offsets),
+                Some(arm7tdmi_aot::replay::aot_thumb_fetch_only_for::<SysBus>),
             ))
         } else {
             Box::new(arm7tdmi_aot::compile_rom_with_seeds(

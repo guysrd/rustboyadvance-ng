@@ -238,6 +238,20 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
     /// AOT-side helper: per-iter Thumb step (fetch + pipeline shift +
     /// THUMB_LUT handler dispatch + AdvancePC bookkeeping). Mirrors
     /// what scalar `replay_cached_block` does for one iteration.
+    /// Phase-4 cpu state offsets for the AOT inline-IR emit.
+    /// next_fetch_access is `pub(crate)` so external crates can't use
+    /// `std::mem::offset_of!` directly — exposing the offsets via this
+    /// fn keeps the field visibility narrow while letting the AOT
+    /// compiler bake them as constants.
+    pub fn aot_field_offsets() -> (usize, usize, usize, usize) {
+        (
+            std::mem::offset_of!(Arm7tdmiCore<I>, pc),
+            std::mem::offset_of!(Arm7tdmiCore<I>, gpr),
+            std::mem::offset_of!(Arm7tdmiCore<I>, cpsr),
+            std::mem::offset_of!(Arm7tdmiCore<I>, next_fetch_access),
+        )
+    }
+
     /// arm7tdmi-aot's phase-0 trampoline calls this once per opcode.
     ///
     /// Returns:
@@ -846,6 +860,18 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             }
             CpuAction::PipelineFlushed => 1,
         }
+    }
+
+    /// Phase-4 helper: do just the per-iter fetch + cycle accounting +
+    /// pipeline shift. The block emit pairs this with inline LLVM IR
+    /// for the actual instruction effect. No dispatch, no pc update.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_thumb_fetch_only(&mut self, fetch_addr: u32) {
+        let access = self.next_fetch_access;
+        let val = self.load_16(fetch_addr, access);
+        self.pipeline[0] = self.pipeline[1];
+        self.pipeline[1] = val as u32;
     }
 
     /// AOT-side helper: mid-block abort check (K=2 cadence per I2).

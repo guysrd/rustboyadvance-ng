@@ -8,8 +8,24 @@ use inkwell::execution_engine::ExecutionEngine;
 #[cfg(test)]
 use inkwell::execution_engine::JitFunction;
 
-use crate::replay::{AotAbortFn, AotReplayFn, AotStepFn};
+use crate::replay::{AotAbortFn, AotFetchOnlyFn, AotReplayFn, AotStepFn};
 use crate::table::CompiledFn;
+
+/// Per-I cpu state field offsets baked into the compiled LLVM IR
+/// (per I8/I13 — single-pointer cpu_ctx ABI). The phase-4 inline-IR
+/// emit fns use these to GEP into the cpu_ctx without going through
+/// the trampoline. SDL frontend computes these via offset_of! and
+/// passes via `LlvmCompiler::register_cpu_offsets`.
+///
+/// All offsets are byte offsets within the `Arm7tdmiCore<I>` struct.
+/// `gpr_offset` points at gpr[0]; gpr[N] is at gpr_offset + N*4.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuOffsets {
+    pub pc: u32,
+    pub gpr: u32,
+    pub cpsr: u32,
+    pub next_fetch_access: u32,
+}
 
 /// Compiler handle. The `Context` is leaked to `'static` so the
 /// `ExecutionEngine` and modules can borrow it for the process
@@ -27,6 +43,13 @@ pub struct LlvmCompiler {
     pub(crate) step_thumb_fn: Option<AotStepFn>,
     /// Phase-1 mid-block abort check for K=2 cadence.
     pub(crate) abort_thumb_fn: Option<AotAbortFn>,
+    /// Phase-4 cpu state offsets for inline IR emit. None until
+    /// register_cpu_offsets is called; emit fns fall through to
+    /// the trampoline call when offsets are missing.
+    pub(crate) cpu_offsets: Option<CpuOffsets>,
+    /// Phase-4 fetch-only trampoline. Pairs with inline IR for the
+    /// instruction's effect. Set via register_fetch_only.
+    pub(crate) fetch_only_thumb_fn: Option<AotFetchOnlyFn>,
 }
 
 impl LlvmCompiler {
@@ -47,7 +70,23 @@ impl LlvmCompiler {
             replay_thumb_fn: None,
             step_thumb_fn: None,
             abort_thumb_fn: None,
+            cpu_offsets: None,
+            fetch_only_thumb_fn: None,
         })
+    }
+
+    /// Phase-4 hook: register cpu state offsets so emit fns can bake
+    /// them into IR for direct gpr/cpsr/pc access. Caller (SDL
+    /// frontend) computes via `std::mem::offset_of!` for the
+    /// monomorphized `Arm7tdmiCore<I>` and passes here.
+    pub fn register_cpu_offsets(&mut self, offsets: CpuOffsets) {
+        self.cpu_offsets = Some(offsets);
+    }
+
+    /// Phase-4 hook: register the fetch-only trampoline. Required
+    /// alongside `register_cpu_offsets` for inline IR emit to fire.
+    pub fn register_fetch_only_thumb(&mut self, f: AotFetchOnlyFn) {
+        self.fetch_only_thumb_fn = Some(f);
     }
 
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
@@ -91,6 +130,7 @@ impl LlvmCompiler {
         self.next_id += 1;
         let id = self.next_id;
         let module = self.context.create_module(&format!("aot_blk_pi_{}", id));
+        let i8_t = self.context.i8_type();
         let i32_t = self.context.i32_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
 
@@ -107,6 +147,24 @@ impl LlvmCompiler {
         let abort_name = format!("rba_aot_abort_{}", id);
         let abort_ref = module.add_function(&abort_name, abort_sig, None);
         self.engine.add_global_mapping(&abort_ref, abort_fn as usize);
+
+        // Phase-4 inline IR uses the fetch-only trampoline + cpu offsets.
+        // Both must be registered to enable inline IR; otherwise we fall
+        // back to the per-iter step trampoline call (phase-1 behavior).
+        let inline_enabled = self.cpu_offsets.is_some()
+            && self.fetch_only_thumb_fn.is_some();
+        let (fetch_only_ref, offsets) = if inline_enabled {
+            let fetch_only_fn = self.fetch_only_thumb_fn.unwrap();
+            let off = self.cpu_offsets.unwrap();
+            let fo_sig = self.context.void_type()
+                .fn_type(&[ptr_t.into(), i32_t.into()], false);
+            let fo_name = format!("rba_aot_fetch_only_{}", id);
+            let fo_ref = module.add_function(&fo_name, fo_sig, None);
+            self.engine.add_global_mapping(&fo_ref, fetch_only_fn as usize);
+            (Some(fo_ref), Some(off))
+        } else {
+            (None, None)
+        };
 
         // Block fn.
         let block_sig = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
@@ -141,11 +199,76 @@ impl LlvmCompiler {
             // Compute fetch_addr at compile time (constant).
             let exec_addr = entry_pc.wrapping_add((2 * k) as u32);
             let fetch_addr = exec_addr.wrapping_add(4);
-
-            // Phase 1: just call the step trampoline. Per-format
-            // inline IR replaces this in the next sub-step.
             let fa = i32_t.const_int(fetch_addr as u64, false);
             let insn = i32_t.const_int(opcode as u64, false);
+
+            // Phase-4 inline IR for F3 MOV imm8 (top5=00100, op=00).
+            // Encoding: 00100_RRR_IIIIIIII. Effects:
+            //   gpr[Rd] = imm8 (zero-extended)
+            //   cpsr.N = 0 (always — imm8 is positive)
+            //   cpsr.Z = (imm8 == 0)
+            //   cpsr.C, .V unchanged
+            //   pc = fetch_addr + 2
+            //   next_fetch_access = Seq (= 0)
+            // Cycle accounting via fetch-only trampoline (load_16 +
+            // pipeline shift) — same per-iter cost as scalar.
+            let f3_top5 = (opcode >> 11) & 0x1f;
+            let f3_op = (opcode >> 11) & 0x3;
+            if inline_enabled && f3_top5 == 0b00100 && f3_op == 0 {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let rd = ((opcode >> 8) & 0x7) as u32;
+                let imm = (opcode & 0xff) as u32;
+
+                // Cycle accounting + pipeline.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Store imm at gpr[rd] (gpr is u32 array; offset = gpr_off + rd*4).
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "gpr_rd_ptr").ok()?
+                };
+                builder.build_store(gpr_rd_ptr, i32_t.const_int(imm as u64, false)).ok()?;
+
+                // cpsr = (cpsr_old & ~(N|Z)) | (Z if imm==0). N=0 always for imm8.
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "cpsr_old").ok()?
+                    .into_int_value();
+                // Mask: clear bits N (0x80000000) and Z (0x40000000).
+                let nz_mask_inv = i32_t.const_int(0x3fff_ffff, false);
+                let cleared = builder.build_and(cpsr_old, nz_mask_inv, "cpsr_cleared").ok()?;
+                // Set Z if imm == 0 (constant at compile time).
+                let z_bit = if imm == 0 { 0x4000_0000u32 } else { 0 };
+                let final_cpsr = builder
+                    .build_or(cleared, i32_t.const_int(z_bit as u64, false), "cpsr_new").ok()?;
+                builder.build_store(cpsr_ptr, final_cpsr).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // next_fetch_access = Seq (= 1, MemoryAccess enum). u8.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue to next iter (no PipelineFlushed branch — F3 MOV is always AdvancePC).
+                let cont_blk = self.context.append_basic_block(block_fn, "cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Fallback: per-iter step trampoline.
             let scall = builder
                 .build_call(step_ref, &[cpu_ctx.into(), fa.into(), insn.into()], "step_res")
                 .ok()?;

@@ -55,6 +55,22 @@ pub unsafe extern "C" fn aot_thumb_step_for<I: MemoryInterface>(
     cpu.aot_thumb_step(fetch_addr, insn)
 }
 
+/// Phase-4 fetch-only trampoline: does just fetch + cycle accounting
+/// + pipeline shift, NO dispatch. The block emit pairs this with
+/// inline LLVM IR for the actual instruction effect.
+pub type AotFetchOnlyFn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    fetch_addr: u32,
+);
+
+pub unsafe extern "C" fn aot_thumb_fetch_only_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    fetch_addr: u32,
+) {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    cpu.aot_thumb_fetch_only(fetch_addr);
+}
+
 /// Phase-1 mid-block abort check (K=2 cadence, called from
 /// compile_thumb_block before iters with k odd && k != 0).
 /// Returns 1 if the AOT block should yield to the dispatcher
