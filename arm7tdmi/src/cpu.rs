@@ -135,6 +135,13 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     pub aot_table: *const u8,
     #[cfg(feature = "aot_dispatch")]
     pub aot_lookup_fn: Option<fn(*const u8, u32) -> usize>,
+    /// Coverage counters for `aot_score = aot_hits / (aot_hits +
+    /// scalar_hits)` reporting at replay end. Bumped from
+    /// `step_block`'s top-of-iteration logic.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_hits: u64,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_misses: u64,
 }
 
 // BlockCache holds handler function pointers keyed by entry-PC; cloning a CPU
@@ -165,6 +172,10 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: None,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses: 0,
         }
     }
 }
@@ -193,6 +204,10 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: None,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses: 0,
         }
     }
 
@@ -354,6 +369,10 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: None,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses: 0,
         }
     }
 
@@ -689,13 +708,28 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             // path.
             #[cfg(feature = "aot_dispatch")]
             if let Some(can_chain) = self.try_aot_dispatch() {
+                self.aot_dispatch_hits = self.aot_dispatch_hits.wrapping_add(1);
                 if !can_chain {
                     return;
                 }
-                if self.bus.cached_block_should_abort() {
-                    return;
-                }
+                // No inter-block abort check after AOT dispatch.
+                // AOT scan splits at every Bcc / direct branch /
+                // exception, producing many small blocks. Adding the
+                // dispatcher's `cached_block_should_abort` here would
+                // fire it MORE frequently than scalar's cadence
+                // (scalar's blocks are larger because they're traced
+                // along the actually-executed path). The frequency
+                // mismatch caused MK divergence on a multi-hour
+                // soak — see `findings-phase0c-abort-cadence.md`.
+                // The K=2 intra-block check inside the NEXT AOT
+                // block (or scalar block) still services pending
+                // IRQs / scheduler events with bounded latency.
                 continue;
+            }
+            #[cfg(feature = "aot_dispatch")]
+            if self.aot_lookup_fn.is_some() {
+                // Hook installed, lookup missed — count as scalar dispatch.
+                self.aot_dispatch_misses = self.aot_dispatch_misses.wrapping_add(1);
             }
 
             let thumb = matches!(self.cpsr.state(), CpuState::THUMB);

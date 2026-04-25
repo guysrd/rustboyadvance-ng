@@ -174,10 +174,19 @@ fn classify_thumb(op: u16, pc: u32) -> Class {
                 // 0b1101_1110 is undefined.
                 Class::Branch(BlockEnd::ExceptionEdge)
             } else {
-                // Bcc imm8: target = pc + 4 + sign_extend(imm8) << 1.
-                let imm8 = (op & 0xFF) as i8 as i32;
-                let target = pc.wrapping_add(4).wrapping_add((imm8 as u32) << 1);
-                Class::Branch(BlockEnd::Conditional { target })
+                // Bcc imm8: handler decides at runtime — taken sets
+                // PipelineFlushed (block ends), not-taken returns
+                // AdvancePC (block continues). So scan treats Bcc as
+                // Linear; the runtime trampoline handles both via
+                // aot_thumb_step's CpuAction return value.
+                //
+                // Pre-fix: scan terminated at Bcc as Conditional,
+                // producing artificially short blocks that diverged
+                // from scalar's longer same-execution-path blocks
+                // (4 div drift on MK at sweep>=4KB). Fixed by
+                // treating Bcc as Linear.
+                let _ = pc;
+                Class::Linear
             }
         }
         // F18 B (1110_0xxxxxxxxxxx).
@@ -507,15 +516,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_thumb_bcc() {
-        // F16 Bcc with cond=0 (EQ), offset 4: pc + 4 + (4 << 1) = pc + 12.
+    fn classify_thumb_bcc_is_linear() {
+        // F16 Bcc is now Linear at scan time — handler decides at
+        // runtime whether to PipelineFlush (taken) or AdvancePC
+        // (not-taken). Pre-fix it was Conditional which artificially
+        // shortened blocks vs scalar's traced path.
         let op = 0b1101_0000_0000_0100u16;
-        let pc = 0x0800_0000;
-        match classify_thumb(op, pc) {
-            Class::Branch(BlockEnd::Conditional { target }) => {
-                assert_eq!(target, 0x0800_000c);
-            }
-            other => panic!("expected Conditional, got {:?}", other),
+        match classify_thumb(op, 0x0800_0000) {
+            Class::Linear => {}
+            other => panic!("expected Linear, got {:?}", other),
         }
     }
 

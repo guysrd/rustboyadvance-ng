@@ -343,6 +343,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "replay done: {} frames in {:.2}s wall, {:.1} avg fps ({} emulated cycles)",
                     replay_frames, elapsed, fps, now
                 );
+                #[cfg(feature = "aot")]
+                {
+                    let h = gba.cpu.aot_dispatch_hits;
+                    let m = gba.cpu.aot_dispatch_misses;
+                    let total = h + m;
+                    let pct = if total > 0 { 100.0 * h as f64 / total as f64 } else { 0.0 };
+                    println!(
+                        "aot dispatch: {} hits, {} misses, {:.2}% coverage",
+                        h, m, pct
+                    );
+                }
                 break 'running;
             }
         }
