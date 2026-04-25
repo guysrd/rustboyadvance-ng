@@ -2,6 +2,7 @@
 members = [
     "core",
     "arm7tdmi",
+    "arm7tdmi-aot",
     "utils",
     "platform/rustboyadvance-sdl2",
     "platform/rustboyadvance-libretro",
