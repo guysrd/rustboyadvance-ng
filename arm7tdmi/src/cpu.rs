@@ -97,10 +97,10 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     pub pc: u32,
     pub bus: Shared<I>,
 
-    // pub(crate) so the sibling dynarec::trampolines module can touch
-    // these when paying fetch cycles at a compiled block's entry. Kept
-    // out of the external public surface because they're part of the
-    // pipeline emulation invariants.
+    // pub(crate) so the sibling dynarec module can touch these when
+    // dispatching compiled block entries. Kept out of the external
+    // public surface because they're part of the pipeline emulation
+    // invariants.
     pub(crate) next_fetch_access: MemoryAccess,
     pub(crate) pipeline: [u32; 2],
     pub gpr: [u32; 15],
@@ -209,43 +209,28 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         WeakPointer::new(self as *mut Arm7tdmiCore<I>)
     }
 
-    /// Install a Cranelift-backed dynarec on the block cache and flip
-    /// the runtime dispatch flag so every compiled block in the cache
-    /// runs its native fn pointer instead of the interpreter replay
-    /// loop. Call once per CPU after construction.
+    /// Install the LLVM-via-inkwell dynarec on the block cache and
+    /// flip the runtime dispatch flag so every compiled block in the
+    /// cache runs its native fn pointer instead of the interpreter
+    /// replay loop. Call once per CPU after construction.
     ///
-    /// After this, new blocks recorded during step_block get a
-    /// JIT-compile attempt; supported Thumb shapes dispatch through
-    /// Cranelift output, everything else falls back to the existing
-    /// cached-interp replay path.
+    /// After this, new all-Thumb ROM blocks recorded during step_block
+    /// are JIT-compiled by the LLVM backend; ARM blocks and any
+    /// LLVM-rejected blocks fall back to the cached_interp scalar
+    /// replay path.
     #[cfg(feature = "dynarec")]
     pub fn enable_dynarec(&mut self) {
-        let compiler = super::dynarec::DynarecCompiler::new_with_bus(
-            super::dynarec::trampolines::for_cpu::<I>(),
-        );
-        self.block_cache.enable_dynarec(compiler);
-        self.dynarec_dispatch_enabled = true;
-    }
-
-    /// Install the LLVM-via-inkwell dynarec compiler. Registers the
-    /// scalar-handler-step trampoline so compiled Thumb blocks can
-    /// dispatch the per-instruction work via the existing handlers.
-    /// Side-by-side with `enable_dynarec` (Cranelift) — call both to
-    /// give LLVM first try at each block, Cranelift catches what LLVM
-    /// can't compile yet. Sets `dynarec_dispatch_enabled` so the
-    /// compiled-block dispatcher path runs.
-    #[cfg(feature = "dynarec_llvm")]
-    pub fn enable_dynarec_llvm(&mut self) {
         let mut compiler =
-            crate::dynarec_llvm::LlvmCompiler::new().expect("LlvmCompiler::new");
-        compiler.register_trampolines(crate::dynarec_llvm::LlvmBusTrampolines {
+            crate::dynarec::LlvmCompiler::new().expect("LlvmCompiler::new");
+        compiler.register_trampolines(crate::dynarec::LlvmBusTrampolines {
             thumb_step_with_fetch: Some(
-                crate::dynarec_llvm::thumb_step_with_fetch_for::<I>,
+                crate::dynarec::thumb_step_with_fetch_for::<I>,
             ),
+            abort_check: Some(crate::dynarec::cached_block_should_abort_for::<I>),
             cpsr_offset: std::mem::offset_of!(Arm7tdmiCore<I>, cpsr) as u32,
             ..Default::default()
         });
-        self.block_cache.enable_dynarec_llvm(compiler);
+        self.block_cache.enable_dynarec(compiler);
         self.dynarec_dispatch_enabled = true;
     }
 
@@ -674,15 +659,6 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             && let Some(compiled) = block.compiled
         {
             self.dispatch_compiled_count = self.dispatch_compiled_count.wrapping_add(1);
-            // Bump the per-shape execution counter under `shape_profile`
-            // so `scripts/dynarec_measure.sh` can retrain the W_* weights
-            // from measured gameplay rather than hand-picked constants.
-            // No-op under the default build (the feature gates the whole
-            // counter infra).
-            #[cfg(feature = "shape_profile")]
-            if let Some(shape) = block.shape {
-                super::dynarec::shape_profile::tick(shape);
-            }
 
             let mut pc_out: u32 = 0;
             let mut cpsr_word: u32 = self.cpsr.get();

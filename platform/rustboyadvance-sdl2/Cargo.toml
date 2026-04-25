@@ -21,18 +21,7 @@ winres = "0.1"
 [features]
 default = []
 debugger = ["rustboyadvance-core/debugger"]
-# Pass-through so `cargo build -p rustboyadvance-sdl2 --features dynarec`
-# exercises the Cranelift dynarec path. Used by the shape-opt measure
-# harness (scripts/dynarec_measure.sh) to time the SDL frontend against
-# real ROMs.
 cached_interp = ["rustboyadvance-core/cached_interp"]
+# LLVM-backed dynarec for the --jit flag. Build env needs
+# LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
 dynarec = ["rustboyadvance-core/dynarec"]
-# LLVM-via-inkwell JIT backend, in migration. Currently not wired
-# into the dispatch path — feature just pulls the dep so SDL builds
-# end-to-end. Build env needs LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
-dynarec_llvm = ["rustboyadvance-core/dynarec_llvm"]
-# Per-shape execution-count profiler, gated through to the arm7tdmi
-# crate. When on, the SDL frontend dumps the counter table at replay
-# exit so the measure harness can retrain `W_*` weights from real
-# gameplay. See docs/dynarec-arm64-program.md.
-shape_profile = ["rustboyadvance-core/shape_profile", "dynarec"]

@@ -61,14 +61,11 @@ pub struct Options {
     #[arg(long = "no-audio")]
     pub no_audio: bool,
 
-    /// Enable the Cranelift dynarec for CPU dispatch. Off by default
-    /// because (a) on pokeemerald PGO'd cached-interp currently beats
-    /// the compiled path end-to-end and (b) dynarec has known latent
-    /// correctness issues in some games that gba-tests don't catch.
-    /// Turn on for profiling / measurement runs; expect possible
-    /// visual glitches in some ROMs until the dispatch path is
-    /// hardened. Built into any binary compiled with `--features
-    /// dynarec` (or `--features shape_profile`).
+    /// Enable the LLVM dynarec for CPU dispatch. Off by default.
+    /// All-Thumb ROM blocks are JIT-compiled by the LLVM backend;
+    /// ARM blocks and any LLVM-rejected blocks fall back to the
+    /// cached_interp scalar replay path. Built into any binary
+    /// compiled with `--features dynarec`.
     #[arg(long = "jit")]
     pub jit: bool,
 

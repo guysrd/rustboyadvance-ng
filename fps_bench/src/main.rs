@@ -25,9 +25,9 @@ struct Options {
     #[arg(long = "replay", value_name = "PATH")]
     replay: Option<PathBuf>,
 
-    /// Enable the Cranelift dynarec dispatch path (off by default; see
-    /// core/src/gba.rs:108 for the rationale). Requires a --features dynarec
-    /// build of this binary.
+    /// Enable the LLVM dynarec dispatch path (off by default).
+    /// Requires a --features dynarec build of this binary, which in
+    /// turn needs LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
     #[arg(long = "jit")]
     jit: bool,
 
@@ -67,7 +67,7 @@ fn main() {
     if opts.jit {
         #[cfg(feature = "dynarec")]
         {
-            eprintln!("--jit: enabling Cranelift dynarec dispatch");
+            eprintln!("--jit: enabling LLVM dynarec dispatch");
             gba.cpu.enable_dynarec();
         }
         #[cfg(not(feature = "dynarec"))]

@@ -126,37 +126,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gba.skip_bios();
     }
 
-    // Dynarec dispatcher control. Two independent triggers, either
-    // turns it on:
-    //   1. --jit CLI flag (runtime choice, any --features dynarec build)
-    //   2. --features shape_profile (implies the counter needs
-    //      compiled blocks to fire — pointless without dynarec on)
-    //
-    // Off by default because dynarec has latent correctness issues
-    // (pokeemerald palette corruption observed when enabled under
-    // --features dynarec alone). Keep the SDL frontend playable on
-    // default `--features dynarec` builds; opt into the possibly-buggy
-    // JIT dispatch with --jit when measuring or testing the JIT itself.
-    let want_dynarec = opts.jit || cfg!(feature = "shape_profile");
-    if want_dynarec {
-        // Both dynarec backends can be on at once. LLVM gets first
-        // try at every Thumb block; what it cant compile yet falls
-        // back to Cranelift; what neither handles falls back to
-        // cached_interp scalar. Once the LLVM backend reaches
-        // feature parity the Cranelift one is removed.
-        #[cfg(feature = "dynarec_llvm")]
-        {
-            info!("Enabling LLVM dynarec dispatcher");
-            gba.cpu.enable_dynarec_llvm();
-        }
+    // Dynarec dispatcher control. Off by default; --jit turns the
+    // LLVM-backed dispatcher on. ARM blocks and any LLVM-rejected
+    // blocks fall back to cached_interp scalar replay.
+    if opts.jit {
         #[cfg(feature = "dynarec")]
         {
-            info!("Enabling Cranelift dynarec dispatcher");
+            info!("Enabling LLVM dynarec dispatcher");
             gba.cpu.enable_dynarec();
         }
-        #[cfg(not(any(feature = "dynarec", feature = "dynarec_llvm")))]
+        #[cfg(not(feature = "dynarec"))]
         log::warn!(
-            "--jit requested but this binary was built without dynarec or dynarec_llvm; ignoring"
+            "--jit requested but this binary was built without dynarec; ignoring"
         );
     }
 
@@ -333,20 +314,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 #[cfg(feature = "dynarec")]
                 {
-                    let (total, compiled, linked) = gba.cpu.block_cache.compile_stats();
+                    let (total, compiled) = gba.cpu.block_cache.compile_stats();
                     let pct = if total > 0 {
                         100.0 * compiled as f64 / total as f64
                     } else {
                         0.0
                     };
-                    let link_pct = if compiled > 0 {
-                        100.0 * linked as f64 / compiled as f64
-                    } else {
-                        0.0
-                    };
                     println!(
-                        "block cache: {} rom blocks, {} compiled ({:.1}%), {} chain-linked ({:.1}% of compiled)",
-                        total, compiled, pct, linked, link_pct,
+                        "block cache: {} rom blocks, {} compiled ({:.1}%)",
+                        total, compiled, pct,
                     );
                     let cc = gba.cpu.dispatch_compiled_count;
                     let ic = gba.cpu.dispatch_interp_count;
@@ -360,30 +336,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "dispatch: {} total, {} compiled ({:.2}%), {} interp",
                         total_d, cc, cc_pct, ic,
                     );
-                    let fn_ns = rustboyadvance_core::arm7tdmi::dynarec::trampolines::FETCH_N_TOTAL_NS
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let fn_calls = rustboyadvance_core::arm7tdmi::dynarec::trampolines::FETCH_N_CALLS
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if fn_calls > 0 {
-                        let avg_ns = fn_ns as f64 / fn_calls as f64;
-                        let pct_of_wall = (fn_ns as f64 / 1e9) / elapsed * 100.0;
-                        println!(
-                            "thumb_fetch_n: {} calls, {:.1}ms total ({:.2}% wall), {:.1} ns/call avg",
-                            fn_calls, fn_ns as f64 / 1e6, pct_of_wall, avg_ns,
-                        );
-                    }
-                }
-                // Dump the per-shape execution counters. Output is parsed
-                // by scripts/dynarec_measure.sh to retrain `W_*` weights
-                // against real gameplay frequency. No-op on the default
-                // build (the whole module is gated on this feature).
-                #[cfg(feature = "shape_profile")]
-                {
-                    print!(
-                        "{}",
-                        rustboyadvance_core::arm7tdmi::dynarec::shape_profile::dump()
-                    );
-                    println!("shape_profile:replay_wall_seconds {:.3}", elapsed);
                 }
                 break 'running;
             }

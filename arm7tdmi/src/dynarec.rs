@@ -1,19 +1,16 @@
 //! LLVM-via-inkwell JIT backend for the ARM7TDMI dynarec.
 //!
-//! This module is the replacement for the Cranelift-based `dynarec` module.
 //! Goal: per-instruction codegen quality at rustc-LTO parity (LLVM is rustc's
-//! own backend), in exchange for slower compile time. Compile-time cost is
-//! mitigated later by lazy compilation of hot blocks only.
+//! own backend), in exchange for slower compile time. Build needs
+//! LLVM_SYS_181_PREFIX=/usr/lib/llvm-18 (Ubuntu 24.04, see Cargo.toml notes).
 //!
-//! Migration phases:
-//!   1. Scaffolding + hello-world JIT (this commit). Proves inkwell+LLVM 18
-//!      links and runs an emitted function.
-//!   2. Thumb body emit functions, one format at a time, mirroring the
-//!      existing Cranelift versions in `crate::dynarec`. SDL-tested per
-//!      shape.
-//!   3. ARM compile path.
-//!   4. Tail emits + chain mechanism + abort handling.
-//!   5. Wire into `crate::cache` dispatch, remove Cranelift.
+//! Block compile path: `compile_thumb_block` walks the recorded raw u16
+//! opcodes and emits a single LLVM IR function that calls the
+//! `thumb_step_with_fetch_for<I>` trampoline N times, then flushes
+//! cpsr back through `*cpsr_ptr` so the dispatcher's `RegPSR::new`
+//! readback preserves handler-driven cpsr changes. Per-format inline
+//! IR replacements for the trampoline calls are work-in-progress
+//! (compile_thumb_format1..F13 standalone fns).
 
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
@@ -56,9 +53,7 @@ pub unsafe extern "C" fn thumb_step_with_fetch_for<I: crate::memory::MemoryInter
     }
 }
 
-/// Thumb shift kind for F1 (LSL/LSR/ASR). Mirrors the type in
-/// `crate::dynarec` (Cranelift backend) so dynarec_llvm doesn't have
-/// to pull in that whole module.
+/// Thumb shift kind for F1 (LSL/LSR/ASR).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShiftKind {
     Lsl,
@@ -132,16 +127,54 @@ pub type BusStoreFn = unsafe extern "C" fn(*mut u8, u32, u32);
 /// dispatcher round-trip between blocks).
 pub type ThumbStepFn = unsafe extern "C" fn(*mut u8, u32, u32) -> u32;
 
-/// Set of bus trampolines the LLVM JIT can link against. Caller fills
-/// these from `crate::dynarec::trampolines::for_cpu::<I>()` (or test
-/// stubs) and passes the struct to `LlvmCompiler::register_trampolines`
-/// once at compiler construction. The compile fns then refer to the
-/// trampolines by name and inkwell maps the names to these pointers
-/// at JIT link time.
+/// Mid-block abort check trampoline. Called between compiled
+/// instructions (every other call, mirroring scalar
+/// `replay_cached_block`) so a pending IRQ / DMA / dirtied RAM
+/// gets serviced with at most ~1 instruction of latency. Returns
+/// non-zero when the LLVM block should yield to the dispatcher
+/// (which then breaks the chain via the `0b10` return bit).
+pub type AbortCheckFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
+
+/// Generic abort-check trampoline. The two arguments mirror what
+/// scalar `replay_cached_block` checks at iteration boundaries:
+///   ctx          → *mut Arm7tdmiCore<I>
+///   entry_thumb  → 1 if the block was recorded in Thumb mode
+///
+/// Returns 1 if any of these are true:
+///   * cpu state flipped ARM<->Thumb since block entry
+///   * RAM was written by a previous instruction in this block
+///     (`take_block_cache_dirty`) — also flushes the cache
+///   * scheduler / IRQ / halt etc. requests a yield
+///     (`cached_block_should_abort`)
+#[cfg(feature = "cached_interp")]
+pub unsafe extern "C" fn cached_block_should_abort_for<
+    I: crate::memory::MemoryInterface,
+>(
+    ctx: *mut u8,
+    entry_thumb: u32,
+) -> u32 {
+    use crate::CpuState;
+    let cpu = unsafe { &mut *(ctx as *mut crate::Arm7tdmiCore<I>) };
+    let was_thumb = entry_thumb != 0;
+    if matches!(cpu.cpsr.state(), CpuState::THUMB) != was_thumb {
+        return 1;
+    }
+    if cpu.bus.take_block_cache_dirty() {
+        cpu.block_cache.flush();
+        return 1;
+    }
+    if cpu.bus.cached_block_should_abort() { 1 } else { 0 }
+}
+
+/// Set of bus trampolines the LLVM JIT links against. Caller fills
+/// these (typically with monomorphized helper fns parameterized over
+/// the concrete `MemoryInterface` impl) and passes the struct to
+/// `LlvmCompiler::register_trampolines` once at compiler construction.
+/// The compile fns then refer to the trampolines by name and inkwell
+/// maps the names to these pointers at JIT link time.
 #[derive(Clone, Copy, Default)]
 pub struct LlvmBusTrampolines {
-    /// Word load WITHOUT the +1I idle (used for fetches and PUSH/POP
-    /// in the cranelift backend; same here).
+    /// Word load WITHOUT the +1I idle (used for fetches and PUSH/POP).
     pub load_32: Option<BusLoadFn>,
     /// Word load WITH the +1I idle (LDR family).
     pub load_with_idle_32: Option<BusLoadFn>,
@@ -160,6 +193,10 @@ pub struct LlvmBusTrampolines {
     /// Per-iter Thumb step (fetch + handler dispatch). Drives the
     /// trampoline-mode block compile in `compile_thumb_block`.
     pub thumb_step_with_fetch: Option<ThumbStepFn>,
+    /// Mid-block yield check. Called between trampoline steps so the
+    /// block bails on IRQ / DMA / RAM-dirty conditions with the same
+    /// granularity the scalar replay loop uses.
+    pub abort_check: Option<AbortCheckFn>,
     /// Byte offset of `Arm7tdmiCore<I>.cpsr` within the cpu struct.
     /// LLVM block exit emits a direct load+store from cpu_ctx+offset
     /// to *cpsr_ptr so the dispatcher's `RegPSR::new(cpsr_word)`
@@ -287,6 +324,7 @@ impl LlvmCompiler {
             return None;
         }
 
+        let abort_fn = self.trampolines.abort_check?;
         let module = self.context.create_module("thumb_block");
         let i32_t = self.context.i32_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
@@ -299,6 +337,11 @@ impl LlvmCompiler {
         let step_ref = module.add_function("rba_thumb_step", step_sig, None);
         self.engine.add_global_mapping(&step_ref, step_fn as usize);
 
+        // Import cached_block_should_abort as `(*mut u8, u32) -> u32`.
+        let abort_sig = i32_t.fn_type(&[ptr_t.into(), i32_t.into()], false);
+        let abort_ref = module.add_function("rba_abort_check", abort_sig, None);
+        self.engine.add_global_mapping(&abort_ref, abort_fn as usize);
+
         let fn_ty = i32_t.fn_type(
             &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
             false,
@@ -307,16 +350,54 @@ impl LlvmCompiler {
         let name = format!("dynarec_block_{}", self.next_id);
         let func = module.add_function(&name, fn_ty, None);
         let entry = self.context.append_basic_block(func, "entry");
+        // Two exit blocks: one for normal end-of-block / PipelineFlushed
+        // (return 0), and one for mid-block yield (return 0b10) so the
+        // dispatcher breaks the chain.
         let exit_blk = self.context.append_basic_block(func, "exit");
+        let abort_blk = self.context.append_basic_block(func, "abort");
         let builder = self.context.create_builder();
         builder.position_at_end(entry);
 
         let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
         let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
 
+        let entry_thumb_v = i32_t.const_int(1, false);
+
         // Emit one step call per recorded instruction. After each call,
-        // brif on result == 1 (PipelineFlushed) → exit early.
+        // brif on result == 1 (PipelineFlushed) → exit early. Insert
+        // an abort-check between iterations so a yield-needed condition
+        // gets serviced within ~1 extra instr — same cadence as scalar
+        // replay's per-iter check.
         for (k, &raw) in opcodes.iter().enumerate() {
+            // Mid-block abort check before iteration k (skip k=0 so
+            // the block always makes forward progress, matching scalar).
+            if k != 0 && (k & 1 == 1) {
+                let abort_call = builder
+                    .build_call(
+                        abort_ref,
+                        &[cpu_ctx.into(), entry_thumb_v.into()],
+                        "abort_res",
+                    )
+                    .ok()?;
+                let abort_res = abort_call
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
+                let zero = i32_t.const_int(0, false);
+                let abort_now = builder
+                    .build_int_compare(
+                        inkwell::IntPredicate::NE,
+                        abort_res,
+                        zero,
+                        "abort_now",
+                    )
+                    .ok()?;
+                let after_abort = self.context.append_basic_block(func, "after_abort");
+                builder
+                    .build_conditional_branch(abort_now, abort_blk, after_abort)
+                    .ok()?;
+                builder.position_at_end(after_abort);
+            }
             // exec_addr = entry_pc + 2*k. fetch_addr = exec_addr + 4
             // (Thumb pipeline-head convention).
             let exec_addr = entry_pc.wrapping_add((2 * k) as u32);
@@ -349,6 +430,28 @@ impl LlvmCompiler {
         }
         // Fell through all iters — jump to exit.
         builder.build_unconditional_branch(exit_blk).ok()?;
+
+        // abort_blk: flush cpsr like exit and return 0b10 so dispatcher
+        // breaks the chain.
+        builder.position_at_end(abort_blk);
+        let abort_cpsr_field = unsafe {
+            builder
+                .build_in_bounds_gep(
+                    self.context.i8_type(),
+                    cpu_ctx,
+                    &[i32_t.const_int(cpsr_offset as u64, false)],
+                    "cpsr_field_abort",
+                )
+                .ok()?
+        };
+        let abort_cpsr_now = builder
+            .build_load(i32_t, abort_cpsr_field, "cpsr_now_abort")
+            .ok()?
+            .into_int_value();
+        builder.build_store(cpsr_ptr, abort_cpsr_now).ok()?;
+        builder
+            .build_return(Some(&i32_t.const_int(0b10, false)))
+            .ok()?;
 
         // exit_blk: flush cpu.cpsr (raw u32 at cpsr_offset) to *cpsr_ptr,
         // return 0.
