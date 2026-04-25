@@ -72,6 +72,27 @@ pub enum Thumb4Op {
 pub type CompiledFn =
     unsafe extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u8) -> u32;
 
+/// Memory access trampoline: `(*mut u8 cpu_ctx, u32 addr) -> u32`.
+/// Same shape as the Cranelift backend's `BusLoad32Fn`. The compiled
+/// LLVM block calls these directly via inkwell's `add_global_mapping`
+/// to bridge into the bus implementation owned by the host.
+pub type BusLoadFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
+
+/// Set of bus trampolines the LLVM JIT can link against. Caller fills
+/// these from `crate::dynarec::trampolines::for_cpu::<I>()` (or test
+/// stubs) and passes the struct to `LlvmCompiler::register_trampolines`
+/// once at compiler construction. The compile fns then refer to the
+/// trampolines by name and inkwell maps the names to these pointers
+/// at JIT link time.
+#[derive(Clone, Copy, Default)]
+pub struct LlvmBusTrampolines {
+    /// Word load WITHOUT the +1I idle (used for fetches and PUSH/POP
+    /// in the cranelift backend; same here).
+    pub load_32: Option<BusLoadFn>,
+    /// Word load WITH the +1I idle (LDR family).
+    pub load_with_idle_32: Option<BusLoadFn>,
+}
+
 /// LLVM JIT compiler. One per CPU instance; freed on Drop, which releases
 /// the generated machine-code pages back to the OS.
 ///
@@ -85,6 +106,11 @@ pub struct LlvmCompiler {
     /// Counter for generating unique function names within the module.
     /// Each compiled block gets `dynarec_block_<n>`.
     next_id: u64,
+    /// Bus trampoline pointers, registered once via `register_trampolines`.
+    /// Compiled blocks reference these by name (extern function declarations
+    /// in the LLVM module); inkwell's `add_global_mapping` resolves the
+    /// names to the function pointers stored here.
+    trampolines: LlvmBusTrampolines,
 }
 
 impl LlvmCompiler {
@@ -108,7 +134,38 @@ impl LlvmCompiler {
             context,
             engine,
             next_id: 0,
+            trampolines: LlvmBusTrampolines::default(),
         })
+    }
+
+    /// Register bus trampolines so compiled blocks can call into the
+    /// host's memory implementation. Call ONCE after `new`, before
+    /// any compile_* method that emits memory ops. Idempotent; the
+    /// last call wins.
+    pub fn register_trampolines(&mut self, t: LlvmBusTrampolines) {
+        self.trampolines = t;
+    }
+
+    /// Helper: declare an extern function in `module` with the
+    /// `(*mut u8, u32) -> u32` shape and bind it to `fn_ptr` via the
+    /// execution engine's global mapping. Returns the FunctionValue
+    /// so the builder can `build_call` it.
+    fn import_load_trampoline<'a>(
+        &self,
+        module: &'a inkwell::module::Module<'static>,
+        name: &str,
+        fn_ptr: BusLoadFn,
+    ) -> inkwell::values::FunctionValue<'a> {
+        use inkwell::AddressSpace;
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let fn_ty = i32_t.fn_type(&[ptr_t.into(), i32_t.into()], false);
+        let func = module.add_function(name, fn_ty, None);
+        // Bind the symbol name to the actual host function pointer.
+        // SAFETY: BusLoadFn has the matching ABI; inkwell will hand
+        // the pointer to the JIT's symbol resolver.
+        self.engine.add_global_mapping(&func, fn_ptr as usize);
+        func
     }
 
     /// Hello-world: compile and run a function that returns 42. Used in
@@ -284,6 +341,85 @@ impl LlvmCompiler {
         self.engine
             .add_module(&module)
             .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F6 LDR PC-relative (`LDR Rd, [PC, #imm8 * 4]`).
+    /// Address is computed at codegen time from `instr_pc`:
+    ///   addr = ((instr_pc + 4) & ~3) + imm8 * 4
+    /// (PC + 4 because the Thumb pipeline-head convention leaves PC
+    /// pointing two instrs ahead during decode; & ~3 aligns.)
+    /// Calls `load_with_idle_32` (charges +1I per LDR semantics) and
+    /// stores the result to gpr[rd]. No flag updates.
+    pub fn compile_thumb_format6(
+        &mut self,
+        rd: u8,
+        imm8: u8,
+        instr_pc: u32,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+        let load_fn = self
+            .trampolines
+            .load_with_idle_32
+            .ok_or_else(|| "load_with_idle_32 trampoline not registered".to_string())?;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let load_ref = self.import_load_trampoline(&module, "rba_load_idle_32", load_fn);
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
+
+        // addr = ((instr_pc + 4) & ~3) + imm8 * 4 — fully constant.
+        let addr_const =
+            ((instr_pc.wrapping_add(4)) & !3u32).wrapping_add((imm8 as u32) * 4);
+        let addr_val = i32_t.const_int(addr_const as u64, false);
+
+        // Call the LDR trampoline.
+        let call = builder
+            .build_call(
+                load_ref,
+                &[cpu_ctx.into(), addr_val.into()],
+                "ldr_val",
+            )
+            .map_err(|e| format!("call: {}", e))?;
+        let val = call.try_as_basic_value().unwrap_basic().into_int_value();
+
+        // Store to gpr[rd].
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        builder
+            .build_store(rd_addr, val)
+            .map_err(|e| format!("store: {}", e))?;
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
         let raw = self
             .engine
             .get_function_address(&name)
@@ -1416,6 +1552,33 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F6 LDR PC-relative: install a stub trampoline that returns a
+    /// known sentinel, run a compiled `LDR r3, [PC, #4]` block, assert
+    /// gpr[3] holds the sentinel.
+    #[test]
+    fn thumb_f6_ldr_pc_rel() {
+        // Stub trampoline — ignores ctx + addr, returns 0xCAFEBABE.
+        unsafe extern "C" fn fake_ldr(_ctx: *mut u8, _addr: u32) -> u32 {
+            0xCAFEBABE
+        }
+        let mut compiler = LlvmCompiler::new().expect("new");
+        compiler.register_trampolines(LlvmBusTrampolines {
+            load_with_idle_32: Some(fake_ldr),
+            ..Default::default()
+        });
+        let func = compiler
+            .compile_thumb_format6(3, /*imm8*/ 1, /*instr_pc*/ 0x0800_0100)
+            .expect("compile LDR PC-rel");
+        let mut gpr: [u32; 15] = [0; 15];
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[3], 0xCAFEBABE);
     }
 
     /// F5 MOV: r8 ← r2 (high reg dest, low reg src). No flag update.
