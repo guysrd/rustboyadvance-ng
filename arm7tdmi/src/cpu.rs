@@ -486,6 +486,61 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             return 0; // AdvancePC
         }
 
+        // F7 LDR/STR with reg offset — raw & 0xf200 == 0x5000.
+        // Encoding: 0101_LB_0_OOO_BBB_DDD; L=bit 11 (load), B=bit 10 (byte), O=Ro.
+        // addr = gpr[Rb] + gpr[Ro]. Mirrors thumb/exec.rs::exec_thumb_ldr_str_reg_offset.
+        if (insn & 0xf200) == 0x5000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let byte = (insn >> 10) & 0x1 != 0;
+            let ro = ((insn >> 6) & 0x7) as usize;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let addr = self.gpr[rb].wrapping_add(self.gpr[ro]);
+            if load {
+                let data = if byte {
+                    self.load_8(addr, MemoryAccess::NonSeq) as u32
+                } else {
+                    self.ldr_word(addr, MemoryAccess::NonSeq)
+                };
+                self.gpr[rd] = data;
+                self.idle_cycle();
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                let value = self.gpr[rd];
+                if byte {
+                    self.store_8(addr, value as u8, MemoryAccess::NonSeq);
+                } else {
+                    self.store_aligned_32(addr, value, MemoryAccess::NonSeq);
+                }
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F10 LDRH/STRH with imm5*2 offset — raw & 0xf000 == 0x8000.
+        // Encoding: 1000_L_IIIII_BBB_DDD; L=bit 11 (load).
+        // offset = imm5 << 1. Mirrors thumb/exec.rs::exec_thumb_ldr_str_halfword.
+        if (insn & 0xf000) == 0x8000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let imm5 = ((insn >> 6) & 0x1f) as i32;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let base = self.gpr[rb] as i32;
+            let addr = base.wrapping_add(imm5 << 1) as u32;
+            if load {
+                let data = self.ldr_half(addr, MemoryAccess::NonSeq);
+                self.idle_cycle();
+                self.gpr[rd] = data;
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                self.store_aligned_16(addr, self.gpr[rd] as u16, MemoryAccess::NonSeq);
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
         // F9 LDR/STR with imm5 offset — raw & 0xe000 == 0x6000.
         // Encoding: 011_BL_IIIII_BBB_DDD; B=bit 12 (1 → byte), L=bit 11 (1 → load).
         // Mirrors thumb/exec.rs::exec_thumb_ldr_str_imm_offset → do_exec_thumb_ldr_str.
