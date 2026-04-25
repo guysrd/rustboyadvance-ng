@@ -139,12 +139,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // JIT dispatch with --jit when measuring or testing the JIT itself.
     let want_dynarec = opts.jit || cfg!(feature = "shape_profile");
     if want_dynarec {
-        info!("Enabling Cranelift dynarec dispatcher");
+        // Both dynarec backends can be on at once. LLVM gets first
+        // try at every Thumb block; what it cant compile yet falls
+        // back to Cranelift; what neither handles falls back to
+        // cached_interp scalar. Once the LLVM backend reaches
+        // feature parity the Cranelift one is removed.
+        #[cfg(feature = "dynarec_llvm")]
+        {
+            info!("Enabling LLVM dynarec dispatcher");
+            gba.cpu.enable_dynarec_llvm();
+        }
         #[cfg(feature = "dynarec")]
-        gba.cpu.enable_dynarec();
-        #[cfg(not(feature = "dynarec"))]
+        {
+            info!("Enabling Cranelift dynarec dispatcher");
+            gba.cpu.enable_dynarec();
+        }
+        #[cfg(not(any(feature = "dynarec", feature = "dynarec_llvm")))]
         log::warn!(
-            "--jit requested but this binary was built without --features dynarec; ignoring"
+            "--jit requested but this binary was built without dynarec or dynarec_llvm; ignoring"
         );
     }
 

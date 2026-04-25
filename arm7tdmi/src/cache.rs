@@ -173,6 +173,13 @@ pub struct BlockCache<I: MemoryInterface> {
     /// dynarec feature is on.
     #[cfg(feature = "dynarec")]
     compiler: Option<DynarecCompiler>,
+    /// LLVM-via-inkwell compiler. Side-by-side with Cranelift during
+    /// the migration. Tried first in `finish_record`; for blocks the
+    /// LLVM backend doesn't support yet (most), falls through to the
+    /// Cranelift compiler. Once the LLVM backend reaches feature parity
+    /// the Cranelift one is removed.
+    #[cfg(feature = "dynarec_llvm")]
+    llvm_compiler: Option<crate::dynarec_llvm::LlvmCompiler>,
     /// Link-time block-chaining waiters. Keyed by the target block's
     /// `BlockKey`; each entry is the list of chain slots belonging to
     /// already-compiled blocks that fall through to this target and
@@ -711,6 +718,8 @@ impl<I: MemoryInterface> Default for BlockCache<I> {
             recording: None,
             #[cfg(feature = "dynarec")]
             compiler: None,
+            #[cfg(feature = "dynarec_llvm")]
+            llvm_compiler: None,
             #[cfg(feature = "dynarec")]
             waiters: FxHashMap::default(),
         }
@@ -771,6 +780,17 @@ impl<I: MemoryInterface> BlockCache<I> {
     #[cfg(feature = "dynarec")]
     pub fn enable_dynarec(&mut self, compiler: DynarecCompiler) {
         self.compiler = Some(compiler);
+    }
+
+    /// Install an LLVM-backed dynarec compiler alongside (or instead of)
+    /// Cranelift. `finish_record` tries LLVM first; falls through to
+    /// Cranelift for shapes the LLVM backend doesn't support yet.
+    #[cfg(feature = "dynarec_llvm")]
+    pub fn enable_dynarec_llvm(
+        &mut self,
+        compiler: crate::dynarec_llvm::LlvmCompiler,
+    ) {
+        self.llvm_compiler = Some(compiler);
     }
 
     /// True if a dynarec compiler has been installed.
@@ -835,23 +855,60 @@ impl<I: MemoryInterface> BlockCache<I> {
             // write, so compilation would burn a Cranelift codegen pass
             // for a single use. ROM blocks stay warm for the whole run.
             let pc = key.0 & !1;
+
+            // Track whether ANY compile (LLVM or Cranelift) succeeded.
+            let mut compiled_via_jit = false;
+
+            // LLVM compile first (when feature on). compile_thumb_block
+            // emits a sequence of thumb_step_with_fetch trampoline
+            // calls — every Thumb block shape compiles correctly via
+            // this path. ARM blocks fall through to Cranelift.
+            #[cfg(feature = "dynarec_llvm")]
             if is_rom_address(pc)
+                && let Some(c) = self.llvm_compiler.as_mut()
+            {
+                let raws_opt: Option<Vec<u16>> = block
+                    .instrs
+                    .iter()
+                    .map(|i| match i {
+                        DecodedInstr::Thumb { raw, .. } => Some(*raw),
+                        DecodedInstr::Arm { .. } => None,
+                    })
+                    .collect();
+                if let Some(raws) = raws_opt {
+                    let block_start_addr =
+                        (block.entry_pc & !1).wrapping_sub(4);
+                    if let Some(f) =
+                        c.compile_thumb_block(&raws, block_start_addr)
+                    {
+                        let f_typed: CompiledThumbFn = unsafe {
+                            std::mem::transmute::<
+                                crate::dynarec_llvm::CompiledFn,
+                                CompiledThumbFn,
+                            >(f)
+                        };
+                        block.compiled = Some(f_typed);
+                        let len_bytes = (block.instrs.len() as u32).wrapping_mul(2);
+                        let fallthrough_pc =
+                            (block.entry_pc & !1).wrapping_add(len_bytes);
+                        block.fallthrough_key =
+                            Some(BlockKey::new(fallthrough_pc, true));
+                        compiled_via_jit = true;
+                    }
+                }
+            }
+
+            // Cranelift compile, only if LLVM didn't succeed.
+            if !compiled_via_jit
+                && is_rom_address(pc)
                 && let Some(compiler) = self.compiler.as_mut()
                 && let Some(result) = try_compile_thumb(compiler, &block)
             {
                 block.compiled = Some(result.func);
                 block.chain_slot = result.chain_slot;
-                // Fall-through key: (entry_pc + 2*len) with the Thumb
-                // bit preserved — the block-cache lookup key for the
-                // next block on the sequential path.
                 let len_bytes = (block.instrs.len() as u32).wrapping_mul(2);
                 let fallthrough_pc = (block.entry_pc & !1).wrapping_add(len_bytes);
                 block.fallthrough_key = Some(BlockKey::new(fallthrough_pc, true));
-                // Tag the block with its shape category so the dispatcher
-                // can `shape_profile::tick` the right counter on every
-                // invocation. Only meaningful when the compile succeeded
-                // — interpreter-path blocks don't have a bench-comparable
-                // shape.
                 #[cfg(feature = "shape_profile")]
                 {
                     let raws: Vec<u16> = block

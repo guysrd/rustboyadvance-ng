@@ -227,6 +227,28 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.dynarec_dispatch_enabled = true;
     }
 
+    /// Install the LLVM-via-inkwell dynarec compiler. Registers the
+    /// scalar-handler-step trampoline so compiled Thumb blocks can
+    /// dispatch the per-instruction work via the existing handlers.
+    /// Side-by-side with `enable_dynarec` (Cranelift) — call both to
+    /// give LLVM first try at each block, Cranelift catches what LLVM
+    /// can't compile yet. Sets `dynarec_dispatch_enabled` so the
+    /// compiled-block dispatcher path runs.
+    #[cfg(feature = "dynarec_llvm")]
+    pub fn enable_dynarec_llvm(&mut self) {
+        let mut compiler =
+            crate::dynarec_llvm::LlvmCompiler::new().expect("LlvmCompiler::new");
+        compiler.register_trampolines(crate::dynarec_llvm::LlvmBusTrampolines {
+            thumb_step_with_fetch: Some(
+                crate::dynarec_llvm::thumb_step_with_fetch_for::<I>,
+            ),
+            cpsr_offset: std::mem::offset_of!(Arm7tdmiCore<I>, cpsr) as u32,
+            ..Default::default()
+        });
+        self.block_cache.enable_dynarec_llvm(compiler);
+        self.dynarec_dispatch_enabled = true;
+    }
+
     pub fn from_saved_state(bus: Shared<I>, state: SavedCpuState) -> Arm7tdmiCore<I> {
         Arm7tdmiCore {
             bus,

@@ -21,6 +21,41 @@ use inkwell::execution_engine::ExecutionEngine;
 #[cfg(test)]
 use inkwell::execution_engine::JitFunction;
 
+/// Generic per-iter Thumb step trampoline. Scoped under
+/// `cached_interp` because it dereferences `cpu.next_fetch_access`
+/// and the THUMB_LUT handler table, both gated on that feature.
+/// Caller monomorphizes for `I = SysBus` (or any `MemoryInterface`)
+/// and registers via `LlvmBusTrampolines::thumb_step_with_fetch`.
+#[cfg(feature = "cached_interp")]
+pub unsafe extern "C" fn thumb_step_with_fetch_for<I: crate::memory::MemoryInterface>(
+    ctx: *mut u8,
+    fetch_addr: u32,
+    insn: u32,
+) -> u32 {
+    use crate::CpuAction;
+    use crate::memory::{MemoryAccess, MemoryInterface};
+    let cpu = unsafe { &mut *(ctx as *mut crate::Arm7tdmiCore<I>) };
+    let access = cpu.next_fetch_access;
+    let val = cpu.load_16(fetch_addr, access);
+    cpu.pipeline[0] = cpu.pipeline[1];
+    cpu.pipeline[1] = val as u32;
+    // Pipeline-head pc convention: scalar's self.pc at handler-call
+    // time IS `fetch_addr` (= exec_addr + 4). After AdvancePC scalar
+    // does pc += 2 → exec_addr + 6 = fetch_addr + 2.
+    cpu.pc = fetch_addr;
+    let thumb_info =
+        &crate::Arm7tdmiCore::<I>::THUMB_LUT[(insn >> 6) as usize & 0x3FF];
+    match (thumb_info.handler_fn)(cpu, insn as u16) {
+        CpuAction::AdvancePC(access) => {
+            cpu.next_fetch_access = access;
+            cpu.pc = fetch_addr.wrapping_add(2);
+            let _ = MemoryAccess::default();
+            0
+        }
+        CpuAction::PipelineFlushed => 1,
+    }
+}
+
 /// Thumb shift kind for F1 (LSL/LSR/ASR). Mirrors the type in
 /// `crate::dynarec` (Cranelift backend) so dynarec_llvm doesn't have
 /// to pull in that whole module.
@@ -81,6 +116,22 @@ pub type BusLoadFn = unsafe extern "C" fn(*mut u8, u32) -> u32;
 /// Memory STORE trampoline: `(*mut u8 cpu_ctx, u32 addr, u32 value)`.
 pub type BusStoreFn = unsafe extern "C" fn(*mut u8, u32, u32);
 
+/// Single-instruction-step trampoline: `(ctx, fetch_addr, insn) -> u32`.
+/// Mirrors scalar `replay_cached_block`'s per-iter logic in one extern
+/// "C" call: fetch+pipeline shift, set cpu.pc to pipeline-head, dispatch
+/// the Thumb LUT handler with the recorded insn word, post-process the
+/// CpuAction return.
+///
+/// Return:
+///   0 = AdvancePC handled, continue
+///   1 = PipelineFlushed (handler updated cpu.pc + cpu.pipeline already)
+///
+/// Lets the LLVM JIT compile any Thumb block shape via a sequence of
+/// these calls + a final cpsr flush. Per-instruction perf is similar
+/// to scalar interp; the JIT win comes from the chain mechanism (no
+/// dispatcher round-trip between blocks).
+pub type ThumbStepFn = unsafe extern "C" fn(*mut u8, u32, u32) -> u32;
+
 /// Set of bus trampolines the LLVM JIT can link against. Caller fills
 /// these from `crate::dynarec::trampolines::for_cpu::<I>()` (or test
 /// stubs) and passes the struct to `LlvmCompiler::register_trampolines`
@@ -106,6 +157,14 @@ pub struct LlvmBusTrampolines {
     pub load_with_idle_sh: Option<BusLoadFn>,
     /// Halfword store, no +1I.
     pub store_16: Option<BusStoreFn>,
+    /// Per-iter Thumb step (fetch + handler dispatch). Drives the
+    /// trampoline-mode block compile in `compile_thumb_block`.
+    pub thumb_step_with_fetch: Option<ThumbStepFn>,
+    /// Byte offset of `Arm7tdmiCore<I>.cpsr` within the cpu struct.
+    /// LLVM block exit emits a direct load+store from cpu_ctx+offset
+    /// to *cpsr_ptr so the dispatcher's `RegPSR::new(cpsr_word)`
+    /// writeback doesn't stomp handler-driven cpsr changes.
+    pub cpsr_offset: u32,
 }
 
 /// LLVM JIT compiler. One per CPU instance; freed on Drop, which releases
@@ -199,6 +258,123 @@ impl LlvmCompiler {
         let func = module.add_function(name, fn_ty, None);
         self.engine.add_global_mapping(&func, fn_ptr as usize);
         func
+    }
+
+    /// Compile a Thumb block by emitting N calls to the
+    /// `thumb_step_with_fetch` trampoline (one per recorded
+    /// instruction), then flushing cpu.cpsr to *cpsr_ptr at exit.
+    /// This is the trampoline-mode block compile that gets us to SDL
+    /// parity before the per-format LLVM IR fully replaces the
+    /// trampoline calls. Once each Thumb format has a real LLVM emit
+    /// (most are done already — see `compile_thumb_format1..F13`),
+    /// this fn becomes the orchestrator that picks per-instr:
+    /// inline-IR vs trampoline-fallback per shape support.
+    ///
+    /// Returns None if the trampoline isn't registered or if any
+    /// instruction is ARM (mode-flip not handled here).
+    pub fn compile_thumb_block(
+        &mut self,
+        opcodes: &[u16],
+        entry_pc: u32,
+    ) -> Option<CompiledFn> {
+        use inkwell::AddressSpace;
+        if opcodes.is_empty() {
+            return None;
+        }
+        let step_fn = self.trampolines.thumb_step_with_fetch?;
+        let cpsr_offset = self.trampolines.cpsr_offset;
+        if cpsr_offset == 0 {
+            return None;
+        }
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        // Import thumb_step_with_fetch as `(*mut u8, u32, u32) -> u32`.
+        let step_sig = i32_t.fn_type(
+            &[ptr_t.into(), i32_t.into(), i32_t.into()],
+            false,
+        );
+        let step_ref = module.add_function("rba_thumb_step", step_sig, None);
+        self.engine.add_global_mapping(&step_ref, step_fn as usize);
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let exit_blk = self.context.append_basic_block(func, "exit");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+        let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
+
+        // Emit one step call per recorded instruction. After each call,
+        // brif on result == 1 (PipelineFlushed) → exit early.
+        for (k, &raw) in opcodes.iter().enumerate() {
+            // exec_addr = entry_pc + 2*k. fetch_addr = exec_addr + 4
+            // (Thumb pipeline-head convention).
+            let exec_addr = entry_pc.wrapping_add((2 * k) as u32);
+            let fetch_addr = exec_addr.wrapping_add(4);
+            let fetch_addr_v = i32_t.const_int(fetch_addr as u64, false);
+            let insn_v = i32_t.const_int(raw as u64, false);
+            let call = builder
+                .build_call(
+                    step_ref,
+                    &[cpu_ctx.into(), fetch_addr_v.into(), insn_v.into()],
+                    "step_res",
+                )
+                .ok()?;
+            let res = call.try_as_basic_value().unwrap_basic().into_int_value();
+            // brif res != 0 → exit_blk; else continue
+            let cont_blk = self.context.append_basic_block(func, "cont");
+            let zero = i32_t.const_int(0, false);
+            let flushed = builder
+                .build_int_compare(
+                    inkwell::IntPredicate::NE,
+                    res,
+                    zero,
+                    "flushed",
+                )
+                .ok()?;
+            builder
+                .build_conditional_branch(flushed, exit_blk, cont_blk)
+                .ok()?;
+            builder.position_at_end(cont_blk);
+        }
+        // Fell through all iters — jump to exit.
+        builder.build_unconditional_branch(exit_blk).ok()?;
+
+        // exit_blk: flush cpu.cpsr (raw u32 at cpsr_offset) to *cpsr_ptr,
+        // return 0.
+        builder.position_at_end(exit_blk);
+        let cpsr_field_addr = unsafe {
+            builder
+                .build_in_bounds_gep(
+                    self.context.i8_type(),
+                    cpu_ctx,
+                    &[i32_t.const_int(cpsr_offset as u64, false)],
+                    "cpsr_field",
+                )
+                .ok()?
+        };
+        let cpsr_now = builder
+            .build_load(i32_t, cpsr_field_addr, "cpsr_now")
+            .ok()?
+            .into_int_value();
+        builder.build_store(cpsr_ptr, cpsr_now).ok()?;
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .ok()?;
+
+        self.engine.add_module(&module).ok()?;
+        let raw = self.engine.get_function_address(&name).ok()?;
+        Some(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
     }
 
     /// Hello-world: compile and run a function that returns 42. Used in
