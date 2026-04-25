@@ -121,6 +121,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     normal_panic(panic_info);
     // }));
 
+    // Per I11: enable_aot_on MUST be called before any
+    // skip_bios() / frame() / step. Doing it right after
+    // GameBoyAdvance::new ensures the BIOS reset path also goes
+    // through the AOT table (currently misses → scalar, but the
+    // hook is in place).
+    #[cfg(feature = "aot")]
+    let _aot_table_keepalive: Option<Box<arm7tdmi_aot::AotTable>> = if opts.aot {
+        eprintln!("--aot: scanning ROM + populating AOT table...");
+        let t0 = std::time::Instant::now();
+        let rom_bytes = std::fs::read(&opts.rom)?;
+        let entry_pc = arm7tdmi_aot::scan::cart_entry_pc(&rom_bytes)
+            .ok_or("ROM bytes 0..3 don't decode as ARM B (cart entry); not a valid GBA ROM?")?;
+        let table = Box::new(arm7tdmi_aot::compile_rom(
+            &rom_bytes,
+            0x0800_0000,
+            entry_pc,
+            arm7tdmi_aot::Mode::Arm,
+        ));
+        eprintln!(
+            "--aot: scan/compile done in {} ms; {} blocks compiled, {} pages allocated",
+            t0.elapsed().as_millis(),
+            table.block_count(),
+            table.page_count(),
+        );
+        arm7tdmi_aot::enable_aot_on(&mut gba.cpu, table.as_ref());
+        Some(table)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "aot"))]
+    if opts.aot {
+        log::warn!(
+            "--aot requested but binary built without --features aot; ignoring"
+        );
+    }
+
     if opts.skip_bios {
         println!("Skipping bios animation..");
         gba.skip_bios();
@@ -128,8 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if opts.jit {
         log::warn!(
-            "--jit is a no-op on this branch (cache_interp scalar only). \
-             AOT-LLVM work lives behind future feature flags."
+            "--jit is a no-op on this branch. use --aot for the AOT-LLVM dispatcher."
         );
     }
 

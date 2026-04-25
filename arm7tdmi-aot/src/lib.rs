@@ -52,3 +52,52 @@ pub fn enable_aot_on<I: MemoryInterface>(cpu: &mut Arm7tdmiCore<I>, table: &AotT
     let table_ptr = table as *const AotTable as *const u8;
     cpu.install_aot_hook(table_ptr, aot_lookup_for_hook);
 }
+
+/// Phase-0 entry point. Scan ROM + populate an AotTable with placeholder
+/// blocks (none yet — phase-0 step-4b will add trampoline-mode emit).
+///
+/// `rom`        — full ROM bytes (cartridge or BIOS).
+/// `rom_base`   — GBA address-space base for `rom` (e.g. `0x08000000`
+///                for cart, `0x00000000` for BIOS).
+/// `entry_pc`   — initial entry point. For cart, decode via
+///                `scan::cart_entry_pc(rom)` first. For BIOS, pass 0.
+/// `entry_mode` — the entry's CPU mode (typically `Mode::Arm`).
+///
+/// Returns an `AotTable` populated with no blocks for now — coverage
+/// will be 0% until step-4b adds the emit. The returned table is
+/// passed to `enable_aot_on(cpu, &table)` and the caller keeps it
+/// alive for the CPU's lifetime.
+pub fn compile_rom(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+) -> AotTable {
+    let _blocks = scan_rom(rom, rom_base, vec![(entry_pc, entry_mode)]);
+    // Phase-0 step-4a: scan runs but no IR is emitted yet. The
+    // table starts empty; the dispatcher misses every lookup and
+    // falls through to scalar replay. Phase-0 step-4b adds the
+    // placeholder emit (one trampoline call per block).
+    AotTable::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: compile_rom on the real pokeemerald ROM doesn't
+    /// panic and returns a usable (empty) table. Skipped if ROM
+    /// file isn't present.
+    #[test]
+    fn compile_rom_pokeemerald_smoke() {
+        let path = "/home/user/pokeemerlad/pokeemerald/pokeemerald.gba";
+        let rom = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let entry = scan::cart_entry_pc(&rom).expect("decode cart B");
+        let table = compile_rom(&rom, 0x0800_0000, entry, Mode::Arm);
+        // Phase-0 step-4a: no blocks compiled yet.
+        assert_eq!(table.block_count(), 0);
+    }
+}

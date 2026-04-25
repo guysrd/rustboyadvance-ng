@@ -2539,6 +2539,7 @@ dependencies = [
 name = "rustboyadvance-sdl2"
 version = "0.1.0"
 dependencies = [
+ "arm7tdmi-aot",
  "bit",
  "bytesize",
  "clap",

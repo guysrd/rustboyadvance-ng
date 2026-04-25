@@ -62,3 +62,7 @@ elf_support = []
 debugger = ["nom", "rustyline", "fuzzy-matcher", "elf_support", "goblin", "arm7tdmi/debugger"]
 # See arm7tdmi/Cargo.toml for the feature description.
 cached_interp = ["arm7tdmi/cached_interp"]
+# AOT dispatch hook on the CPU struct. arm7tdmi-aot's enable_aot_on
+# uses this to install the lookup fn. Inkwell stays out of core's
+# build graph; the SDL frontend pulls in arm7tdmi-aot directly.
+aot_dispatch = ["arm7tdmi/aot_dispatch", "cached_interp"]

@@ -63,9 +63,17 @@ pub struct Options {
 
     /// No-op on the `aot-llvm` branch — the LLVM JIT was retired here
     /// (see docs/llvm-jit-status.md on shape-opt/apr22 for rationale).
-    /// Reserved for the AOT-LLVM dispatcher when that lands.
+    /// Use `--aot` for the AOT-LLVM dispatcher.
     #[arg(long = "jit")]
     pub jit: bool,
+
+    /// Enable the AOT-LLVM dispatcher. At ROM load, scan reachable
+    /// blocks, batch-compile them into native code, populate the
+    /// PC->fn table, install the dispatcher hook. Requires
+    /// `--features aot` build (which needs LLVM_SYS_181_PREFIX).
+    /// See docs/aot-llvm-program.md for the experiment program.
+    #[arg(long = "aot")]
+    pub aot: bool,
 
     /// Print an FNV-1a hash of the framebuffer every N frames while
     /// replaying (format: `fb_hash: frame=N cycle=C hash=HHHHHHHH`).

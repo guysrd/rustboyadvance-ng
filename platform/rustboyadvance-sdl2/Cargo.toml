@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 rustboyadvance-core = { path = "../../core/", features = ["elf_support"] }
 rustboyadvance-utils = { path = "../../utils/" }
+arm7tdmi-aot = { path = "../../arm7tdmi-aot", optional = true }
 sdl2 = { version = "0.38.0", features = ["image"] }
 bytesize = "2.0.1"
 clap = { version = "4.5.46", features = ["derive"] }
@@ -22,3 +23,5 @@ winres = "0.1"
 default = []
 debugger = ["rustboyadvance-core/debugger"]
 cached_interp = ["rustboyadvance-core/cached_interp"]
+# AOT-LLVM dispatcher. Build env needs LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
+aot = ["dep:arm7tdmi-aot", "rustboyadvance-core/aot_dispatch"]
