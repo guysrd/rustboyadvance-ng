@@ -83,26 +83,34 @@ impl LlvmCompiler {
         let step_fn = self.step_thumb_fn?;
         let abort_fn = self.abort_thumb_fn?;
 
-        let module = self.context.create_module("aot_blk_pi");
+        // Use per-module unique symbol names for the externs.
+        // Without this, every block module declares "rba_aot_step"
+        // and the JIT engine's global symbol table gets confused
+        // across many modules — that was the suspect cause of the
+        // sweep>=4KB divergence.
+        self.next_id += 1;
+        let id = self.next_id;
+        let module = self.context.create_module(&format!("aot_blk_pi_{}", id));
         let i32_t = self.context.i32_type();
         let ptr_t = self.context.ptr_type(AddressSpace::default());
 
-        // Imports: step + abort trampolines.
+        // Imports: step + abort trampolines, unique-named per module.
         let step_sig = i32_t.fn_type(
             &[ptr_t.into(), i32_t.into(), i32_t.into()],
             false,
         );
-        let step_ref = module.add_function("rba_aot_step", step_sig, None);
+        let step_name = format!("rba_aot_step_{}", id);
+        let step_ref = module.add_function(&step_name, step_sig, None);
         self.engine.add_global_mapping(&step_ref, step_fn as usize);
 
         let abort_sig = i32_t.fn_type(&[ptr_t.into()], false);
-        let abort_ref = module.add_function("rba_aot_abort", abort_sig, None);
+        let abort_name = format!("rba_aot_abort_{}", id);
+        let abort_ref = module.add_function(&abort_name, abort_sig, None);
         self.engine.add_global_mapping(&abort_ref, abort_fn as usize);
 
         // Block fn.
         let block_sig = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
-        self.next_id += 1;
-        let block_name = format!("aot_pi_blk_{}", self.next_id);
+        let block_name = format!("aot_pi_blk_{}", id);
         let block_fn = module.add_function(&block_name, block_sig, None);
         let entry = self.context.append_basic_block(block_fn, "entry");
         let exit_blk = self.context.append_basic_block(block_fn, "exit");
