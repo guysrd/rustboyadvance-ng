@@ -5,20 +5,21 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**Currently in:** phase 1 (per-format inline IR) — phase 1a done
-but has a divergence bug at scale; phase 1b (inline F3 MOV imm8)
-blocked on debugging the scale issue.
+**Currently in:** phase 1 (per-format inline IR). Phase 1a's LLVM
+per-instr emit has a divs-at-scale bug (gated behind
+AOT_USE_PER_INSTR=1, ignore for now). Phase 1b shipped F3 family
+(MOV/CMP/ADD/SUB imm8) inline in `aot_thumb_step`. Phase 1c adds
+F1 (LSL/LSR/ASR imm5) and F4 (ALU low-reg, all 16 ops including
+MUL).
 
-**Next deliverable:** debug the per-instr emit divs-at-scale bug.
-Likely options:
-1. Emit ALL blocks into ONE shared LLVM module (vs one-per-block).
-2. Use the A8 dump-ir flag on a divergent block to see the IR.
-3. Compare phase-1 emit vs phase-0 whole-block on a single test
-   block — they should produce semantically identical state.
+**Next deliverable:** phase 2 candidates per A7 — F5 high-reg ops,
+F2 ADD/SUB reg+imm3, F12 ADD Rd, PC/SP, #imm. After that, phase 4
+inlines fetch and abort check (saves the per-iter `load_16` +
+indirect call), which is where actual fps gain over scalar starts.
 
-Once the bug is fixed, phase 1b inlines F3 MOV imm8 (replaces a step
-trampoline call with direct gpr write + cpsr update IR for that
-opcode).
+Trampoline F19-orphan divs at trace seeds (24052) is documented in
+`docs/findings-phase1-trampoline-divs.md`; option-c partial-accept
+chosen for now (ship Rust-level inline fast paths at sweep=0).
 
 ## Phase 0 — ACCEPTED ✓
 
@@ -65,22 +66,38 @@ Hypothesis: LLVM JIT engine's symbol/state management bug at
 scale, OR a calling-convention issue, OR a memory aliasing
 inference issue.
 
+## Phase 1b (rust-inline) — partial accept
+
+`aot_thumb_step` in arm7tdmi/src/cpu.rs now has Rust-level inline
+fast paths for the format-3 family (MOV/CMP/ADD/SUB imm8) and as
+of phase 1c F1 (MoveShiftedReg LSL/LSR/ASR imm5) and F4 (AluOps
+low-reg, all 16 ops including MUL). These skip the THUMB_LUT
+indirect call when the block is dispatched through AOT.
+
+PE 100-seed trace-in: 0 divs, 0.77% coverage.
+sweep=0: 0 divs both ROMs (baseline preserved).
+
+Phase 1 full accept blocked by the F19-orphan trampoline bug
+documented in docs/findings-phase1-trampoline-divs.md. Coverage
+stays low until that's fixed OR phase 4 inlines fetch into the
+LLVM IR (which sidesteps the per-iter trampoline path).
+
 ## Pending
 
-### Debug phase 1a divergence (next)
+### Phase 2: F5 / F2 / F12 inline (per A7)
 
-Steps:
-1. Pick one divergent block. Use `--dump-ir <pc>` (per A8) to see
-   what LLVM emitted. Compare against expected pattern.
-2. Use `--dump-asm <pc>` to see native instructions.
-3. Try emitting all blocks into one shared module (avoids
-   per-module-state issues).
+Continue Rust-level inline fast paths in `aot_thumb_step`:
+- F5: high-reg MOV/ADD/CMP (Rd = R8..R15 or Rs = R8..R15).
+  CMP/MOV are simple; ADD with Rd=R15 reload_pipeline16 is the
+  branchy variant.
+- F2: ADD/SUB Rd, Rs, Rn (reg) or #imm3 (imm).
+- F12: ADD Rd, [PC|SP], #imm8 — PC-rel address compute.
 
-### Phase 1b: inline F3 MOV imm8
+### Phase 4: inline fetch + abort
 
-After 1a is debugged, replace the step trampoline call for F3
-MOV imm8 opcodes with direct LLVM IR (gpr[rd] = imm8 + flag
-update). Diff test per A6.
+This is where wins start showing up. Currently the per-iter
+`load_16` for fetch + cycle bookkeeping happens via real bus
+calls; phase 4 inlines them as direct memory loads + cycle adds.
 
 ## Reminder loop
 
@@ -90,6 +107,8 @@ marker.
 
 ## Recent commits on this branch
 
+- a0bd4f2 phase 1b: F3 family expansion + trampoline divs investigation
+- fa38437 phase 1b: F3 MOV imm8 fast-path
 - 74b3e15 phase 1a debug: per-module unique extern names (didnt fix)
 - 634aa1f phase 1a: per-instr dispatch architecture (gated)
 - dbc49d8 phase 0d: trace-driven aot entry points

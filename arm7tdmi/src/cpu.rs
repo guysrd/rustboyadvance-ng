@@ -268,6 +268,33 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // diff). Add formats here as their bit-exact equivalent is
         // ported.
         let top3 = (insn >> 13) & 0x7;
+        if top3 == 0b000 {
+            // F1 MoveShiftedReg (LSL/LSR/ASR Rd, Rs, #imm5) — bits 15:13 = 000
+            // AND bits 12:11 != 0b11 (the 0b11 case is F2 AddSub).
+            // Encoding: 000_oo_IIIII_SSS_DDD where oo ∈ {LSL=0, LSR=1, ASR=2}.
+            // Mirrors thumb/exec.rs::exec_thumb_move_shifted_reg.
+            let bs_op_bits = ((insn >> 11) & 0x3) as u8;
+            if bs_op_bits != 0b11 {
+                let imm = ((insn >> 6) & 0x1f) as u32;
+                let rs = ((insn >> 3) & 0x7) as usize;
+                let rd = (insn & 0x7) as usize;
+                let mut carry = self.cpsr.C();
+                let bsop = match bs_op_bits {
+                    0 => crate::BarrelShiftOpCode::LSL,
+                    1 => crate::BarrelShiftOpCode::LSR,
+                    2 => crate::BarrelShiftOpCode::ASR,
+                    _ => unsafe { std::hint::unreachable_unchecked() },
+                };
+                let op2 = self.barrel_shift_op(bsop, self.gpr[rs], imm, &mut carry, true);
+                self.gpr[rd] = op2;
+                self.alu_update_flags(op2, false, carry, self.cpsr.V());
+                self.next_fetch_access = MemoryAccess::Seq;
+                self.pc = fetch_addr.wrapping_add(2);
+                return 0; // AdvancePC
+            }
+            // bs_op_bits == 0b11 → F2 AddSub; falls through to LUT below.
+        }
+
         if top3 == 0b001 {
             // F3 MOV/CMP/ADD/SUB Rd, #imm8 — bits 15:13 = 0b001.
             // Encoding: 001_oo_RRR_IIIIIIII (oo selects op).
@@ -293,6 +320,74 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             self.alu_update_flags(result, arithmetic, carry, overflow);
             if op != 1 {
                 self.gpr[rd] = result; // skip writeback for CMP
+            }
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F4 ALU ops — raw & 0xfc00 == 0x4000 (top6 = 010000).
+        // Encoding: 010000_OOOO_SSS_DDD; OOOO indexes ThumbAluOps.
+        // Mirrors thumb/exec.rs::exec_thumb_alu_ops.
+        if (insn & 0xfc00) == 0x4000 {
+            let op = ((insn >> 6) & 0xf) as u8;
+            let rs = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let dst = self.gpr[rd];
+            let src = self.gpr[rs];
+            let mut carry = self.cpsr.C();
+            let mut overflow = self.cpsr.V();
+            // Helper: shift-by-register pattern with one idle cycle (used by
+            // LSL/LSR/ASR/ROR variants of F4).
+            let result = match op {
+                0b0000 | 0b1000 => dst & src,                                       // AND / TST
+                0b0001 => dst ^ src,                                                // EOR
+                0b0010 => {                                                          // LSL
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::LSL, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0011 => {                                                          // LSR
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::LSR, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0100 => {                                                          // ASR
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::ASR, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0111 => {                                                          // ROR
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::ROR, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0101 => self.alu_adc_flags(dst, src, &mut carry, &mut overflow),  // ADC
+                0b0110 => self.alu_sbc_flags(dst, src, &mut carry, &mut overflow),  // SBC
+                0b1001 => self.alu_sub_flags(0, src, &mut carry, &mut overflow),    // NEG
+                0b1010 => self.alu_sub_flags(dst, src, &mut carry, &mut overflow),  // CMP
+                0b1011 => self.alu_add_flags(dst, src, &mut carry, &mut overflow),  // CMN
+                0b1100 => dst | src,                                                 // ORR
+                0b1101 => {                                                          // MUL
+                    let m = self.get_required_multipiler_array_cycles(src);
+                    for _ in 0..m {
+                        self.idle_cycle();
+                    }
+                    carry = false;
+                    overflow = false;
+                    dst.wrapping_mul(src)
+                }
+                0b1110 => dst & (!src),                                              // BIC
+                0b1111 => !src,                                                       // MVN
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            };
+            // is_arithmetic: ADC / SBC / NEG / CMP / CMN.
+            let arithmetic = matches!(op, 0b0101 | 0b0110 | 0b1001 | 0b1010 | 0b1011);
+            self.alu_update_flags(result, arithmetic, carry, overflow);
+            // is_setting_flags (no writeback): TST / CMP / CMN.
+            let setting_flags = matches!(op, 0b1000 | 0b1010 | 0b1011);
+            if !setting_flags {
+                self.gpr[rd] = result;
             }
             self.next_fetch_access = MemoryAccess::Seq;
             self.pc = fetch_addr.wrapping_add(2);
