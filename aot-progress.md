@@ -52,6 +52,19 @@ equivalent IR ops + 1 fetch_only extern call.
 That's the real phase 4. ~3-5 days work. The infrastructure
 (CpuOffsets, fetch_only extern) is in place from step 1.
 
+**Phase 4 step 1 GATED off by default (commit 95e6954):** since the
+inline IR was a fps regression, default per-instr is preserved.
+AOT_INLINE_F3=1 to opt in (for correctness verification + further
+iteration).
+
+Open observations:
+- `compile_rom_with_seeds_step_offsets` at sweep=64KB takes ~70-76s
+  to compile via LLVM JIT (regardless of phase-4 changes). LLVM is
+  slow when compiling 32k separate per-block modules. Future:
+  consolidate modules (one per ROM page, multiple blocks each).
+- AOT_USE_PER_INSTR=1 mode is correct at sw=4-64KB but always slower
+  than default whole-block (extern boundary per opcode).
+
 Lesson: inline IR is only a win when the equivalent Rust fast path
 has high overhead. F3 MOV imm8's Rust path is already 4 ops
 (`gpr[rd] = imm; cpsr.set_N(false); cpsr.set_Z(imm==0); pc += 2`).
