@@ -17,3 +17,4 @@ phase1-f15	-9	530.2	537.4	384.3	386.4	0	0	0	0.0	0	0	0	accept	phase 1: f15 ldm/st
 phase4-f3-inline	0	490.9	537.3	388.0	386.4	0	0	0	54.7	0	0	0	accept	phase 4 step 1: f3 mov imm8 inline llvm ir (sw=4KB 0/0 div/drift, 64KB 0/34, but ~10fps SLOWER than per-instr — extern fetch_only + IR ops costs more than the trampoline's rust inline fast path)
 phase4-gated	4	558.3	553.3	397.5	398.4	0	0	0	0.0	0	0	0	accept	phase 4 inline f3 gated off (AOT_INLINE_F3=1 to enable); default per-instr fps preserved; sw=0 score=+4 within noise
 deadcode-cleanup	2	560.6	559.3	403.9	403.7	0	0	0	0.0	0	0	0	accept	remove dead pay_thumb_fetch_extra_nonseq (cranelift-era leftover); sw=0 score=+2 noise
+post-cleanup-sw64	-47	521.2	565.4	403.5	406.5	34	68	0	70.9	0	1	0	accept	post-cleanup measurement: PE -7.8% / MK -0.7% at sweep=64KB / 70.92% & 1.16% cov
