@@ -31,6 +31,14 @@ pub enum ShiftKind {
     Asr,
 }
 
+/// Thumb F2 right-hand operand: 3-bit immediate (always non-negative,
+/// simplifies V flag formula) or a register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thumb2Operand {
+    Imm3(u8),
+    Reg(u8),
+}
+
 /// Function signature shared by every compiled block. Mirrors the Cranelift
 /// shape (`*mut u32 gpr, *mut u32 cpsr, *mut u32 pc_out, *mut u8 cpu_ctx -> u32`).
 /// Return value is the same `took` bit-encoding the dispatcher already
@@ -252,6 +260,229 @@ impl LlvmCompiler {
         self.engine
             .add_module(&module)
             .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F2 ADD/SUB reg or imm3 (`ADD/SUB Rd, Rs, op2`).
+    /// Always writes full NZCV (Thumb2 always has S-bit semantics).
+    /// For `Imm3` the sign bit of imm is always 0, so V can use the
+    /// simplified formula (same as F3 ADD/SUB):
+    ///   ADD V = (~rs & result) >> 31
+    ///   SUB V = (rs & ~result) >> 31
+    /// For `Reg`, the general formula:
+    ///   ADD V = (~(rs ^ rn) & (rs ^ result)) >> 31
+    ///   SUB V = ((rs ^ rn) & (rs ^ result)) >> 31
+    pub fn compile_thumb_format2(
+        &mut self,
+        rd: u8,
+        rs: u8,
+        operand: Thumb2Operand,
+        sub: bool,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+        use inkwell::IntPredicate;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+
+        // Load Rs.
+        let rs_idx = i32_t.const_int(rs as u64, false);
+        let rs_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rs_idx], "rs_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rs_val = builder
+            .build_load(i32_t, rs_addr, "rs_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        // Load operand (imm3 const or gpr[rn]).
+        let (rhs, is_imm3) = match operand {
+            Thumb2Operand::Imm3(v) => (i32_t.const_int(v as u64, false), true),
+            Thumb2Operand::Reg(rn) => {
+                let rn_idx = i32_t.const_int(rn as u64, false);
+                let rn_addr = unsafe {
+                    builder
+                        .build_in_bounds_gep(i32_t, gpr_ptr, &[rn_idx], "rn_addr")
+                        .map_err(|e| format!("gep: {}", e))?
+                };
+                let v = builder
+                    .build_load(i32_t, rn_addr, "rn_val")
+                    .map_err(|e| format!("load: {}", e))?
+                    .into_int_value();
+                (v, false)
+            }
+        };
+
+        let result = if sub {
+            builder
+                .build_int_sub(rs_val, rhs, "result")
+                .map_err(|e| format!("isub: {}", e))?
+        } else {
+            builder
+                .build_int_add(rs_val, rhs, "result")
+                .map_err(|e| format!("iadd: {}", e))?
+        };
+
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        builder
+            .build_store(rd_addr, result)
+            .map_err(|e| format!("store rd: {}", e))?;
+
+        // Flags
+        let n_bit = builder
+            .build_and(result, i32_t.const_int(0x8000_0000, false), "n")
+            .map_err(|e| format!("and: {}", e))?;
+        let zero_const = i32_t.const_int(0, false);
+        let z_bool = builder
+            .build_int_compare(IntPredicate::EQ, result, zero_const, "z")
+            .map_err(|e| format!("icmp: {}", e))?;
+        let z_u32 = builder
+            .build_int_z_extend(z_bool, i32_t, "z_u32")
+            .map_err(|e| format!("zext: {}", e))?;
+        let z_shifted = builder
+            .build_left_shift(z_u32, i32_t.const_int(30, false), "z_sh")
+            .map_err(|e| format!("shl: {}", e))?;
+
+        let (c_bool, v_shifted) = if sub {
+            // C = rs >= rhs (unsigned no-borrow)
+            let c = builder
+                .build_int_compare(IntPredicate::UGE, rs_val, rhs, "c")
+                .map_err(|e| format!("icmp: {}", e))?;
+            // V (sub):
+            //   imm3:  V = (rs & ~result) >> 31
+            //   reg:   V = ((rs ^ rn) & (rs ^ result)) >> 31
+            let v_top = if is_imm3 {
+                let not_result = builder
+                    .build_not(result, "not_result")
+                    .map_err(|e| format!("not: {}", e))?;
+                let v_bits = builder
+                    .build_and(rs_val, not_result, "v_bits")
+                    .map_err(|e| format!("and: {}", e))?;
+                builder
+                    .build_and(v_bits, i32_t.const_int(0x8000_0000, false), "v_top")
+                    .map_err(|e| format!("and: {}", e))?
+            } else {
+                let xor1 = builder
+                    .build_xor(rs_val, rhs, "xor_rs_rhs")
+                    .map_err(|e| format!("xor: {}", e))?;
+                let xor2 = builder
+                    .build_xor(rs_val, result, "xor_rs_res")
+                    .map_err(|e| format!("xor: {}", e))?;
+                let v_bits = builder
+                    .build_and(xor1, xor2, "v_bits")
+                    .map_err(|e| format!("and: {}", e))?;
+                builder
+                    .build_and(v_bits, i32_t.const_int(0x8000_0000, false), "v_top")
+                    .map_err(|e| format!("and: {}", e))?
+            };
+            let v = builder
+                .build_right_shift(v_top, i32_t.const_int(3, false), false, "v_sh")
+                .map_err(|e| format!("lshr: {}", e))?;
+            (c, v)
+        } else {
+            // ADD: C = result < rs (unsigned wrap)
+            let c = builder
+                .build_int_compare(IntPredicate::ULT, result, rs_val, "c")
+                .map_err(|e| format!("icmp: {}", e))?;
+            // V (add):
+            //   imm3:  V = (~rs & result) >> 31
+            //   reg:   V = (~(rs ^ rn) & (rs ^ result)) >> 31
+            let v_top = if is_imm3 {
+                let not_rs = builder
+                    .build_not(rs_val, "not_rs")
+                    .map_err(|e| format!("not: {}", e))?;
+                let v_bits = builder
+                    .build_and(not_rs, result, "v_bits")
+                    .map_err(|e| format!("and: {}", e))?;
+                builder
+                    .build_and(v_bits, i32_t.const_int(0x8000_0000, false), "v_top")
+                    .map_err(|e| format!("and: {}", e))?
+            } else {
+                let xor1 = builder
+                    .build_xor(rs_val, rhs, "xor_rs_rhs")
+                    .map_err(|e| format!("xor: {}", e))?;
+                let not_xor1 = builder
+                    .build_not(xor1, "not_xor1")
+                    .map_err(|e| format!("not: {}", e))?;
+                let xor2 = builder
+                    .build_xor(rs_val, result, "xor_rs_res")
+                    .map_err(|e| format!("xor: {}", e))?;
+                let v_bits = builder
+                    .build_and(not_xor1, xor2, "v_bits")
+                    .map_err(|e| format!("and: {}", e))?;
+                builder
+                    .build_and(v_bits, i32_t.const_int(0x8000_0000, false), "v_top")
+                    .map_err(|e| format!("and: {}", e))?
+            };
+            let v = builder
+                .build_right_shift(v_top, i32_t.const_int(3, false), false, "v_sh")
+                .map_err(|e| format!("lshr: {}", e))?;
+            (c, v)
+        };
+        let c_u32 = builder
+            .build_int_z_extend(c_bool, i32_t, "c_u32")
+            .map_err(|e| format!("zext: {}", e))?;
+        let c_shifted = builder
+            .build_left_shift(c_u32, i32_t.const_int(29, false), "c_sh")
+            .map_err(|e| format!("shl: {}", e))?;
+
+        // Pack
+        let cpsr_old = builder
+            .build_load(i32_t, cpsr_ptr, "cpsr_old")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+        let cpsr_cleared = builder
+            .build_and(cpsr_old, i32_t.const_int(0x0FFF_FFFF, false), "cpsr_cl")
+            .map_err(|e| format!("and: {}", e))?;
+        let nz = builder
+            .build_or(n_bit, z_shifted, "nz")
+            .map_err(|e| format!("or: {}", e))?;
+        let cv = builder
+            .build_or(c_shifted, v_shifted, "cv")
+            .map_err(|e| format!("or: {}", e))?;
+        let flags = builder
+            .build_or(nz, cv, "flags")
+            .map_err(|e| format!("or: {}", e))?;
+        let cpsr_new = builder
+            .build_or(cpsr_cleared, flags, "cpsr_new")
+            .map_err(|e| format!("or: {}", e))?;
+        builder
+            .build_store(cpsr_ptr, cpsr_new)
+            .map_err(|e| format!("store: {}", e))?;
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
         let raw = self
             .engine
             .get_function_address(&name)
@@ -783,6 +1014,68 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F2 ADD reg: r0 = 100, r1 = 50, ADD r2, r0, r1 → r2=150, no flags.
+    #[test]
+    fn thumb_f2_add_reg() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format2(2, 0, Thumb2Operand::Reg(1), false)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 100;
+        gpr[1] = 50;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[2], 150);
+        assert_eq!(cpsr & 0xF000_0000, 0);
+    }
+
+    /// F2 SUB imm3: r5 = 10, SUB r6, r5, #3 → r6=7, C=1, no other flags.
+    #[test]
+    fn thumb_f2_sub_imm3() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format2(6, 5, Thumb2Operand::Imm3(3), true)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[5] = 10;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[6], 7);
+        // C=1 (rs >= imm3, so no borrow). N=0, Z=0, V=0.
+        assert_eq!(cpsr & 0xF000_0000, 0x2000_0000);
+    }
+
+    /// F2 ADD reg with signed overflow: 0x7FFFFFFF + 1 = 0x80000000.
+    /// V flag set (positive + positive = negative).
+    #[test]
+    fn thumb_f2_add_reg_signed_overflow() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format2(2, 0, Thumb2Operand::Reg(1), false)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 0x7FFF_FFFF;
+        gpr[1] = 1;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[2], 0x8000_0000);
+        // N=1 (top bit), V=1 (signed overflow). Z=0, C=0.
+        assert_eq!(cpsr & 0xF000_0000, 0x9000_0000);
     }
 
     /// F1 LSL: r1 = 0x12345678, LSL r0, r1, #4 → r0 = 0x23456780,
