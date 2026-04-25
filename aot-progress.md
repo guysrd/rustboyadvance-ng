@@ -34,6 +34,37 @@ the per-iter trampoline call with direct LLVM ops. F3 MOV imm8 is
 the simplest starting point (4 stores: gpr[Rd], cpsr, pc,
 next_fetch_access; all constant-foldable from baked opcode bits).
 
+Plan for next turn:
+1. Add `CpuOffsets` struct in arm7tdmi-aot/src/lib.rs with pc_offset,
+   gpr_offset, cpsr_offset, next_fetch_access_offset (all u32).
+2. SDL frontend in main.rs computes via offset_of! for
+   `Arm7tdmiCore<SysBus>` and passes via compile_rom variant.
+3. Add a thin `aot_thumb_charge_fetch_for<I>` extern that does just
+   load_16 + pipeline shift + cycle accounting (no dispatch). Same
+   sig as aot_thumb_step but skips the format detection / dispatch.
+4. In emit_per_instr_thumb_block, detect F3 MOV imm8 opcodes
+   (top5=00100 && bits 12:11 == 00). For those:
+   - Call aot_thumb_charge_fetch_for extern.
+   - Emit inline IR: store imm at gpr[Rd], update cpsr (clear N, set
+     Z if imm==0), store fetch_addr+2 at pc, store Seq at nfa.
+   - All operands constant-foldable from baked opcode bits.
+5. Test: AOT_USE_PER_INSTR=1 sweep=64KB. Expect:
+   - 0 divs (correctness preserved).
+   - fps gain on F3-heavy code.
+
+Empirical confirmation that this approach is sound: F3 MOV imm8 is
+extremely common (~15-20% of dynamic Thumb instrs) and the body is
+just a gpr store + cpsr Z-flag set (constants at AOT time). LLVM
+optimizer should fold the IR to ~3 native stores. Saves ~5ns vs
+the trampoline call's ~10ns extern boundary + ~3ns format detection
++ ~3ns body. Per-format gain ≈ 30%, weighted by frequency ≈ 5% on
+F3 alone. Stack ~10 inlined formats and we beat scalar.
+
+Alternative path: ARM block support (MK uses ARM heavily, currently
+only 1.16% AOT coverage). Would need arm7tdmi-aot::aot_arm_step_for
+trampoline + emit_per_instr_arm_block + classify_arm support in
+scan (already exists). 5%+ gain on MK from coverage alone.
+
 ## Phase 0 — ACCEPTED ✓
 
 Per `scripts/aot_measure.sh` at default sweep=0:
