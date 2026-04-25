@@ -98,6 +98,157 @@ impl LlvmCompiler {
         Ok(unsafe { f.call() })
     }
 
+    /// Emit a single-instruction compiled block for Thumb format 3 ADD
+    /// imm8 (`ADD Rd, #imm8`). Exercises the full cpsr round-trip
+    /// (load *cpsr_ptr → compute NZCV from rd+imm8 result → store back)
+    /// plus gpr read+write. This is the pattern every flag-setting
+    /// Thumb ALU format will follow.
+    ///
+    /// For Thumb3 ADD/SUB/CMP with imm8 ∈ [0, 255] the V-flag formula
+    /// is the simplified one (sign bit of imm8 is always 0):
+    ///   ADD V = (~rd & result) >> 31
+    /// (matches the Cranelift codegen at `emit_thumb_format3` ADD path.)
+    pub fn compile_thumb_format3_add(
+        &mut self,
+        rd: u8,
+        imm8: u8,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+        use inkwell::IntPredicate;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+
+        // Load gpr[rd]
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep rd: {}", e))?
+        };
+        let rd_val = builder
+            .build_load(i32_t, rd_addr, "rd_val")
+            .map_err(|e| format!("load rd: {}", e))?
+            .into_int_value();
+
+        // result = rd + imm8
+        let imm_val = i32_t.const_int(imm8 as u64, false);
+        let result = builder
+            .build_int_add(rd_val, imm_val, "result")
+            .map_err(|e| format!("iadd: {}", e))?;
+
+        // Store back gpr[rd] = result
+        builder
+            .build_store(rd_addr, result)
+            .map_err(|e| format!("store rd: {}", e))?;
+
+        // Flags
+        // N = result >> 31 (top bit), shifted into bit 31 already
+        let n_bit = builder
+            .build_and(
+                result,
+                i32_t.const_int(0x8000_0000, false),
+                "n_bit",
+            )
+            .map_err(|e| format!("and N: {}", e))?;
+        // Z = (result == 0) << 30
+        let zero_const = i32_t.const_int(0, false);
+        let z_bool = builder
+            .build_int_compare(IntPredicate::EQ, result, zero_const, "z_bool")
+            .map_err(|e| format!("icmp Z: {}", e))?;
+        let z_u32 = builder
+            .build_int_z_extend(z_bool, i32_t, "z_u32")
+            .map_err(|e| format!("zext Z: {}", e))?;
+        let z_shifted = builder
+            .build_left_shift(z_u32, i32_t.const_int(30, false), "z_shifted")
+            .map_err(|e| format!("shl Z: {}", e))?;
+        // C = (result < rd) (unsigned wrap) << 29
+        let c_bool = builder
+            .build_int_compare(IntPredicate::ULT, result, rd_val, "c_bool")
+            .map_err(|e| format!("icmp C: {}", e))?;
+        let c_u32 = builder
+            .build_int_z_extend(c_bool, i32_t, "c_u32")
+            .map_err(|e| format!("zext C: {}", e))?;
+        let c_shifted = builder
+            .build_left_shift(c_u32, i32_t.const_int(29, false), "c_shifted")
+            .map_err(|e| format!("shl C: {}", e))?;
+        // V = (~rd & result) >> 31 << 28 = (~rd & result & 0x80000000) >> 3
+        let not_rd = builder
+            .build_not(rd_val, "not_rd")
+            .map_err(|e| format!("not: {}", e))?;
+        let v_bits = builder
+            .build_and(not_rd, result, "v_bits")
+            .map_err(|e| format!("and V: {}", e))?;
+        let v_top = builder
+            .build_and(
+                v_bits,
+                i32_t.const_int(0x8000_0000, false),
+                "v_top",
+            )
+            .map_err(|e| format!("and Vtop: {}", e))?;
+        let v_shifted = builder
+            .build_right_shift(v_top, i32_t.const_int(3, false), false, "v_shifted")
+            .map_err(|e| format!("lshr V: {}", e))?;
+
+        // Pack: cpsr = (cpsr & 0x0FFFFFFF) | (N | Z | C | V)
+        let cpsr_old = builder
+            .build_load(i32_t, cpsr_ptr, "cpsr_old")
+            .map_err(|e| format!("load cpsr: {}", e))?
+            .into_int_value();
+        let cpsr_cleared = builder
+            .build_and(
+                cpsr_old,
+                i32_t.const_int(0x0FFF_FFFF, false),
+                "cpsr_cleared",
+            )
+            .map_err(|e| format!("and cpsr: {}", e))?;
+        let nz = builder
+            .build_or(n_bit, z_shifted, "nz")
+            .map_err(|e| format!("or NZ: {}", e))?;
+        let cv = builder
+            .build_or(c_shifted, v_shifted, "cv")
+            .map_err(|e| format!("or CV: {}", e))?;
+        let flags = builder
+            .build_or(nz, cv, "flags")
+            .map_err(|e| format!("or flags: {}", e))?;
+        let cpsr_new = builder
+            .build_or(cpsr_cleared, flags, "cpsr_new")
+            .map_err(|e| format!("or cpsr_new: {}", e))?;
+        builder
+            .build_store(cpsr_ptr, cpsr_new)
+            .map_err(|e| format!("store cpsr: {}", e))?;
+
+        // return 0 (no branch)
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
     /// Emit a single-instruction compiled block for Thumb format 3 MOV
     /// imm8 (`MOV Rd, #imm8`). This is the simplest non-trivial Thumb
     /// shape: imm8 constant goes into `gpr[rd]`, no flag work, return 0
@@ -179,6 +330,65 @@ mod tests {
         let mut compiler = LlvmCompiler::new().expect("new");
         let result = compiler.compile_constant_42().expect("compile");
         assert_eq!(result, 42);
+    }
+
+    /// Thumb F3 ADD imm8 with full NZCV flag handling. Validates the
+    /// cpsr round-trip pattern (load → modify → store) that every
+    /// flag-setting Thumb format will use.
+    #[test]
+    fn thumb_f3_add_imm_writes_rd_and_flags() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        // ADD r3, #5: r3 starts at 100, expected r3 = 105.
+        // Flags: N=0, Z=0, C=0 (no overflow), V=0 (no signed overflow).
+        let func = compiler
+            .compile_thumb_format3_add(3, 5)
+            .expect("compile ADD r3, #5");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[3] = 100;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut cpu_ctx: u8 = 0;
+        let took = unsafe {
+            func(
+                gpr.as_mut_ptr(),
+                &mut cpsr,
+                &mut pc_out,
+                &mut cpu_ctx as *mut u8,
+            )
+        };
+        assert_eq!(took, 0);
+        assert_eq!(gpr[3], 105);
+        // No flags set (positive non-zero result, no overflow).
+        assert_eq!(cpsr & 0xF000_0000, 0, "NZCV should be zero");
+    }
+
+    /// Thumb F3 ADD imm8 with overflow into Z flag.
+    #[test]
+    fn thumb_f3_add_imm_z_flag() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        // ADD r0, #1: r0 starts at 0xFFFF_FFFF.
+        // Result wraps to 0 → Z=1, C=1 (unsigned wrap). N=0. V=0
+        // (sign-bit pattern: 1 + 0 = 0; ~rd=0 & result=0 → V=0).
+        let func = compiler
+            .compile_thumb_format3_add(0, 1)
+            .expect("compile ADD r0, #1");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[0] = 0xFFFF_FFFF;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut cpu_ctx: u8 = 0;
+        unsafe {
+            func(
+                gpr.as_mut_ptr(),
+                &mut cpsr,
+                &mut pc_out,
+                &mut cpu_ctx as *mut u8,
+            );
+        }
+        assert_eq!(gpr[0], 0);
+        // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
+        assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
+            "Z + C should be set: cpsr = 0x{:08x}", cpsr);
     }
 
     /// First Thumb format end-to-end via LLVM: F3 MOV Rd, #imm8.
