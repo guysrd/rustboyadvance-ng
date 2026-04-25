@@ -79,7 +79,7 @@ inference issue.
 ## Phase 1b/1c/2/5 (rust-inline) — incremental accept
 
 `aot_thumb_step` in arm7tdmi/src/cpu.rs now has Rust-level inline
-fast paths for:
+fast paths for 13 Thumb formats:
 - F1 MoveShiftedReg LSL/LSR/ASR Rd, Rs, #imm5
 - F2 AddSub ADD/SUB Rd, Rs, Rn or #imm3
 - F3 DataProcessImm MOV/CMP/ADD/SUB Rd, #imm8
@@ -87,15 +87,16 @@ fast paths for:
 - F5 HiRegOpOrBranchExchange ADD/CMP/MOV/BX (Rd=R15 → PipelineFlushed)
 - F6 LdrPc (literal pool load)
 - F7 LdrStrRegOffset LDR/STR reg-offset, byte/word
+- F8 LdrStrShb STRH/LDRH/LDSB/LDSH reg-offset
 - F9 LdrStrImmOffset LDR/STR imm5-offset, byte/word
 - F10 LdrStrHalfWord LDRH/STRH imm5*2 offset
 - F11 LdrStrSp LDR/STR sp-relative word
 - F12 LoadAddress ADD Rd, [PC|SP], #imm8
 - F13 AddSp ADD/SUB SP, #imm7<<2
 
-Missing (deferred): F8 (LDSB/LDRH/LDSH reg-offset, 4 sub-cases),
-F14 PUSH/POP, F15 LDM/STM, F16 Bcc tail (terminator), F18 B tail
-(terminator), F19 BL pair (terminator).
+Missing (deferred): F14 PUSH/POP, F15 LDM/STM (variable-len reg list).
+F16 Bcc, F18 B, F19 BL pair are block terminators handled by the AOT
+emit, not by aot_thumb_step.
 
 Each is bit-exact with its scalar handler — same alu helpers, same
 idle_cycle calls, same PipelineFlushed/AdvancePC semantics, same
@@ -142,8 +143,26 @@ CronCreate `c1a9dd9e` at minutes 7,22,37,52 every hour. Each fire:
 re-read docs/aot-llvm-program.md, this file, continue from resume
 marker.
 
+## Sweep coverage discontinuity (observed 2026-04-25)
+
+PE divs vs sweep_kb:
+- sweep=0: 0 divs / 0% coverage (baseline)
+- sweep=1KB: 0 divs / 0.14% (554 blocks)
+- sweep=2KB: 0 divs / 0.51% (1042 blocks)
+- sweep=3KB: 36 divs / 56.33% (huge jump)
+- sweep=4KB: 36 divs / 56.39%
+- sweep=64KB: 89 divs (per resume marker)
+
+The 0.51% → 56.33% coverage jump between 2-3KB suggests some block in
+the [0x080800, 0x080C00] range opens a reachable graph that includes
+hot common code. The 36 divs that come with it is the trampoline
+cycle bug mentioned in findings-phase1-trampoline-divs.md, not a new
+regression.
+
 ## Recent commits on this branch
 
+- 21b0003 phase 5: inline f8 strh/ldrh/ldsb/ldsh reg-offset
+- 74cbee8 aot-progress: phase 1c+2+5 status, 12 thumb formats inlined
 - 41412f4 phase 5: f7 ldr/str reg-offset + f10 halfword imm-offset inline
 - 422928e phase 5: f9 ldr/str imm-offset + f11 sp-rel inline
 - a529065 phase 5: f6 ldr pc-rel inline (literal pool)
