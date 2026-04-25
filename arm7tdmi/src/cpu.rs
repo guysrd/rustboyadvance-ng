@@ -663,12 +663,15 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             self.dispatch_compiled_count = self.dispatch_compiled_count.wrapping_add(1);
 
             let mut pc_out: u32 = 0;
-            let mut cpsr_word: u32 = self.cpsr.get();
+            // cpsr_word is unused — handlers update self.cpsr directly
+            // via cpu_ctx + cpsr_offset, and the LLVM block no longer
+            // emits the redundant exit-flush. Kept in the ABI so
+            // standalone per-format compile fns (which DO use cpsr_ptr
+            // for flag updates) stay callable for unit tests.
+            let mut cpsr_word: u32 = 0;
             let gpr_ptr = self.gpr.as_mut_ptr();
             let cpu_ctx = self as *mut Arm7tdmiCore<I> as *mut u8;
             let taken = compiled(gpr_ptr, &mut cpsr_word, &mut pc_out, cpu_ctx);
-            // Rebuild CPSR from the possibly-updated word.
-            self.cpsr = super::psr::RegPSR::new(cpsr_word);
             // Return-value bits:
             //   bit 0 = branch taken (pc_out populated, reload pipeline).
             //   bit 1 = mid-block abort (abort_mid_block trampoline has

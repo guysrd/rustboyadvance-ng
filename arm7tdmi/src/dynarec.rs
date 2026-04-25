@@ -374,8 +374,10 @@ impl LlvmCompiler {
         let builder = self.context.create_builder();
         builder.position_at_end(entry);
 
-        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
         let cpu_ctx = func.get_nth_param(3).unwrap().into_pointer_value();
+        // cpsr_ptr (param 1) and cpsr_offset are unused now — handlers
+        // update self.cpsr directly via cpu_ctx, no exit flush needed.
+        let _ = cpsr_offset;
 
         // Emit one step call per recorded instruction. Pick the
         // abort-aware trampoline on odd iters (k=1,3,5,...) so the
@@ -442,46 +444,18 @@ impl LlvmCompiler {
         // Fell through all iters — jump to exit.
         builder.build_unconditional_branch(exit_blk).ok()?;
 
-        // abort_blk: flush cpsr like exit and return 0b10 so dispatcher
-        // breaks the chain.
+        // abort_blk: return 0b10 so the dispatcher breaks the chain.
+        // No cpsr flush needed — handlers update self.cpsr directly
+        // via cpu_ctx + cpsr_offset, the dispatcher reads it from
+        // there.
         builder.position_at_end(abort_blk);
-        let abort_cpsr_field = unsafe {
-            builder
-                .build_in_bounds_gep(
-                    self.context.i8_type(),
-                    cpu_ctx,
-                    &[i32_t.const_int(cpsr_offset as u64, false)],
-                    "cpsr_field_abort",
-                )
-                .ok()?
-        };
-        let abort_cpsr_now = builder
-            .build_load(i32_t, abort_cpsr_field, "cpsr_now_abort")
-            .ok()?
-            .into_int_value();
-        builder.build_store(cpsr_ptr, abort_cpsr_now).ok()?;
         builder
             .build_return(Some(&i32_t.const_int(0b10, false)))
             .ok()?;
 
-        // exit_blk: flush cpu.cpsr (raw u32 at cpsr_offset) to *cpsr_ptr,
-        // return 0.
+        // exit_blk: return 0 (no branch, no abort). cpsr is already
+        // up to date via the handlers' direct writes through cpu_ctx.
         builder.position_at_end(exit_blk);
-        let cpsr_field_addr = unsafe {
-            builder
-                .build_in_bounds_gep(
-                    self.context.i8_type(),
-                    cpu_ctx,
-                    &[i32_t.const_int(cpsr_offset as u64, false)],
-                    "cpsr_field",
-                )
-                .ok()?
-        };
-        let cpsr_now = builder
-            .build_load(i32_t, cpsr_field_addr, "cpsr_now")
-            .ok()?
-            .into_int_value();
-        builder.build_store(cpsr_ptr, cpsr_now).ok()?;
         builder
             .build_return(Some(&i32_t.const_int(0, false)))
             .ok()?;
