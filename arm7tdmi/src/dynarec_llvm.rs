@@ -39,6 +39,15 @@ pub enum Thumb2Operand {
     Reg(u8),
 }
 
+/// Thumb format 5 high-register ops. MOV/ADD don't update flags
+/// (a Thumb quirk); only CMP does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Thumb5Op {
+    Mov,
+    Add,
+    Cmp,
+}
+
 /// Thumb format 4 logical / compare ops. All write flags; only some
 /// write back to Rd. Most preserve C, V; CMP/CMN/NEG compute full NZCV.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +284,160 @@ impl LlvmCompiler {
         self.engine
             .add_module(&module)
             .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F5 non-branch high-register op. MOV/ADD just do
+    /// the value math (NO flag update — Thumb high-reg quirk). CMP
+    /// updates full NZCV like F4 CMP.
+    ///
+    /// Note: rd and rs are 4-bit register selectors (0..15). Caller
+    /// is responsible for ensuring rd != 15 (R15 = PC, branch handled
+    /// elsewhere as a tail).
+    pub fn compile_thumb_format5(
+        &mut self,
+        op: Thumb5Op,
+        rd: u8,
+        rs: u8,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+        use inkwell::IntPredicate;
+
+        debug_assert!(rd < 15, "F5 with rd=15 should be a branch tail");
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rd_val = builder
+            .build_load(i32_t, rd_addr, "rd_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        let rs_idx = i32_t.const_int(rs as u64, false);
+        let rs_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rs_idx], "rs_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rs_val = builder
+            .build_load(i32_t, rs_addr, "rs_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        match op {
+            Thumb5Op::Mov => {
+                builder
+                    .build_store(rd_addr, rs_val)
+                    .map_err(|e| format!("store: {}", e))?;
+            }
+            Thumb5Op::Add => {
+                let result = builder
+                    .build_int_add(rd_val, rs_val, "result")
+                    .map_err(|e| format!("iadd: {}", e))?;
+                builder
+                    .build_store(rd_addr, result)
+                    .map_err(|e| format!("store: {}", e))?;
+            }
+            Thumb5Op::Cmp => {
+                // Full NZCV from rd - rs, no writeback.
+                let result = builder
+                    .build_int_sub(rd_val, rs_val, "result")
+                    .map_err(|e| format!("isub: {}", e))?;
+                let zero_const = i32_t.const_int(0, false);
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "n")
+                    .map_err(|e| format!("and: {}", e))?;
+                let z_bool = builder
+                    .build_int_compare(IntPredicate::EQ, result, zero_const, "z")
+                    .map_err(|e| format!("icmp: {}", e))?;
+                let z_u32 = builder
+                    .build_int_z_extend(z_bool, i32_t, "z_u32")
+                    .map_err(|e| format!("zext: {}", e))?;
+                let z_shifted = builder
+                    .build_left_shift(z_u32, i32_t.const_int(30, false), "z_sh")
+                    .map_err(|e| format!("shl: {}", e))?;
+                let c_bool = builder
+                    .build_int_compare(IntPredicate::UGE, rd_val, rs_val, "c")
+                    .map_err(|e| format!("icmp: {}", e))?;
+                let c_u32 = builder
+                    .build_int_z_extend(c_bool, i32_t, "c_u32")
+                    .map_err(|e| format!("zext: {}", e))?;
+                let c_shifted = builder
+                    .build_left_shift(c_u32, i32_t.const_int(29, false), "c_sh")
+                    .map_err(|e| format!("shl: {}", e))?;
+                // V (sub): (rd ^ rs) & (rd ^ result) >> 31
+                let xor1 = builder
+                    .build_xor(rd_val, rs_val, "x1")
+                    .map_err(|e| format!("xor: {}", e))?;
+                let xor2 = builder
+                    .build_xor(rd_val, result, "x2")
+                    .map_err(|e| format!("xor: {}", e))?;
+                let v_bits = builder
+                    .build_and(xor1, xor2, "vb")
+                    .map_err(|e| format!("and: {}", e))?;
+                let v_top = builder
+                    .build_and(v_bits, i32_t.const_int(0x8000_0000, false), "vt")
+                    .map_err(|e| format!("and: {}", e))?;
+                let v_shifted = builder
+                    .build_right_shift(v_top, i32_t.const_int(3, false), false, "vs")
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let cpsr_old = builder
+                    .build_load(i32_t, cpsr_ptr, "cpsr_old")
+                    .map_err(|e| format!("load: {}", e))?
+                    .into_int_value();
+                let cpsr_cleared = builder
+                    .build_and(cpsr_old, i32_t.const_int(0x0FFF_FFFF, false), "cl")
+                    .map_err(|e| format!("and: {}", e))?;
+                let nz = builder
+                    .build_or(n_bit, z_shifted, "nz")
+                    .map_err(|e| format!("or: {}", e))?;
+                let cv = builder
+                    .build_or(c_shifted, v_shifted, "cv")
+                    .map_err(|e| format!("or: {}", e))?;
+                let flags = builder
+                    .build_or(nz, cv, "flags")
+                    .map_err(|e| format!("or: {}", e))?;
+                let cpsr_new = builder
+                    .build_or(cpsr_cleared, flags, "cpsr_new")
+                    .map_err(|e| format!("or: {}", e))?;
+                builder
+                    .build_store(cpsr_ptr, cpsr_new)
+                    .map_err(|e| format!("store: {}", e))?;
+            }
+        }
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
         let raw = self
             .engine
             .get_function_address(&name)
@@ -1253,6 +1416,69 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F5 MOV: r8 ← r2 (high reg dest, low reg src). No flag update.
+    #[test]
+    fn thumb_f5_mov_high_reg() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format5(Thumb5Op::Mov, 8, 2)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[2] = 0xCAFEBABE;
+        // Pre-set NZCV to verify they're untouched by F5 MOV.
+        let mut cpsr: u32 = 0xF000_0000;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[8], 0xCAFEBABE);
+        // Flags untouched.
+        assert_eq!(cpsr, 0xF000_0000);
+    }
+
+    /// F5 ADD: r10 += r0, no flag update.
+    #[test]
+    fn thumb_f5_add_high_reg() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format5(Thumb5Op::Add, 10, 0)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[10] = 100;
+        gpr[0] = 50;
+        let mut cpsr: u32 = 0xF000_0000;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[10], 150);
+        // Flags untouched.
+        assert_eq!(cpsr, 0xF000_0000);
+    }
+
+    /// F5 CMP: full NZCV.
+    #[test]
+    fn thumb_f5_cmp_high_reg_less() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format5(Thumb5Op::Cmp, 8, 2)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[8] = 5;
+        gpr[2] = 10;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        // r8 unchanged. 5 - 10 = -5: N=1, C=0 (borrow), Z=0, V=0.
+        assert_eq!(gpr[8], 5);
+        assert_eq!(cpsr & 0xF000_0000, 0x8000_0000);
     }
 
     /// F4 AND: r0 = 0xFF00, r1 = 0x0FF0, AND r0, r0, r1 → r0 = 0x0F00.
