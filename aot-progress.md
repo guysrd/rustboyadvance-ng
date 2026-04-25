@@ -65,6 +65,29 @@ Open observations:
 - AOT_USE_PER_INSTR=1 mode is correct at sw=4-64KB but always slower
   than default whole-block (extern boundary per opcode).
 
+Tried this turn (no measurable win):
+- `#[inline(always)]` on `aot_thumb_step` — 484 vs 488 fps at
+  sweep=64KB, within noise. Reverted.
+
+Path forward (high-value, multi-day):
+1. Inline cycle accounting via `*scheduler.timestamp += K` in IR.
+   Requires `pub fn scheduler_timestamp_ptr()` on SysBus, plumbed
+   through to AOT compiler as a baked constant pointer.
+2. Skip per-iter pipeline shifts in `aot_thumb_step`. Restore at
+   block exit via 2 const stores (halfwords at known ROM addresses,
+   baked at scan time). Saves ~2ns/iter ≈ 1.3% at high coverage.
+3. Inline ALL hot formats in IR (not just F3) so no opcode falls
+   through to the step trampoline extern. Combined with (1) and (2)
+   could potentially beat scalar.
+
+Path forward (alternative, smaller scope):
+- ARM block support for MK. Currently AOT scan accepts ARM mode
+  but `compile_rom_with_seeds_*` skips ARM specs (1.16% AOT
+  coverage on MK). Adding `aot_arm_step_for<I>` + `emit_arm_block`
+  would give MK ~50% coverage. But fps WIN unclear without phase-4
+  IR work — trampoline mode is currently 6% SLOWER than scalar at
+  high coverage.
+
 Lesson: inline IR is only a win when the equivalent Rust fast path
 has high overhead. F3 MOV imm8's Rust path is already 4 ops
 (`gpr[rd] = imm; cpsr.set_N(false); cpsr.set_Z(imm==0); pc += 2`).
