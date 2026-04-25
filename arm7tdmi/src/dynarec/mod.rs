@@ -2925,7 +2925,13 @@ impl DynarecCompiler {
                 instr_pc: u32,
             | {
                 match item {
-                    Body::F1(d) => emit_thumb_format1(builder, gpr_ptr, gpr_cache, cpsr_var, *d),
+                    Body::F1(d) => {
+                        if skip_flag_write {
+                            emit_thumb_format1_no_flags(builder, gpr_ptr, gpr_cache, *d);
+                        } else {
+                            emit_thumb_format1(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
+                        }
+                    }
                     Body::F2(d) => {
                         if skip_flag_write {
                             emit_thumb_format2_no_flags(builder, gpr_ptr, gpr_cache, *d);
@@ -2940,8 +2946,23 @@ impl DynarecCompiler {
                             emit_thumb_format3(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
                         }
                     }
-                    Body::F4(d) => emit_thumb_format4_logical(builder, gpr_ptr, gpr_cache, cpsr_var, *d),
-                    Body::F5(d) => emit_thumb_format5_non_branch(builder, gpr_ptr, gpr_cache, cpsr_var, *d),
+                    Body::F4(d) => {
+                        if skip_flag_write {
+                            emit_thumb_format4_logical_no_flags(builder, gpr_ptr, gpr_cache, *d);
+                        } else {
+                            emit_thumb_format4_logical(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
+                        }
+                    }
+                    Body::F5(d) => {
+                        // F5 Mov/Add don't write flags; only Cmp does.
+                        // For Cmp with dead flags, the whole emit is a
+                        // no-op (no writeback, no flag side-effect).
+                        if skip_flag_write && matches!(d.op, Thumb5Op::Cmp) {
+                            // skip entirely
+                        } else {
+                            emit_thumb_format5_non_branch(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
+                        }
+                    }
                     Body::F6(d) => emit_thumb_format6(
                         builder, gpr_ptr, cpu_ctx, load_idle_32_ref, *d, instr_pc,
                     ),
@@ -5542,6 +5563,29 @@ fn emit_thumb_format5_non_branch(
     }
 }
 
+/// Dead-flag-write variant of `emit_thumb_format1`. Skips the entire
+/// N/Z/C bit-pack into cpsr_var when the next body item's flag-write
+/// mask covers NZC (most common: F2/F3/F4-CMP follow). Saves ~10
+/// Cranelift IR ops + ~15-20 host instructions per F1 emit on
+/// flag-dead patterns. Same value semantics — just no flag side-effect.
+fn emit_thumb_format1_no_flags(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
+    dec: DecodedThumb1,
+) {
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
+    let result = match (dec.kind, dec.imm5) {
+        (ShiftKind::Lsl, 0) => rs_val,
+        (ShiftKind::Lsl, n) => builder.ins().ishl_imm(rs_val, n as i64),
+        (ShiftKind::Lsr, 0) => builder.ins().iconst(types::I32, 0),
+        (ShiftKind::Lsr, n) => builder.ins().ushr_imm(rs_val, n as i64),
+        (ShiftKind::Asr, 0) => builder.ins().sshr_imm(rs_val, 31),
+        (ShiftKind::Asr, n) => builder.ins().sshr_imm(rs_val, n as i64),
+    };
+    gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
+}
+
 /// Emit a Thumb format 1 shift by immediate (LSL/LSR/ASR Rd, Rs, #imm5).
 /// Writes N, Z, and C (shifter carry) to CPSR. Preserves V.
 ///
@@ -5639,6 +5683,43 @@ fn emit_thumb_format1(
     let flags = builder.ins().bor(nz, cv);
     let new_cpsr = builder.ins().bor(cleared, flags);
     builder.def_var(cpsr_var, new_cpsr);
+}
+
+/// Dead-flag-write variant of `emit_thumb_format4_logical`. Same value
+/// semantics, no flag bit-packing. For TST/CMP/CMN/NEG (which don't
+/// writeback) this becomes a true no-op when the flag write is dead —
+/// the value computation itself is dead too. AND/EOR/ORR/BIC/MVN still
+/// writeback the result.
+fn emit_thumb_format4_logical_no_flags(
+    builder: &mut FunctionBuilder,
+    gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
+    dec: DecodedThumb4,
+) {
+    // For non-writeback ops with dead flags, computing the value is
+    // also dead — bail without emitting anything.
+    let writeback = !matches!(dec.op, Thumb4Op::Tst | Thumb4Op::Cmp | Thumb4Op::Cmn);
+    if !writeback {
+        return;
+    }
+    let rd_val = gpr_cache.read(builder, gpr_ptr, dec.rd as usize);
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
+    let result = match dec.op {
+        Thumb4Op::And => builder.ins().band(rd_val, rs_val),
+        Thumb4Op::Eor => builder.ins().bxor(rd_val, rs_val),
+        Thumb4Op::Orr => builder.ins().bor(rd_val, rs_val),
+        Thumb4Op::Bic => {
+            let not_rs = builder.ins().bnot(rs_val);
+            builder.ins().band(rd_val, not_rs)
+        }
+        Thumb4Op::Mvn => builder.ins().bnot(rs_val),
+        Thumb4Op::Neg => {
+            let zero = builder.ins().iconst(types::I32, 0);
+            builder.ins().isub(zero, rs_val)
+        }
+        Thumb4Op::Tst | Thumb4Op::Cmp | Thumb4Op::Cmn => unreachable!(),
+    };
+    gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
 }
 
 /// Emit a Thumb format 4 logical / compare op. All mnemonics in this
