@@ -12,7 +12,9 @@
 
 pub mod bus;
 pub mod compiler;
+pub mod scan;
 pub mod table;
 
 pub use compiler::LlvmCompiler;
+pub use scan::{BlockEnd, BlockSpec, Mode, scan_rom};
 pub use table::{AotTable, CompiledFn, aot_lookup};
