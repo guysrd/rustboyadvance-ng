@@ -21,6 +21,16 @@ use inkwell::execution_engine::ExecutionEngine;
 #[cfg(test)]
 use inkwell::execution_engine::JitFunction;
 
+/// Thumb shift kind for F1 (LSL/LSR/ASR). Mirrors the type in
+/// `crate::dynarec` (Cranelift backend) so dynarec_llvm doesn't have
+/// to pull in that whole module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftKind {
+    Lsl,
+    Lsr,
+    Asr,
+}
+
 /// Function signature shared by every compiled block. Mirrors the Cranelift
 /// shape (`*mut u32 gpr, *mut u32 cpsr, *mut u32 pc_out, *mut u8 cpu_ctx -> u32`).
 /// Return value is the same `took` bit-encoding the dispatcher already
@@ -242,6 +252,244 @@ impl LlvmCompiler {
         self.engine
             .add_module(&module)
             .map_err(|_| "add_module failed".to_string())?;
+        let raw = self
+            .engine
+            .get_function_address(&name)
+            .map_err(|e| format!("get_function_address: {}", e))?;
+        Ok(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Emit a Thumb F1 shift-by-imm5 (`LSL/LSR/ASR Rd, Rs, #imm5`).
+    /// Writes N, Z, and shifter-out C; preserves V.
+    ///
+    /// ARM7TDMI barrel-shifter quirks (mirrors `crate::dynarec::emit_thumb_format1`):
+    ///   LSL #0:  result = Rs, C preserved (read from cpsr).
+    ///   LSR #0 → LSR #32: result = 0, C = bit 31 of Rs.
+    ///   ASR #0 → ASR #32: result = sign-extended Rs, C = bit 31 of Rs.
+    ///   LSL #n (1..31): result = Rs << n, C = bit (32 - n) of Rs.
+    ///   LSR #n (1..31): result = Rs >> n, C = bit (n - 1) of Rs.
+    ///   ASR #n (1..31): result = (i32)Rs >> n, C = bit (n - 1) of Rs.
+    pub fn compile_thumb_format1_shift(
+        &mut self,
+        kind: ShiftKind,
+        rd: u8,
+        rs: u8,
+        imm5: u8,
+    ) -> Result<CompiledFn, String> {
+        use inkwell::AddressSpace;
+        use inkwell::IntPredicate;
+
+        let module = self.context.create_module("thumb_block");
+        let i32_t = self.context.i32_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let fn_ty = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), ptr_t.into(), ptr_t.into()],
+            false,
+        );
+        self.next_id += 1;
+        let name = format!("dynarec_block_{}", self.next_id);
+        let func = module.add_function(&name, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let gpr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let cpsr_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+
+        let rs_idx = i32_t.const_int(rs as u64, false);
+        let rs_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rs_idx], "rs_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        let rs_val = builder
+            .build_load(i32_t, rs_addr, "rs_val")
+            .map_err(|e| format!("load: {}", e))?
+            .into_int_value();
+
+        let one_const = i32_t.const_int(1, false);
+
+        // Preserved-C bit pulled from cpsr_var when the shift quirk
+        // calls for it (LSL #0 only). Computed eagerly; LLVM DCE drops
+        // it if unused.
+        let cpsr_old = builder
+            .build_load(i32_t, cpsr_ptr, "cpsr_old")
+            .map_err(|e| format!("load cpsr: {}", e))?
+            .into_int_value();
+        let preserved_c_top = builder
+            .build_and(cpsr_old, i32_t.const_int(0x2000_0000, false), "c_old_top")
+            .map_err(|e| format!("and: {}", e))?;
+        let preserved_c = builder
+            .build_right_shift(
+                preserved_c_top,
+                i32_t.const_int(29, false),
+                false,
+                "c_old",
+            )
+            .map_err(|e| format!("lshr: {}", e))?;
+
+        let (result, new_c) = match (kind, imm5) {
+            (ShiftKind::Lsl, 0) => (rs_val, preserved_c),
+            (ShiftKind::Lsl, n) => {
+                let r = builder
+                    .build_left_shift(
+                        rs_val,
+                        i32_t.const_int(n as u64, false),
+                        "lsl_r",
+                    )
+                    .map_err(|e| format!("lsl: {}", e))?;
+                let c_shift = i32_t.const_int(32 - n as u64, false);
+                let c_raw = builder
+                    .build_right_shift(rs_val, c_shift, false, "c_raw")
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let c = builder
+                    .build_and(c_raw, one_const, "c_bit")
+                    .map_err(|e| format!("and: {}", e))?;
+                (r, c)
+            }
+            (ShiftKind::Lsr, 0) => {
+                let r = i32_t.const_int(0, false);
+                let c_raw = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int(31, false),
+                        false,
+                        "c_raw",
+                    )
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let c = builder
+                    .build_and(c_raw, one_const, "c_bit")
+                    .map_err(|e| format!("and: {}", e))?;
+                (r, c)
+            }
+            (ShiftKind::Lsr, n) => {
+                let r = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int(n as u64, false),
+                        false,
+                        "lsr_r",
+                    )
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let c_raw = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int((n - 1) as u64, false),
+                        false,
+                        "c_raw",
+                    )
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let c = builder
+                    .build_and(c_raw, one_const, "c_bit")
+                    .map_err(|e| format!("and: {}", e))?;
+                (r, c)
+            }
+            (ShiftKind::Asr, 0) => {
+                let r = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int(31, false),
+                        true,
+                        "asr_r",
+                    )
+                    .map_err(|e| format!("ashr: {}", e))?;
+                let c_raw = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int(31, false),
+                        false,
+                        "c_raw",
+                    )
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let c = builder
+                    .build_and(c_raw, one_const, "c_bit")
+                    .map_err(|e| format!("and: {}", e))?;
+                (r, c)
+            }
+            (ShiftKind::Asr, n) => {
+                let r = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int(n as u64, false),
+                        true,
+                        "asr_r",
+                    )
+                    .map_err(|e| format!("ashr: {}", e))?;
+                let c_raw = builder
+                    .build_right_shift(
+                        rs_val,
+                        i32_t.const_int((n - 1) as u64, false),
+                        false,
+                        "c_raw",
+                    )
+                    .map_err(|e| format!("lshr: {}", e))?;
+                let c = builder
+                    .build_and(c_raw, one_const, "c_bit")
+                    .map_err(|e| format!("and: {}", e))?;
+                (r, c)
+            }
+        };
+
+        // Store result back to gpr[rd]
+        let rd_idx = i32_t.const_int(rd as u64, false);
+        let rd_addr = unsafe {
+            builder
+                .build_in_bounds_gep(i32_t, gpr_ptr, &[rd_idx], "rd_addr")
+                .map_err(|e| format!("gep: {}", e))?
+        };
+        builder
+            .build_store(rd_addr, result)
+            .map_err(|e| format!("store rd: {}", e))?;
+
+        // Flags: N, Z from result; C is new_c (already at bit 0); V preserved.
+        let n_bit = builder
+            .build_and(result, i32_t.const_int(0x8000_0000, false), "n")
+            .map_err(|e| format!("and: {}", e))?;
+        let zero_const = i32_t.const_int(0, false);
+        let z_bool = builder
+            .build_int_compare(IntPredicate::EQ, result, zero_const, "z")
+            .map_err(|e| format!("icmp: {}", e))?;
+        let z_u32 = builder
+            .build_int_z_extend(z_bool, i32_t, "z_u32")
+            .map_err(|e| format!("zext: {}", e))?;
+        let z_shifted = builder
+            .build_left_shift(z_u32, i32_t.const_int(30, false), "z_sh")
+            .map_err(|e| format!("shl: {}", e))?;
+        let c_shifted = builder
+            .build_left_shift(new_c, i32_t.const_int(29, false), "c_sh")
+            .map_err(|e| format!("shl: {}", e))?;
+        let v_preserved = builder
+            .build_and(cpsr_old, i32_t.const_int(0x1000_0000, false), "v_pres")
+            .map_err(|e| format!("and v: {}", e))?;
+
+        // cpsr_new = (cpsr_old & 0x0FFFFFFF) | N | Z | C | V_preserved
+        let cpsr_cleared = builder
+            .build_and(cpsr_old, i32_t.const_int(0x0FFF_FFFF, false), "cpsr_cl")
+            .map_err(|e| format!("and: {}", e))?;
+        let nz = builder
+            .build_or(n_bit, z_shifted, "nz")
+            .map_err(|e| format!("or: {}", e))?;
+        let cv = builder
+            .build_or(c_shifted, v_preserved, "cv")
+            .map_err(|e| format!("or: {}", e))?;
+        let flags = builder
+            .build_or(nz, cv, "flags")
+            .map_err(|e| format!("or: {}", e))?;
+        let cpsr_new = builder
+            .build_or(cpsr_cleared, flags, "cpsr_new")
+            .map_err(|e| format!("or: {}", e))?;
+        builder
+            .build_store(cpsr_ptr, cpsr_new)
+            .map_err(|e| format!("store cpsr: {}", e))?;
+
+        builder
+            .build_return(Some(&i32_t.const_int(0, false)))
+            .map_err(|e| format!("ret: {}", e))?;
+
+        self.engine
+            .add_module(&module)
+            .map_err(|_| "add_module".to_string())?;
         let raw = self
             .engine
             .get_function_address(&name)
@@ -535,6 +783,73 @@ mod tests {
         // Z=1 (bit 30), C=1 (bit 29). N=0, V=0.
         assert_eq!(cpsr & 0xF000_0000, 0x6000_0000,
             "Z + C should be set: cpsr = 0x{:08x}", cpsr);
+    }
+
+    /// F1 LSL: r1 = 0x12345678, LSL r0, r1, #4 → r0 = 0x23456780,
+    /// C = bit 28 of r1 = 1 (after shifting up by 4, that bit fell off).
+    #[test]
+    fn thumb_f1_lsl_imm() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format1_shift(ShiftKind::Lsl, 0, 1, 4)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[1] = 0x1234_5678;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0x2345_6780);
+        // bit (32 - 4) = bit 28 of 0x1234_5678 → 0x1 → C set.
+        assert_eq!(
+            cpsr & 0x2000_0000,
+            0x2000_0000,
+            "C bit should be set: cpsr = 0x{:08x}",
+            cpsr
+        );
+    }
+
+    /// F1 LSR by 1, simple bit drop.
+    #[test]
+    fn thumb_f1_lsr_imm() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format1_shift(ShiftKind::Lsr, 0, 1, 1)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[1] = 0x0000_0003;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 1);
+        // bit 0 of original = 1 → C = 1.
+        assert_eq!(cpsr & 0x2000_0000, 0x2000_0000);
+    }
+
+    /// F1 ASR sign-extends. r1 = 0xF000_0000, ASR r0, r1, #4 →
+    /// r0 = 0xFF00_0000.
+    #[test]
+    fn thumb_f1_asr_imm_sign_extend() {
+        let mut compiler = LlvmCompiler::new().expect("new");
+        let func = compiler
+            .compile_thumb_format1_shift(ShiftKind::Asr, 0, 1, 4)
+            .expect("compile");
+        let mut gpr: [u32; 15] = [0; 15];
+        gpr[1] = 0xF000_0000;
+        let mut cpsr: u32 = 0;
+        let mut pc_out: u32 = 0;
+        let mut ctx: u8 = 0;
+        unsafe {
+            func(gpr.as_mut_ptr(), &mut cpsr, &mut pc_out, &mut ctx as *mut u8);
+        }
+        assert_eq!(gpr[0], 0xFF00_0000);
+        // N = 1 (top bit of result).
+        assert_eq!(cpsr & 0x8000_0000, 0x8000_0000);
     }
 
     /// F3 SUB imm: r4 = 100, SUB r4, #5 → r4=95, C=1 (no borrow), N=0,
