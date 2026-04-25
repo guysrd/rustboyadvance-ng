@@ -1,0 +1,3 @@
+commit	weighted_cycles	pokeemerald_fps	pokeemerald_cpu_pct	pokeemerald_gpu_pct	mario_kart_fps	mario_kart_cpu_pct	mario_kart_gpu_pct	status	description
+f560d04	41055500	327.1	59.8	11.7	251.3	60.6	11.0	keep	baseline (shape_profile wired)
+304aa28	0	0.0	0.0	0.0	0.0	0.0	0.0	discard	emit_flag_update bor chain reorder - user reported pokemon emerald color corruption in SDL replay; reverted (semantically should be no-op, Cranelift may have mis-scheduled)

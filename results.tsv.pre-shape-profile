@@ -1,0 +1,18 @@
+commit	weighted_cycles	fps	status	description
+431b429	49703500	823.5	keep	baseline (scaffolding)
+feb291d	40865500	865.9	keep	emit_flag_update: skip C/V round-trip on logical ops + N/V bit-band
+d1fa6b2	41604500	866.2	discard	emit_cond_check lazy flag extract - no bench shape exercises cond path, within noise
+f80f617	41668500	856.5	discard	emit_thumb_format3 skip rd_val load on MOV - noise, Cranelift already DCEs
+f1271f8	44448500	834.1	discard	emit_flag_update select for Z/C - regression; select lowers worse than icmp+uextend+ishl on x86_64
+2c37ca2	37857750	834.4	keep	Thumb3 MOV imm8 fast path - 2-run avg WC=-7.4%, fps within host noise
+87e0d3c	43974000	835.6	discard	Cranelift opt_level=speed - regression; adds compile-time overhead without exec gain on our shapes
+0316d8b	37189500	850.3	keep	Thumb3 ADD/SUB/CMP inline simplified V (imm8>=0 shortcut)
+8c86904	37104250	846.7	keep	try_compile_imm_block skip cpsr load/store when block flags-clean (arm_mov_imm: 8 -> 6 host insns)
+63dca83	36454250	847.4	keep	Disable Cranelift unwind_info - saves CFI metadata emission
+b1acadf	37294750	829.4	keep	Thumb block dead-flag-write elim: dp_chain 4.19ns->1.84ns (-56% on shape); WC +2% within noise
+9a3b3d8	36952250	846.8	keep	Thumb2 Imm3 simplified V inline - bench doesn't exercise shape; principled gain
+606c0b1	36884750	823.9	keep	Extend Thumb dead-flag-elim to format 2 (ADD/SUB reg)
+c478eac	36799000	852.7	keep	ARM imm block dead-flag-write elim - bench has no multi-instr ARM chains
+ca11be7	36750500	826.0	keep	patterns: shift-pair sxtb/sxth/uxtb/uxth stencil + 4 diff tests
+f31935b	37537250	838.7	discard	emit_thumb_format1 hoist preserve_c - noise, Cranelift already DCEs unused cpsr read
+772d381	39696500	849.9	keep	Add shift_pair_sxtb bench+weight - metric now includes new shape (baseline re-aligned)

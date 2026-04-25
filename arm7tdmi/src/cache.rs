@@ -285,6 +285,11 @@ struct DynarecDebug {
     /// emits a direct gpr_ptr load/store (legacy behavior). For
     /// bisecting any regressions caused by the Variable-based caching.
     pub no_gpr_cache: bool,
+    /// Opt-in: enable Variable-based gpr caching during the rollout.
+    /// Default off until all emit fns are converted (mixed-mode
+    /// aliasing causes silent divergences). Once the refactor is
+    /// done the default flips and this knob goes away.
+    pub gpr_cache_active: bool,
     max_len: Option<usize>,
 }
 
@@ -309,6 +314,15 @@ fn dynarec_no_arm_jit() -> bool {
 #[cfg(feature = "dynarec")]
 pub(crate) fn dynarec_no_gpr_cache() -> bool {
     dynarec_debug().no_gpr_cache
+}
+
+/// Active when DYNAREC_DEBUG includes `gpr-cache` AND no-gpr-cache is
+/// not also set. During the rollout, default is passthrough (off);
+/// flips to default-on after every emit fn is converted.
+#[cfg(feature = "dynarec")]
+pub(crate) fn dynarec_gpr_cache_active() -> bool {
+    let d = dynarec_debug();
+    d.gpr_cache_active && !d.no_gpr_cache
 }
 
 #[cfg(feature = "dynarec")]
@@ -344,6 +358,7 @@ fn dynarec_debug() -> &'static DynarecDebug {
                     "no-per-iter-fetch" => d.no_per_iter_fetch = true,
                     "no-arm-jit" => d.no_arm_jit = true,
                     "no-gpr-cache" => d.no_gpr_cache = true,
+                    "gpr-cache" => d.gpr_cache_active = true,
                     t if t.starts_with("max=") => {
                         if let Ok(n) = t[4..].parse() {
                             d.max_len = Some(n);

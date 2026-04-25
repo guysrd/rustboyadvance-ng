@@ -1779,7 +1779,11 @@ impl DynarecCompiler {
                         if skip_fu {
                             emit_thumb_format2_no_flags(&mut builder, gpr_ptr, *d);
                         } else {
-                            emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, *d);
+                            // Test path — passthrough cache, no Variable
+                            // caching (production try_compile_thumb_mem_block_with_branch
+                            // owns the real cache).
+                            let mut tmp_cache = GprCache::new(true);
+                            emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d);
                         }
                     }
                     ThumbItem::F3(d) => {
@@ -1913,10 +1917,14 @@ impl DynarecCompiler {
             let idle_cycle_ref =
                 self.module.declare_func_in_func(imports.idle_cycle, builder.func);
 
+            // Test compile path — local passthrough cache so emit fns
+            // that take &mut GprCache compile cleanly. Production caching
+            // happens only in try_compile_thumb_mem_block_with_branch.
+            let mut tmp_cache = GprCache::new(true);
             for item in &items {
                 match item {
                     MemItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
-                    MemItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, *d),
+                    MemItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     MemItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
                     MemItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
@@ -2327,10 +2335,11 @@ impl DynarecCompiler {
                 builder.ins().load(types::I32, MemFlags::trusted(), cpsr_ptr, 0);
             builder.def_var(cpsr_var, cpsr_initial);
 
+            let mut tmp_cache = GprCache::new(true);
             for item in &body {
                 match item {
                     BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, *d),
-                    BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, *d),
+                    BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, *d),
                     BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, *d),
                     BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, *d),
                     BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, *d),
@@ -2381,7 +2390,7 @@ impl DynarecCompiler {
             } else if let Some(item) = tail_body {
                 match item {
                     BodyItem::F1(d) => emit_thumb_format1(&mut builder, gpr_ptr, cpsr_var, d),
-                    BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, cpsr_var, d),
+                    BodyItem::F2(d) => emit_thumb_format2(&mut builder, gpr_ptr, &mut tmp_cache, cpsr_var, d),
                     BodyItem::F3(d) => emit_thumb_format3(&mut builder, gpr_ptr, cpsr_var, d),
                     BodyItem::F4(d) => emit_thumb_format4_logical(&mut builder, gpr_ptr, cpsr_var, d),
                     BodyItem::F5(d) => emit_thumb_format5_non_branch(&mut builder, gpr_ptr, cpsr_var, d),
@@ -2762,6 +2771,22 @@ impl DynarecCompiler {
                 .module
                 .declare_func_in_func(imports.idle_cycle, builder.func);
             let entry_pc_val = builder.ins().iconst(types::I32, entry_pc as i64);
+            // Per-block gpr cache. Lazy-Variable based; emit fns route
+            // their gpr access through this so Cranelift's regalloc can
+            // keep hot regs in host regs across the body.
+            //
+            // Default = passthrough (every read/write is a direct
+            // gpr_ptr load/store, identical to legacy codegen) until
+            // ALL emit fns are converted. Mixed mode (some via cache,
+            // some via direct gpr_ptr) creates aliasing — the cache
+            // would hold stale Variable values vs current memory writes.
+            // The default flips to active once every emit is converted.
+            //
+            // Opt-in via DYNAREC_DEBUG=gpr-cache while the rollout is
+            // in progress. Once every emit fn is converted, the default
+            // flips and this opt-in goes away.
+            let mut gpr_cache =
+                GprCache::new(!crate::cache::dynarec_gpr_cache_active());
 
             // Pay fetch cycles. Two models:
             //   - fetch_n (default): pre-pay all N fetches at block entry.
@@ -2870,14 +2895,20 @@ impl DynarecCompiler {
                 }
             }
 
-            let emit_body = |builder: &mut FunctionBuilder, item: &Body, skip_flag_write: bool, instr_pc: u32| {
+            let emit_body = |
+                builder: &mut FunctionBuilder,
+                gpr_cache: &mut GprCache,
+                item: &Body,
+                skip_flag_write: bool,
+                instr_pc: u32,
+            | {
                 match item {
                     Body::F1(d) => emit_thumb_format1(builder, gpr_ptr, cpsr_var, *d),
                     Body::F2(d) => {
                         if skip_flag_write {
                             emit_thumb_format2_no_flags(builder, gpr_ptr, *d);
                         } else {
-                            emit_thumb_format2(builder, gpr_ptr, cpsr_var, *d);
+                            emit_thumb_format2(builder, gpr_ptr, gpr_cache, cpsr_var, *d);
                         }
                     }
                     Body::F3(d) => {
@@ -3205,7 +3236,7 @@ impl DynarecCompiler {
                     _ => {}
                 }
 
-                emit_body(&mut builder, item, skip_flags[k], instr_pc);
+                emit_body(&mut builder, &mut gpr_cache, item, skip_flags[k], instr_pc);
 
                 if per_iter_fetch {
                     // Update cpu.next_fetch_access from this iter's
@@ -3364,7 +3395,7 @@ impl DynarecCompiler {
                     // sees whatever flags it writes, so we never skip
                     // its flag update.
                     let tail_instr_pc = entry_pc.wrapping_add((2 * body.len()) as u32);
-                    emit_body(&mut builder, b, false, tail_instr_pc);
+                    emit_body(&mut builder, &mut gpr_cache, b, false, tail_instr_pc);
                     // Mirror scalar's `CpuAction::AdvancePC(NonSeq)` for the
                     // post-block fetch: when the tail body item is a STORE
                     // (STR/STRB/PUSH), scalar STR returns NonSeq, so the
@@ -5686,15 +5717,11 @@ fn emit_thumb_format4_logical(
 fn emit_thumb_format2(
     builder: &mut FunctionBuilder,
     gpr_ptr: Value,
+    gpr_cache: &mut GprCache,
     cpsr_var: Variable,
     dec: DecodedThumb2,
 ) {
-    let rs_val = builder.ins().load(
-        types::I32,
-        MemFlags::trusted(),
-        gpr_ptr,
-        Offset32::new(dec.rs * 4),
-    );
+    let rs_val = gpr_cache.read(builder, gpr_ptr, dec.rs as usize);
     // For Imm3 shape (imm3 ∈ [0,7], always non-negative), rhs sign
     // bit is known 0, so the same simplified V formula Thumb3 uses
     // applies:
@@ -5704,24 +5731,14 @@ fn emit_thumb_format2(
     let is_small_positive_imm = matches!(dec.operand, Thumb2Operand::Imm3(_));
     let rhs = match dec.operand {
         Thumb2Operand::Imm3(v) => builder.ins().iconst(types::I32, v as i64),
-        Thumb2Operand::Reg(rn) => builder.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            gpr_ptr,
-            Offset32::new(rn * 4),
-        ),
+        Thumb2Operand::Reg(rn) => gpr_cache.read(builder, gpr_ptr, rn as usize),
     };
     let (result, dp_equivalent) = if dec.sub {
         (builder.ins().isub(rs_val, rhs), DpOp::Sub)
     } else {
         (builder.ins().iadd(rs_val, rhs), DpOp::Add)
     };
-    builder.ins().store(
-        MemFlags::trusted(),
-        result,
-        gpr_ptr,
-        Offset32::new(dec.rd * 4),
-    );
+    gpr_cache.write(builder, gpr_ptr, dec.rd as usize, result);
 
     if is_small_positive_imm {
         // Inlined flag update with simplified V (mirrors emit_thumb_format3
