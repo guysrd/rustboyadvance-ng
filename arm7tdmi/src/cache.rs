@@ -29,15 +29,6 @@ use rustc_hash::FxHashMap;
 use crate::cpu::{Arm7tdmiCore, CpuAction};
 use crate::memory::MemoryInterface;
 
-/// Fn pointer shape for a JIT-compiled Thumb block. The LLVM backend
-/// emits functions matching this signature (gpr_ptr, cpsr_ptr,
-/// pc_out_ptr, cpu_ctx). Return value:
-///   bit 0 = branch taken (pc_out populated, caller reloads pipeline)
-///   bit 1 = mid-block abort (handler already wrote pc/pipeline state)
-#[cfg(feature = "dynarec")]
-pub type CompiledThumbFn =
-    extern "C" fn(*mut u32, *mut u32, *mut u32, *mut u8) -> u32;
-
 /// One recorded instruction inside a block.
 ///
 /// Handler fn signatures differ between ARM and Thumb (u32 vs u16 insn word),
@@ -73,17 +64,9 @@ impl BlockKey {
 /// PipelineFlushed the last time we executed it.
 pub struct Block<I: MemoryInterface> {
     pub instrs: Vec<DecodedInstr<I>>,
-    /// PC at which this block begins, with the Thumb bit in bit 0. Needed
-    /// by the dynarec compiler to fold PC relative branch targets at
-    /// codegen time. Populated even when the `dynarec` feature is off so
-    /// future diagnostics can use it.
+    /// PC at which this block begins, with the Thumb bit in bit 0.
+    /// Populated for diagnostics and for AOT/JIT lookup paths.
     pub entry_pc: u32,
-    /// Optional compiled block. Set by `finish_record` when the LLVM
-    /// dynarec compiler successfully lowers all the recorded opcodes.
-    /// None for ARM blocks (cached_interp scalar fallback) and any
-    /// block the LLVM backend rejects.
-    #[cfg(feature = "dynarec")]
-    pub compiled: Option<CompiledThumbFn>,
 }
 
 impl<I: MemoryInterface> Block<I> {
@@ -91,8 +74,6 @@ impl<I: MemoryInterface> Block<I> {
         Block {
             instrs: Vec::with_capacity(8),
             entry_pc,
-            #[cfg(feature = "dynarec")]
-            compiled: None,
         }
     }
 }
@@ -120,13 +101,6 @@ pub struct BlockCache<I: MemoryInterface> {
     ram_blocks: FxHashMap<BlockKey, Rc<Block<I>>>,
     /// Block currently being recorded. `None` when not in a recording pass.
     recording: Option<(BlockKey, Block<I>)>,
-    /// LLVM-via-inkwell compiler. `finish_record` calls
-    /// `compile_thumb_block` on every all-Thumb ROM block; ARM blocks
-    /// and any block the backend rejects fall through to the
-    /// cached_interp scalar replay path. Set by `enable_dynarec` on
-    /// the owning CPU.
-    #[cfg(feature = "dynarec")]
-    llvm_compiler: Option<crate::dynarec::LlvmCompiler>,
 }
 
 
@@ -146,8 +120,6 @@ impl<I: MemoryInterface> Default for BlockCache<I> {
             rom_blocks: FxHashMap::with_capacity_and_hasher(2048, Default::default()),
             ram_blocks: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             recording: None,
-            #[cfg(feature = "dynarec")]
-            llvm_compiler: None,
         }
     }
 }
@@ -191,22 +163,6 @@ impl<I: MemoryInterface> BlockCache<I> {
         self.recording = None;
     }
 
-    /// Install the LLVM-backed dynarec compiler. After this, every
-    /// newly recorded all-Thumb ROM block is handed to
-    /// `compile_thumb_block` in `finish_record` and the resulting fn
-    /// pointer is stashed on the Block for `step_block` to dispatch
-    /// to. Call once per CPU after construction.
-    #[cfg(feature = "dynarec")]
-    pub fn enable_dynarec(&mut self, compiler: crate::dynarec::LlvmCompiler) {
-        self.llvm_compiler = Some(compiler);
-    }
-
-    /// True if the dynarec compiler has been installed.
-    #[cfg(feature = "dynarec")]
-    pub fn has_dynarec(&self) -> bool {
-        self.llvm_compiler.is_some()
-    }
-
     /// Begin trace-recording a new block starting at `key`.
     #[inline]
     pub fn begin_record(&mut self, key: BlockKey) {
@@ -229,15 +185,9 @@ impl<I: MemoryInterface> BlockCache<I> {
         }
     }
 
-    /// Finish the current recording and insert it into the appropriate cache
-    /// half based on the block's entry region. Called on pipeline flush or
-    /// when the block length cap is reached.
-    ///
-    /// When the dynarec feature is on and the LLVM compiler has been
-    /// installed, every all-Thumb ROM block is handed to the backend.
-    /// On success the resulting fn pointer is stashed on the Block and
-    /// step_block can dispatch to it; on rejection the Block is left
-    /// with compiled=None and replays via the interpreter handler loop.
+    /// Finish the current recording and insert it into the appropriate
+    /// cache half based on the block's entry region. Called on pipeline
+    /// flush or when the block length cap is reached.
     #[inline]
     pub fn finish_record(&mut self) {
         if let Some((_key, block)) = self.recording.as_ref()
@@ -246,52 +196,9 @@ impl<I: MemoryInterface> BlockCache<I> {
             self.recording = None;
             return;
         }
-
-        #[cfg(feature = "dynarec")]
-        let Some((key, mut block)) = self.recording.take() else {
-            return;
-        };
-        #[cfg(not(feature = "dynarec"))]
         let Some((key, block)) = self.recording.take() else {
             return;
         };
-
-        #[cfg(feature = "dynarec")]
-        {
-            // Only compile ROM blocks. RAM blocks get flushed on every
-            // RAM write, so compiling them would burn a codegen pass
-            // for a single use. ROM blocks stay warm for the whole run.
-            let pc = key.0 & !1;
-            if is_rom_address(pc)
-                && let Some(c) = self.llvm_compiler.as_mut()
-            {
-                // Only all-Thumb blocks reach the backend. ARM blocks
-                // fall back to cached_interp scalar replay.
-                let raws_opt: Option<Vec<u16>> = block
-                    .instrs
-                    .iter()
-                    .map(|i| match i {
-                        DecodedInstr::Thumb { raw, .. } => Some(*raw),
-                        DecodedInstr::Arm { .. } => None,
-                    })
-                    .collect();
-                if let Some(raws) = raws_opt
-                    && let Some(f) = c.compile_thumb_block(
-                        &raws,
-                        (block.entry_pc & !1).wrapping_sub(4),
-                    )
-                {
-                    let f_typed: CompiledThumbFn = unsafe {
-                        std::mem::transmute::<
-                            crate::dynarec::CompiledFn,
-                            CompiledThumbFn,
-                        >(f)
-                    };
-                    block.compiled = Some(f_typed);
-                }
-            }
-        }
-
         let pc = key.0 & !1;
         if is_rom_address(pc) {
             self.rom_blocks.insert(key, Rc::new(block));
@@ -320,19 +227,5 @@ impl<I: MemoryInterface> BlockCache<I> {
         self.rom_blocks.len() + self.ram_blocks.len()
     }
 
-    /// Diagnostic: compile-rate stats for the ROM-block half of the
-    /// cache. Returns `(total_rom_blocks, with_compiled_fn)`. Used by
-    /// benchmarks and diagnostic runs to estimate how much of the
-    /// hot code is on the dynarec fast path.
-    #[cfg(feature = "dynarec")]
-    pub fn compile_stats(&self) -> (usize, usize) {
-        let mut compiled = 0;
-        for block in self.rom_blocks.values() {
-            if block.compiled.is_some() {
-                compiled += 1;
-            }
-        }
-        (self.rom_blocks.len(), compiled)
-    }
 }
 

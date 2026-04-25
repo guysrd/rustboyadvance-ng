@@ -61,11 +61,9 @@ pub struct Options {
     #[arg(long = "no-audio")]
     pub no_audio: bool,
 
-    /// Enable the LLVM dynarec for CPU dispatch. Off by default.
-    /// All-Thumb ROM blocks are JIT-compiled by the LLVM backend;
-    /// ARM blocks and any LLVM-rejected blocks fall back to the
-    /// cached_interp scalar replay path. Built into any binary
-    /// compiled with `--features dynarec`.
+    /// No-op on the `aot-llvm` branch — the LLVM JIT was retired here
+    /// (see docs/llvm-jit-status.md on shape-opt/apr22 for rationale).
+    /// Reserved for the AOT-LLVM dispatcher when that lands.
     #[arg(long = "jit")]
     pub jit: bool,
 

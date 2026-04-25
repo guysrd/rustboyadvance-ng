@@ -126,18 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gba.skip_bios();
     }
 
-    // Dynarec dispatcher control. Off by default; --jit turns the
-    // LLVM-backed dispatcher on. ARM blocks and any LLVM-rejected
-    // blocks fall back to cached_interp scalar replay.
     if opts.jit {
-        #[cfg(feature = "dynarec")]
-        {
-            info!("Enabling LLVM dynarec dispatcher");
-            gba.cpu.enable_dynarec();
-        }
-        #[cfg(not(feature = "dynarec"))]
         log::warn!(
-            "--jit requested but this binary was built without dynarec; ignoring"
+            "--jit is a no-op on this branch (cache_interp scalar only). \
+             AOT-LLVM work lives behind future feature flags."
         );
     }
 
@@ -312,31 +304,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "replay done: {} frames in {:.2}s wall, {:.1} avg fps ({} emulated cycles)",
                     replay_frames, elapsed, fps, now
                 );
-                #[cfg(feature = "dynarec")]
-                {
-                    let (total, compiled) = gba.cpu.block_cache.compile_stats();
-                    let pct = if total > 0 {
-                        100.0 * compiled as f64 / total as f64
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "block cache: {} rom blocks, {} compiled ({:.1}%)",
-                        total, compiled, pct,
-                    );
-                    let cc = gba.cpu.dispatch_compiled_count;
-                    let ic = gba.cpu.dispatch_interp_count;
-                    let total_d = cc + ic;
-                    let cc_pct = if total_d > 0 {
-                        100.0 * cc as f64 / total_d as f64
-                    } else {
-                        0.0
-                    };
-                    println!(
-                        "dispatch: {} total, {} compiled ({:.2}%), {} interp",
-                        total_d, cc, cc_pct, ic,
-                    );
-                }
                 break 'running;
             }
         }

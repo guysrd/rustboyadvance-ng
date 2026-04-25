@@ -17,11 +17,6 @@ use thumb::ThumbInstruction;
 
 #[cfg(feature = "cached_interp")]
 pub mod cache;
-/// LLVM-via-inkwell JIT backend. Compiles hot Thumb blocks to native
-/// code via inkwell. ARM and any LLVM-rejected blocks fall back to the
-/// cached interpreter scalar path.
-#[cfg(feature = "dynarec")]
-pub mod dynarec;
 pub mod cpu;
 pub use cpu::*;
 pub mod alu;

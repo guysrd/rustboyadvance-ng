@@ -97,10 +97,6 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     pub pc: u32,
     pub bus: Shared<I>,
 
-    // pub(crate) so the sibling dynarec module can touch these when
-    // dispatching compiled block entries. Kept out of the external
-    // public surface because they're part of the pipeline emulation
-    // invariants.
     pub(crate) next_fetch_access: MemoryAccess,
     pub(crate) pipeline: [u32; 2],
     pub gpr: [u32; 15],
@@ -121,29 +117,6 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     /// `cached_interp` feature is on; zero-sized otherwise.
     #[cfg(feature = "cached_interp")]
     pub block_cache: super::cache::BlockCache<I>,
-
-    /// Runtime kill switch for the dynarec compiled-block dispatch in
-    /// replay_cached_block. Defaults to false so no behavior change lands
-    /// in this commit. A follow up commit wires the CPU constructor to
-    /// install a compiler on the cache AND flip this to true once the
-    /// cycle accounting for compiled blocks is parity-safe.
-    #[cfg(feature = "dynarec")]
-    pub dynarec_dispatch_enabled: bool,
-
-    /// Diagnostic counter incremented every time `replay_cached_block`
-    /// hits the compiled-dispatch fast path (compiled block present +
-    /// dynarec dispatch enabled + Thumb state). Reset to 0 at
-    /// construction; read via `dispatch_counts()` at the end of a run
-    /// to see what fraction of block replays went through compiled
-    /// native code vs the scalar interpreter loop.
-    #[cfg(feature = "dynarec")]
-    pub dispatch_compiled_count: u64,
-    /// Companion to `dispatch_compiled_count`: bumped on every block
-    /// replay that fell through to the scalar interpreter loop
-    /// (compiled was None, dynarec disabled, or block wasn't Thumb).
-    /// Sum of both is the total number of block replays.
-    #[cfg(feature = "dynarec")]
-    pub dispatch_interp_count: u64,
 }
 
 // BlockCache holds handler function pointers keyed by entry-PC; cloning a CPU
@@ -166,12 +139,6 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             dbg: self.dbg.clone(),
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
-            #[cfg(feature = "dynarec")]
-            dynarec_dispatch_enabled: false,
-            #[cfg(feature = "dynarec")]
-            dispatch_compiled_count: 0,
-            #[cfg(feature = "dynarec")]
-            dispatch_interp_count: 0,
         }
     }
 }
@@ -196,44 +163,11 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
 
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
-            #[cfg(feature = "dynarec")]
-            dynarec_dispatch_enabled: false,
-            #[cfg(feature = "dynarec")]
-            dispatch_compiled_count: 0,
-            #[cfg(feature = "dynarec")]
-            dispatch_interp_count: 0,
         }
     }
 
     pub fn weak_ptr(&mut self) -> WeakPointer<Arm7tdmiCore<I>> {
         WeakPointer::new(self as *mut Arm7tdmiCore<I>)
-    }
-
-    /// Install the LLVM-via-inkwell dynarec on the block cache and
-    /// flip the runtime dispatch flag so every compiled block in the
-    /// cache runs its native fn pointer instead of the interpreter
-    /// replay loop. Call once per CPU after construction.
-    ///
-    /// After this, new all-Thumb ROM blocks recorded during step_block
-    /// are JIT-compiled by the LLVM backend; ARM blocks and any
-    /// LLVM-rejected blocks fall back to the cached_interp scalar
-    /// replay path.
-    #[cfg(feature = "dynarec")]
-    pub fn enable_dynarec(&mut self) {
-        let mut compiler =
-            crate::dynarec::LlvmCompiler::new().expect("LlvmCompiler::new");
-        compiler.register_trampolines(crate::dynarec::LlvmBusTrampolines {
-            thumb_step_with_fetch: Some(
-                crate::dynarec::thumb_step_with_fetch_for::<I>,
-            ),
-            thumb_step_with_fetch_and_abort: Some(
-                crate::dynarec::thumb_step_with_fetch_and_abort_for::<I>,
-            ),
-            cpsr_offset: std::mem::offset_of!(Arm7tdmiCore<I>, cpsr) as u32,
-            ..Default::default()
-        });
-        self.block_cache.enable_dynarec(compiler);
-        self.dynarec_dispatch_enabled = true;
     }
 
     pub fn from_saved_state(bus: Shared<I>, state: SavedCpuState) -> Arm7tdmiCore<I> {
@@ -257,12 +191,6 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
 
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
-            #[cfg(feature = "dynarec")]
-            dynarec_dispatch_enabled: false,
-            #[cfg(feature = "dynarec")]
-            dispatch_compiled_count: 0,
-            #[cfg(feature = "dynarec")]
-            dispatch_interp_count: 0,
         }
     }
 
@@ -632,76 +560,11 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
     ) -> bool {
         use super::cache::DecodedInstr;
 
-        // Dispatch to a dynarec compiled native block when one is attached.
-        // Only Thumb blocks get compiled today, and the compiler only kicks
-        // in when `enable_dynarec` has installed a compiler on the cache.
-        //
-        // Cycle accounting status:
-        //   - Instruction fetches: paid up front via `thumb_fetch_n` at
-        //     block entry.
-        //   - LDR family: `load_with_idle_*` trampolines pay `load_X` +
-        //     the +1I scalar adds after every data load.
-        //   - STR family: `store_X` trampolines pay the data store. If the
-        //     LAST instruction in the block is a store, the codegen also
-        //     emits a `set_next_fetch_nonseq` call so the post-block
-        //     fetch sees `next_fetch_access = NonSeq`, mirroring scalar
-        //     `CpuAction::AdvancePC(NonSeq)`.
-        //   - In-block STORE followed by another body item or by the
-        //     branch terminator: codegen emits one
-        //     `pay_thumb_fetch_extra_nonseq` trampoline call per body
-        //     STORE, charging the missing `(n - s)` cycles for the next
-        //     fetch. Address is `entry_pc` (page-invariant within a block).
-        // ARM blocks compile too (single-instruction B/Bcc only as of
-        // this change; more shapes follow). Compiled-block dispatch is
-        // mode-agnostic — the took bit-0 path uses pc_out[0] as the
-        // next-state Thumb flag, which works for ARM (target bit 0
-        // clear → ARM) and Thumb (Thumb bit set on PC writes) alike.
-        #[cfg(feature = "dynarec")]
-        if self.dynarec_dispatch_enabled
-            && let Some(compiled) = block.compiled
-        {
-            self.dispatch_compiled_count = self.dispatch_compiled_count.wrapping_add(1);
-
-            let mut pc_out: u32 = 0;
-            // cpsr_word is unused — handlers update self.cpsr directly
-            // via cpu_ctx + cpsr_offset, and the LLVM block no longer
-            // emits the redundant exit-flush. Kept in the ABI so
-            // standalone per-format compile fns (which DO use cpsr_ptr
-            // for flag updates) stay callable for unit tests.
-            let mut cpsr_word: u32 = 0;
-            let gpr_ptr = self.gpr.as_mut_ptr();
-            let cpu_ctx = self as *mut Arm7tdmiCore<I> as *mut u8;
-            let taken = compiled(gpr_ptr, &mut cpsr_word, &mut pc_out, cpu_ctx);
-            // Return-value bits:
-            //   bit 0 = branch taken (pc_out populated, reload pipeline).
-            //   bit 1 = mid-block abort (abort_mid_block trampoline has
-            //           already set pc / pipeline[0/1] / next_fetch_access;
-            //           caller must not chain past this, just yield).
-            if taken & 0b10 != 0 {
-                return false; // step_block breaks the chain
-            }
-            if taken & 0b01 != 0 {
-                // Branch fired. Apply the mode bit and set pc. The Thumb
-                // bit in pc_out[0] selects the next CPU state; the rest
-                // is the aligned target address. reload_pipeline* on the
-                // new mode flushes and re-fetches.
-                let thumb_bit = pc_out & 1 != 0;
-                self.cpsr.set_state(if thumb_bit { CpuState::THUMB } else { CpuState::ARM });
-                self.pc = pc_out & if thumb_bit { !1 } else { !3 };
-                if thumb_bit { self.reload_pipeline16() } else { self.reload_pipeline32() }
-            }
-            return true; // chain: pipeline already reloaded if branch fired
-        }
-
         // Always run the first instruction before checking abort conditions —
         // that guarantees forward progress even when (for example) an IRQ is
         // pending but CPU has IRQs disabled, so cpu_interrupt() is a no-op and
         // would otherwise loop us forever between the outer run() while and
         // step_block's early return.
-        #[cfg(feature = "dynarec")]
-        {
-            self.dispatch_interp_count = self.dispatch_interp_count.wrapping_add(1);
-        }
         let mut instr_idx: u32 = 0;
 
         for instr in &block.instrs {

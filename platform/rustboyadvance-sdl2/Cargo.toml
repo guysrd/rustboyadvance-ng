@@ -22,6 +22,3 @@ winres = "0.1"
 default = []
 debugger = ["rustboyadvance-core/debugger"]
 cached_interp = ["rustboyadvance-core/cached_interp"]
-# LLVM-backed dynarec for the --jit flag. Build env needs
-# LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
-dynarec = ["rustboyadvance-core/dynarec"]

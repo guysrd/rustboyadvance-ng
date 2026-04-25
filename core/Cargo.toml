@@ -62,7 +62,3 @@ elf_support = []
 debugger = ["nom", "rustyline", "fuzzy-matcher", "elf_support", "goblin", "arm7tdmi/debugger"]
 # See arm7tdmi/Cargo.toml for the feature description.
 cached_interp = ["arm7tdmi/cached_interp"]
-# Enables LLVM-backed dynarec on the CPU's block cache. Implies
-# cached_interp (which provides the block cache scaffolding). Build
-# env needs LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
-dynarec = ["arm7tdmi/dynarec", "cached_interp"]

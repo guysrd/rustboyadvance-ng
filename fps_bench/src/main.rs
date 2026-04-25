@@ -25,9 +25,8 @@ struct Options {
     #[arg(long = "replay", value_name = "PATH")]
     replay: Option<PathBuf>,
 
-    /// Enable the LLVM dynarec dispatch path (off by default).
-    /// Requires a --features dynarec build of this binary, which in
-    /// turn needs LLVM_SYS_181_PREFIX=/usr/lib/llvm-18.
+    /// No-op on the `aot-llvm` branch — LLVM JIT was retired here.
+    /// Reserved for the AOT-LLVM dispatcher when that lands.
     #[arg(long = "jit")]
     jit: bool,
 
@@ -65,13 +64,10 @@ fn main() {
     }
 
     if opts.jit {
-        #[cfg(feature = "dynarec")]
-        {
-            eprintln!("--jit: enabling LLVM dynarec dispatch");
-            gba.cpu.enable_dynarec();
-        }
-        #[cfg(not(feature = "dynarec"))]
-        eprintln!("--jit requested but binary built without --features dynarec; ignoring");
+        eprintln!(
+            "--jit is a no-op on this branch (cached_interp scalar only). \
+             AOT-LLVM dispatcher landing in a future commit."
+        );
     }
 
     match opts.replay {
