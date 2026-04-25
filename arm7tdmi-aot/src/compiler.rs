@@ -151,8 +151,11 @@ impl LlvmCompiler {
         // Phase-4 inline IR uses the fetch-only trampoline + cpu offsets.
         // Both must be registered to enable inline IR; otherwise we fall
         // back to the per-iter step trampoline call (phase-1 behavior).
+        // Also gated on AOT_INLINE_F3=1 (read once, not per-opcode!).
+        let f3_inline_env = std::env::var("AOT_INLINE_F3").map(|v| v == "1").unwrap_or(false);
         let inline_enabled = self.cpu_offsets.is_some()
-            && self.fetch_only_thumb_fn.is_some();
+            && self.fetch_only_thumb_fn.is_some()
+            && f3_inline_env;
         let (fetch_only_ref, offsets) = if inline_enabled {
             let fetch_only_fn = self.fetch_only_thumb_fn.unwrap();
             let off = self.cpu_offsets.unwrap();
@@ -212,6 +215,11 @@ impl LlvmCompiler {
             //   next_fetch_access = Seq (= 0)
             // Cycle accounting via fetch-only trampoline (load_16 +
             // pipeline shift) — same per-iter cost as scalar.
+            // Phase 4 step 1: F3 MOV imm8 inline IR.
+            // Only fires when inline_enabled (AOT_INLINE_F3=1 + the
+            // fetch_only/offsets infrastructure registered). Currently
+            // a slight perf regression vs the trampoline path; kept for
+            // correctness verification + future iteration.
             let f3_top5 = (opcode >> 11) & 0x1f;
             let f3_op = (opcode >> 11) & 0x3;
             if inline_enabled && f3_top5 == 0b00100 && f3_op == 0 {
