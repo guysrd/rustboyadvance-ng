@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpu_offsets.thumb_seq_cycles[8],
                 cpu_offsets.thumb_nonseq_cycles[8],
             );
-            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full_v2(
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full_v3(
                 &rom_bytes,
                 0x0800_0000,
                 entry_pc,
@@ -237,6 +237,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Phase-4 F6 helpers: bus.load_32 + idle_cycle externs.
                 Some(arm7tdmi_aot::replay::aot_load_32_for::<SysBus>),
                 Some(arm7tdmi_aot::replay::aot_idle_cycle_for::<SysBus>),
+                // Phase-4 F11 STR helper: bus.store_32 extern.
+                Some(arm7tdmi_aot::replay::aot_store_32_for::<SysBus>),
             ))
         } else {
             Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(

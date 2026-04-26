@@ -108,6 +108,29 @@ pub unsafe extern "C" fn aot_idle_cycle_for<I: MemoryInterface>(
     cpu.bus.idle_cycle();
 }
 
+/// Phase-4 helper: bus-side aligned word store with cycle accounting.
+/// Used by F11 STR sp-rel inline IR (and future F9 STR paths).
+/// Stores at `addr & ~3` (matches scalar's `store_aligned_32`).
+/// `access_byte`: 0 = NonSeq, 1 = Seq.
+pub type AotStore32Fn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    val: u32,
+    access_byte: u8,
+);
+
+pub unsafe extern "C" fn aot_store_32_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    val: u32,
+    access_byte: u8,
+) {
+    use arm7tdmi::memory::MemoryAccess;
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    let access = if access_byte == 1 { MemoryAccess::Seq } else { MemoryAccess::NonSeq };
+    cpu.bus.store_32(addr & !0x3, val, access);
+}
+
 /// Phase-8 ARM step trampoline. Mirrors `aot_thumb_step_for` but
 /// dispatches via ARM_LUT instead of THUMB_LUT and uses 32-bit fetch.
 pub unsafe extern "C" fn aot_arm_step_for<I: MemoryInterface>(

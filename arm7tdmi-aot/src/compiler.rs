@@ -10,6 +10,7 @@ use inkwell::execution_engine::JitFunction;
 
 use crate::replay::{
     AotAbortFn, AotFetchOnlyFn, AotIdleCycleFn, AotLoad32Fn, AotReplayFn, AotStepFn,
+    AotStore32Fn,
 };
 // Phase-8 ARM trampolines (used by emit_placeholder_arm_block; the per-instr
 // arm emit + step-arm + abort-arm registration come in a future commit).
@@ -78,6 +79,10 @@ pub struct LlvmCompiler {
     /// Phase-4 idle-cycle trampoline. F6 uses this for its 1S+1N+1I
     /// cycle accounting. Future F4 shifts/MUL paths will reuse.
     pub(crate) idle_cycle_fn: Option<AotIdleCycleFn>,
+    /// Phase-4 bus.store_32 trampoline (per I3). F11 STR sp-rel
+    /// (and future F9 STR / F14 PUSH) inline IR uses this to do
+    /// the actual word store with cycle accounting via the bus.
+    pub(crate) store_32_fn: Option<AotStore32Fn>,
 }
 
 impl LlvmCompiler {
@@ -103,6 +108,7 @@ impl LlvmCompiler {
             fetch_only_thumb_fn: None,
             load_32_fn: None,
             idle_cycle_fn: None,
+            store_32_fn: None,
         })
     }
 
@@ -131,6 +137,11 @@ impl LlvmCompiler {
     /// Phase-4 hook: register the bus-side idle-cycle trampoline.
     pub fn register_idle_cycle(&mut self, f: AotIdleCycleFn) {
         self.idle_cycle_fn = Some(f);
+    }
+
+    /// Phase-4 hook: register the bus-side store_32 trampoline.
+    pub fn register_store_32(&mut self, f: AotStore32Fn) {
+        self.store_32_fn = Some(f);
     }
 
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
@@ -212,12 +223,16 @@ impl LlvmCompiler {
         let f4_log_inline_env = std::env::var("AOT_INLINE_F4_LOG").map(|v| v == "1").unwrap_or(false);
         let f4_arith_inline_env = std::env::var("AOT_INLINE_F4_ARITH").map(|v| v == "1").unwrap_or(false);
         let f6_inline_env = std::env::var("AOT_INLINE_F6").map(|v| v == "1").unwrap_or(false);
+        // F11 split: STR-only this commit; LDR has misalignment ROR semantics
+        // per I14 that needs separate IR work (or a ldr_word extern).
+        let f11_str_inline_env = std::env::var("AOT_INLINE_F11_STR").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
             || f3_inline_env
             || f4_log_inline_env
             || f4_arith_inline_env
             || f6_inline_env
+            || f11_str_inline_env
             || f12_inline_env
             || f13_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
@@ -259,6 +274,22 @@ impl LlvmCompiler {
             (Some(l32_ref), Some(idle_ref))
         } else {
             (None, None)
+        };
+
+        // Phase-4 F11 STR helper: bus.store_32 extern.
+        let store_32_ref = if f11_str_inline_env && self.store_32_fn.is_some() {
+            let store_32_fn = self.store_32_fn.unwrap();
+            let i8_t_local = self.context.i8_type();
+            let store_32_sig = self.context.void_type().fn_type(
+                &[ptr_t.into(), i32_t.into(), i32_t.into(), i8_t_local.into()],
+                false,
+            );
+            let store_32_name = format!("rba_aot_store_32_{}", id);
+            let s32_ref = module.add_function(&store_32_name, store_32_sig, None);
+            self.engine.add_global_mapping(&s32_ref, store_32_fn as usize);
+            Some(s32_ref)
+        } else {
+            None
         };
 
         // Block fn.
@@ -993,6 +1024,83 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f6_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F11 STR SP-relative (word).
+            // Encoding: 1001_0_DDD_IIIIIIII; mask 0xf800 == 0x9000.
+            //   imm = (insn & 0xff) << 2  (constant, word-scaled)
+            //   addr = gpr[SP] + imm  (runtime base, constant offset)
+            //   bus.store_32(addr & ~3, gpr[Rd], NonSeq)
+            //                (matches scalar's store_aligned_32)
+            //   pc = fetch_addr + 2; nfa = NonSeq (= 0)
+            //   No flag updates.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F11 STR path.
+            // F11 LDR (mask 0x9800) NOT inlined here — needs I14 misaligned-
+            // word ROR which is a follow-up.
+            if inline_enabled
+                && f11_str_inline_env
+                && store_32_ref.is_some()
+                && (opcode & 0xf800) == 0x9000
+            {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let s32 = store_32_ref.unwrap();
+                let rd = ((opcode >> 8) & 0x7) as u32;
+                let imm = ((opcode & 0xff) as u32) << 2;
+
+                // Cycle accounting (fetch) + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[SP] (REG_SP = 13).
+                let sp_off = (off.gpr + 13 * 4) as u64;
+                let sp_off_v = i32_t.const_int(sp_off, false);
+                let sp_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[sp_off_v], "f11s_sp_ptr").ok()?
+                };
+                let sp_val = builder.build_load(i32_t, sp_ptr, "f11s_sp_val").ok()?
+                    .into_int_value();
+
+                // addr = SP + imm.
+                let addr = builder
+                    .build_int_add(sp_val, i32_t.const_int(imm as u64, false), "f11s_addr")
+                    .ok()?;
+
+                // val = gpr[Rd].
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f11s_gpr_rd_ptr").ok()?
+                };
+                let val = builder.build_load(i32_t, gpr_rd_ptr, "f11s_val").ok()?
+                    .into_int_value();
+
+                // bus.store_32(addr, val, NonSeq=0). Wrapper does addr & ~3.
+                let access_v = i8_t.const_int(0, false);
+                builder.build_call(
+                    s32,
+                    &[cpu_ctx.into(), addr.into(), val.into(), access_v.into()],
+                    "f11s_store",
+                ).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f11s_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = NonSeq (= 0).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f11s_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(0, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f11s_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
