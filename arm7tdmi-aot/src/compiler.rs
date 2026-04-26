@@ -226,6 +226,7 @@ impl LlvmCompiler {
         // F11 split: STR-only this commit; LDR has misalignment ROR semantics
         // per I14 that needs separate IR work (or a ldr_word extern).
         let f11_str_inline_env = std::env::var("AOT_INLINE_F11_STR").map(|v| v == "1").unwrap_or(false);
+        let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
             || f3_inline_env
@@ -234,7 +235,8 @@ impl LlvmCompiler {
             || f6_inline_env
             || f11_str_inline_env
             || f12_inline_env
-            || f13_inline_env;
+            || f13_inline_env
+            || f19hi_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
             && self.fetch_only_thumb_fn.is_some()
             && any_format_inline;
@@ -1101,6 +1103,55 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f11s_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F19 hi (BL pair high half).
+            // Encoding: 11110_OOOOOOOOOOO; top5 == 0b11110.
+            // Effects (mirrors arm7tdmi/src/cpu.rs aot_thumb_step F19 hi path):
+            //   off = sign-extend ((insn & 0x7ff) << 12) — constant at AOT time
+            //   gpr[REG_LR=14] = (fetch_addr + off) wrapping — constant
+            //   pc = fetch_addr + 2; nfa = Seq.
+            //   No flag updates; no PipelineFlushed (F19 lo terminates).
+            // Smallest-possible inline IR: 1 const store to gpr[14] + pc/nfa
+            // updates. Useful for the stacking-pattern hazard test — does
+            // even minimal-IR-per-opcode addition cause MK regression?
+            if inline_enabled && f19hi_inline_env && (opcode >> 11) == 0b11110 {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                // off bake: ((insn & 0x7ff) << 21) as i32 >> 9
+                let off_imm = ((((opcode & 0x7ff) as u32) << 21) as i32 >> 9) as u32;
+                let lr_const = fetch_addr.wrapping_add(off_imm);
+
+                // Cycle accounting + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // gpr[14] = lr_const.
+                let gpr_lr_off = (off.gpr + 14 * 4) as u64;
+                let gpr_lr_off_v = i32_t.const_int(gpr_lr_off, false);
+                let gpr_lr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_lr_off_v], "f19h_lr_ptr").ok()?
+                };
+                builder.build_store(gpr_lr_ptr, i32_t.const_int(lr_const as u64, false)).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f19h_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq (= 1).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f19h_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue.
+                let cont_blk = self.context.append_basic_block(block_fn, "f19h_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
