@@ -57,6 +57,17 @@ inline IR was a fps regression, default per-instr is preserved.
 AOT_INLINE_F3=1 to opt in (for correctness verification + further
 iteration).
 
+**Phase 4 step 2 done (commit afb1ebd):** inline cycle accumulation
+via `*sched_ts_ptr += K_seq_or_nonseq` in IR. aot_thumb_fetch_only
+now uses read_16_no_cycles (skip cycle charge); F3 IR adds runtime
+nfa-based cycle selection + direct ts_ptr increment.
+
+Still no measurable fps win — the inline IR ops cost roughly what
+the saved extern boundary did. The real win requires inlining ALL
+hot formats so no opcode falls through to the step trampoline extern
+(elimination of all per-iter externs is the only path to beating
+scalar). That's another 5-10 days of per-format IR emit work.
+
 **Phase 4 infrastructure complete (commits 376722b, 990bd11, 1846504):**
 - `SysBus::scheduler_timestamp_ptr() -> *mut usize` — stable raw ptr
   at scheduler.timestamp. Inline IR adds K via `*ts_ptr += K`.
