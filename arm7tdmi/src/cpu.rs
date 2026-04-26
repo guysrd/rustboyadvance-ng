@@ -956,6 +956,15 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.ldr_half(addr, access)
     }
 
+    /// Forwards to the private `ldr_sign_half` in `memory.rs`. F8 LDSH
+    /// uses this; misaligned-addr (`addr & 1 != 0`) does sign-extended
+    /// byte load instead of halfword.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_ldr_sign_half(&mut self, addr: u32, access: MemoryAccess) -> u32 {
+        self.ldr_sign_half(addr, access)
+    }
+
     /// AOT-side helper: mid-block abort check (K=2 cadence per I2).
     /// Mirrors the scalar `replay_cached_block` per-iter abort guard.
     /// Returns true if the AOT block should yield to the dispatcher.

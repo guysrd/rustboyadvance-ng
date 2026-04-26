@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpu_offsets.thumb_seq_cycles[8],
                 cpu_offsets.thumb_nonseq_cycles[8],
             );
-            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full_v6(
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full_v7(
                 &rom_bytes,
                 0x0800_0000,
                 entry_pc,
@@ -247,6 +247,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Phase-4 F9 LDRB/STRB helpers: load_8 + store_8.
                 Some(arm7tdmi_aot::replay::aot_load_8_for::<SysBus>),
                 Some(arm7tdmi_aot::replay::aot_store_8_for::<SysBus>),
+                // Phase-4 F8 LDSH helper: ldr_sign_half.
+                Some(arm7tdmi_aot::replay::aot_ldr_sign_half_for::<SysBus>),
             ))
         } else {
             Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(

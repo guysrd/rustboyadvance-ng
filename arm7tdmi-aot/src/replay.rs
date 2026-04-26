@@ -234,6 +234,26 @@ pub unsafe extern "C" fn aot_store_8_for<I: MemoryInterface>(
     cpu.bus.store_8(addr, val, access);
 }
 
+/// Phase-4 helper: signed halfword load (LDSH). Wraps cpu.aot_ldr_sign_half
+/// (= cpu.ldr_sign_half) which handles the misaligned case: if addr & 1,
+/// do a sign-extended byte load instead. Returns u32 (sign-extended).
+pub type AotLdrSignHalfFn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    access_byte: u8,
+) -> u32;
+
+pub unsafe extern "C" fn aot_ldr_sign_half_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    access_byte: u8,
+) -> u32 {
+    use arm7tdmi::memory::MemoryAccess;
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    let access = if access_byte == 1 { MemoryAccess::Seq } else { MemoryAccess::NonSeq };
+    cpu.aot_ldr_sign_half(addr, access)
+}
+
 /// Phase-8 ARM step trampoline. Mirrors `aot_thumb_step_for` but
 /// dispatches via ARM_LUT instead of THUMB_LUT and uses 32-bit fetch.
 pub unsafe extern "C" fn aot_arm_step_for<I: MemoryInterface>(

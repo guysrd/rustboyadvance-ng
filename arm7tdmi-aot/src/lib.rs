@@ -336,6 +336,39 @@ pub fn compile_rom_with_seeds_full_v6(
     load_8_fn: Option<replay::AotLoad8Fn>,
     store_8_fn: Option<replay::AotStore8Fn>,
 ) -> AotTable {
+    compile_rom_with_seeds_full_v7(
+        rom, rom_base, entry_pc, entry_mode, seeds,
+        replay_thumb_fn, step_thumb_fn, abort_thumb_fn,
+        cpu_offsets, fetch_only_thumb_fn, replay_arm_fn, bios_bytes,
+        load_32_fn, idle_cycle_fn, store_32_fn, ldr_word_fn,
+        ldr_half_fn, store_16_fn, load_8_fn, store_8_fn, None,
+    )
+}
+
+/// Phase-4 v7: also accepts ldr_sign_half trampoline for F8 LDSH.
+pub fn compile_rom_with_seeds_full_v7(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+    cpu_offsets: Option<CpuOffsets>,
+    fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
+    replay_arm_fn: Option<replay::AotReplayFn>,
+    bios_bytes: Option<&[u8]>,
+    load_32_fn: Option<replay::AotLoad32Fn>,
+    idle_cycle_fn: Option<replay::AotIdleCycleFn>,
+    store_32_fn: Option<replay::AotStore32Fn>,
+    ldr_word_fn: Option<replay::AotLdrWordFn>,
+    ldr_half_fn: Option<replay::AotLdrHalfFn>,
+    store_16_fn: Option<replay::AotStore16Fn>,
+    load_8_fn: Option<replay::AotLoad8Fn>,
+    store_8_fn: Option<replay::AotStore8Fn>,
+    ldr_sign_half_fn: Option<replay::AotLdrSignHalfFn>,
+) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
     // coverage on the SDL replay we ALSO sweep aligned halfwords as
@@ -445,6 +478,9 @@ pub fn compile_rom_with_seeds_full_v6(
     }
     if let Some(s8) = store_8_fn {
         compiler.register_store_8(s8);
+    }
+    if let Some(lsh) = ldr_sign_half_fn {
+        compiler.register_ldr_sign_half(lsh);
     }
     if let Some(arm) = replay_arm_fn {
         compiler.register_replay_arm(arm);
