@@ -39,3 +39,4 @@ ship-char-5x5	-61	501.2	560.2	395.5	397.7	0	68	0	71.0	0	1	0	accept	post-hygiene 
 phase1-fps-replan	-61	501.2	560.2	395.5	397.7	0	68	0	71.0	0	1	0	replan	formalize phase-1 fps-rejection per program-doc permanent-fail rule; findings-ladder.md captures three exit options (A: phase-4-prime IR emit, B: LLVM-free fn-ptr dispatch, C: ship corectness only)
 holding-001	-9	548.8	554.5	391.2	393.5	0	68	0	1.4	0	1	0	holding	holding firing per phase-1-rejected protocol; 3-run sw=0 medians: PE -1.0% MK -0.6%, both within +/-3% of ship-state baseline
 holding-002	-5	558.5	561.6	399.1	401.1	0	68	0	1.4	0	1	0	holding	holding firing #2; PE -0.6% MK -0.5% sw=0 within +/-3% of baseline
+holding-003	-9	556.5	563.7	399.4	401.7	0	68	0	1.4	0	1	0	holding	holding firing #3; PE -1.3% MK -0.6% sw=0 within band
