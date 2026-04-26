@@ -275,6 +275,19 @@ impl SysBus {
         )
     }
 
+    /// Phase-4 hook: read a halfword without charging cycles. The
+    /// bus.load_16 path always calls add_cycles; this lets the AOT
+    /// compiler do inline cycle accounting + this no-cycle read for
+    /// pipeline maintenance, avoiding a double-charge.
+    ///
+    /// Same dispatch semantics as `read_16` (region match), just no
+    /// cycle accumulation. Caller is responsible for charging cycles
+    /// separately if they want the fetch to be visible to the scheduler.
+    #[inline]
+    pub fn read_16_no_cycles(&mut self, addr: u32) -> u16 {
+        self.read_16(addr)
+    }
+
     #[inline(always)]
     pub fn add_cycles(&mut self, addr: Addr, access: MemoryAccess, width: MemoryAccessWidth) {
         use MemoryAccess::*;
