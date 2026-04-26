@@ -57,16 +57,32 @@ inline IR was a fps regression, default per-instr is preserved.
 AOT_INLINE_F3=1 to opt in (for correctness verification + further
 iteration).
 
-**Phase 4 infrastructure (commit 376722b):**
-- `SysBus::scheduler_timestamp_ptr() -> *mut usize` — raw pointer
-  at scheduler.timestamp, stable for bus lifetime. AOT bakes as
-  constant ptr in IR; cycle accounting becomes `*ts_ptr += K`.
-- `SysBus::thumb_fetch_cycles(page) -> (s, n)` — Seq/NonSeq cycle
-  costs per page. AOT reads at compile time, bakes as IR constants.
+**Phase 4 infrastructure complete (commits 376722b, 990bd11, 1846504):**
+- `SysBus::scheduler_timestamp_ptr() -> *mut usize` — stable raw ptr
+  at scheduler.timestamp. Inline IR adds K via `*ts_ptr += K`.
+- `SysBus::thumb_fetch_cycles(page) -> (s, n)` — Seq/NonSeq cycle costs
+  per page. Per I7 stable until WAITCNT change.
+- `Arm7tdmiCore::aot_field_offsets()` returns (pc, gpr, cpsr, nfa,
+  pipeline) byte offsets via offset_of! for the monomorphized type.
+- `CpuOffsets` struct in arm7tdmi-aot now carries all of: cpu offsets
+  (pc, gpr, cpsr, nfa, pipeline) + sched_timestamp_ptr + per-page
+  thumb_seq_cycles[16] + thumb_nonseq_cycles[16].
+- SDL frontend computes everything from the live SysBus and passes via
+  `compile_rom_with_seeds_step_offsets`.
 
-Both unused by current code. Future phase 4 work plumbs these
-through arm7tdmi-aot to enable inline cycle accounting in IR
-(eliminates the fetch_only extern boundary).
+All required ingredients for inline cycle accounting are now in place.
+Future phase-4 IR emit can:
+  *sched_ts_ptr += K_seq                (cycle accounting, no extern)
+  pipeline[0] = pipeline[1]              (pipeline shift via offset)
+  pipeline[1] = ???                      (need to load or skip)
+  store imm at gpr[Rd]                   (per-format effect)
+  pc = fetch_addr + 2
+  next_fetch_access = Seq
+
+Remaining design decision: skip per-iter memory loads (since A1 says
+no Thumb handler reads pipeline) and bake post-block pipeline values
+as constants from ROM at scan time. Add 2 const stores at
+fall-through exit. Saves the extern call entirely.
 
 **Latest measurement (2026-04-26 post dead-code cleanup):**
 - sweep=0 baseline: 0/0 divs both ROMs, score=+2 (noise).
