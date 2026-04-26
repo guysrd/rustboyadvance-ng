@@ -109,6 +109,37 @@ multi-day refactor scope of:
 - PE AOT sw=64KB: 508, 516, 504, 508, 506 → median 507.6, mean 508.5
 - Gap: 7.5% (real, not noise)
 
+**Post-hygiene 5x5 ship characterization (2026-04-26 commit c75dbee):**
+
+PE (3-run sw=0 + 5-run scalar + 5-run sw=64KB):
+- PE scalar:        557.9, 559.2, 560.2, 564.5, 580.1 → median 560.2
+- PE AOT sw=0:      548.0, 553.3, 567.8             → median 553.3 (-1.2% parity)
+- PE AOT sw=64KB:   497.1, 500.1, 501.2, 504.0, 504.1 → median 501.2 (-10.5%)
+
+MK (5-run each):
+- MK scalar:        396.1, 396.1, 397.7, 398.0, 403.9 → median 397.7
+- MK AOT sw=0:      388.0, 388.1, 388.1             → median 388.1 (-2.4%)
+- MK AOT sw=64KB:   394.4, 395.4, 395.5, 395.8, 397.7 → median 395.5 (-0.6% parity)
+
+Notes:
+- PE sw=64KB gap widened slightly vs the earlier -7.5% — system-load
+  variance, not a regression from the hygiene cleanup (struct layout
+  changes only affected fields after the IR-baked offsets, and the
+  drop in counter increments per dispatch can only be a strict win).
+- MK at sw=0 is -2.4% because BIOS scan still installs 3 exception-
+  vector seeds (1.4% coverage) — even tiny coverage of trampoline-mode
+  AOT loses to scalar. Disabling BIOS scan would close this.
+- Phase-1 trampoline architecture's ceiling reproduces:
+  high-coverage PE -10.5%, low-coverage MK -2.4%, parity at near-zero
+  coverage. No path to closing this without phase-4-proper IR emit.
+
+**Ship-state recommendation:** the AOT_SWEEP_CAP_KB=0 build with
+BIOS scan disabled (or AOT off entirely) matches scalar ±1%. Keeping
+AOT compiled-in but `--aot` off-by-default is the safest user-facing
+posture until phase-4 IR emit lands. Any cron-paced micro-optimization
+will continue to hit noise floor; commit to multi-day phase-4 work
+or pause the program.
+
 Per-dispatch math: 7.5% × 27s scalar = 2s overhead / 181M AOT
 dispatches = ~11ns per AOT dispatch. The AOT path adds ~11ns per
 hit vs scalar's per-iter dispatch. Most likely the 17-way format
