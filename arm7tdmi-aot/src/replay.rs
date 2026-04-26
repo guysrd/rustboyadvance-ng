@@ -71,19 +71,6 @@ pub unsafe extern "C" fn aot_thumb_fetch_only_for<I: MemoryInterface>(
     cpu.aot_thumb_fetch_only(fetch_addr);
 }
 
-/// Phase-4 pipeline-load extern: reads halfword via the no-cycles
-/// path (so the AOT IR can charge cycles inline without double-charge)
-/// + does the per-iter pipeline shift.
-pub unsafe extern "C" fn aot_thumb_pipeline_load_for<I: MemoryInterface>(
-    cpu_ctx: *mut u8,
-    fetch_addr: u32,
-) {
-    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
-    let val = cpu.read_16_no_cycles(fetch_addr);
-    cpu.pipeline[0] = cpu.pipeline[1];
-    cpu.pipeline[1] = val as u32;
-}
-
 /// Phase-1 mid-block abort check (K=2 cadence, called from
 /// compile_thumb_block before iters with k odd && k != 0).
 /// Returns 1 if the AOT block should yield to the dispatcher

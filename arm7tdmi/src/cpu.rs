@@ -878,14 +878,14 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         }
     }
 
-    /// Phase-4 helper: do just the per-iter fetch + cycle accounting +
-    /// pipeline shift. The block emit pairs this with inline LLVM IR
-    /// for the actual instruction effect. No dispatch, no pc update.
+    /// Phase-4 helper: do per-iter pipeline shift WITHOUT charging
+    /// cycles. The block emit's inline IR handles cycle accounting
+    /// directly via `*sched_ts_ptr += K_seq_or_nonseq`. Without this
+    /// no-cycles read, going through `load_16` would double-charge.
     #[cfg(feature = "cached_interp")]
     #[inline]
     pub fn aot_thumb_fetch_only(&mut self, fetch_addr: u32) {
-        let access = self.next_fetch_access;
-        let val = self.load_16(fetch_addr, access);
+        let val = self.read_16_no_cycles(fetch_addr);
         self.pipeline[0] = self.pipeline[1];
         self.pipeline[1] = val as u32;
     }

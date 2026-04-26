@@ -243,7 +243,37 @@ impl LlvmCompiler {
                 let rd = ((opcode >> 8) & 0x7) as u32;
                 let imm = (opcode & 0xff) as u32;
 
-                // Cycle accounting + pipeline.
+                // Phase-4 inline cycle accounting: select Seq/NonSeq cycles
+                // based on cpu.next_fetch_access at runtime, then add to
+                // *sched_ts_ptr. No extern boundary; LLVM optimizer can
+                // fold across iters.
+                let i64_t = self.context.i64_type();
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "nfa_ptr_pre").ok()?
+                };
+                let nfa = builder.build_load(i8_t, nfa_ptr, "nfa_pre").ok()?
+                    .into_int_value();
+                // is_seq = (nfa == 1)
+                let one_i8 = i8_t.const_int(1, false);
+                let is_seq = builder
+                    .build_int_compare(IntPredicate::EQ, nfa, one_i8, "is_seq").ok()?;
+                // Per-page cycle constants (baked from live SysBus per I7).
+                let page = ((fetch_addr >> 24) & 0xf) as usize;
+                let k_seq = i64_t.const_int(off.thumb_seq_cycles[page] as u64, false);
+                let k_nonseq = i64_t.const_int(off.thumb_nonseq_cycles[page] as u64, false);
+                let cycles = builder.build_select(is_seq, k_seq, k_nonseq, "cycles").ok()?
+                    .into_int_value();
+                // *ts_ptr += cycles
+                let ts_const = i64_t.const_int(off.scheduler_timestamp_ptr, false);
+                let ts_ptr = builder.build_int_to_ptr(ts_const, ptr_t, "ts_ptr").ok()?;
+                let ts_old = builder.build_load(i64_t, ts_ptr, "ts_old").ok()?
+                    .into_int_value();
+                let ts_new = builder.build_int_add(ts_old, cycles, "ts_new").ok()?;
+                builder.build_store(ts_ptr, ts_new).ok()?;
+
+                // Pipeline maintenance via no-cycles extern (fetch_only_for
+                // is now the no-cycles variant — see cpu.rs aot_thumb_fetch_only).
                 builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
 
                 // Store imm at gpr[rd] (gpr is u32 array; offset = gpr_off + rd*4).

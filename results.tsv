@@ -21,3 +21,4 @@ post-cleanup-sw64	-47	521.2	565.4	403.5	406.5	34	68	0	70.9	0	1	0	accept	post-cle
 noop-stub	-52	497.4	545.6	389.6	393.5	34	68	0	70.9	0	1	0	accept	replace Option<aot_lookup_fn> with noop-stub default; saves 1 branch per dispatch (no measurable fps change, within noise)
 phase4-infra2	-6	542.5	546.5	395.5	397.3	0	0	0	0.0	0	0	0	accept	phase 4 infra: bus.scheduler_timestamp_ptr + thumb_fetch_cycles getters; sw=0 unchanged
 phase4-infra3	-4	543.7	546.8	384.1	384.6	0	0	0	0.0	0	0	0	accept	phase 4 infra step 3: extend CpuOffsets with sched_ts_ptr + thumb cycle arrays; SDL plumbs from live bus
+phase4-inline-cycle	-6	545.4	548.8	397.6	400.2	0	0	0	0.0	0	0	0	accept	phase 4: inline cycle accumulation in F3 IR (correct, drift=-150 sw=4KB; no measurable fps gain - IR overhead matches saved extern cost)
