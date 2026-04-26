@@ -191,26 +191,49 @@ Phase-4-prime coverage: 8 sub-formats inlined, ~50-55% dynamic
 estimate. Bus extern infrastructure (load_32, idle_cycle) reusable
 for upcoming F9/F11.
 
-**Next phase-4-prime step:** F11 LDR/STR SP-relative.
-Encoding 1001_L_DDD_IIIIIIII; mask 0xf000 == 0x9000.
-  L (bit 11): 0 = STR, 1 = LDR
-  imm = (insn & 0xff) << 2 (constant)
-  addr = gpr[SP] + imm  (runtime base, constant offset)
-  LDR: gpr[Rd] = ldr_word(addr, NonSeq)  + idle_cycle (for LDR only)
-  STR: bus.store_32(addr, gpr[Rd], NonSeq)  + nfa = NonSeq
-  No flag updates.
-Need an aot_store_32 extern. F11 STR addr is gpr[SP] + imm; SP base
-is typically in IWRAM (stack region) which is RAM (not IO). Could
-inline as `iwram[(addr - 0x03000000) & 0x7FFC] = val` but the
-runtime IO-region check per I3 would be safer initially. Use bus
-extern path for now.
+**F11 STR landed (commit d814fe9):** with mixed results.
+Correctness gates pass (0 divs PE / 1 div MK historical at sw=64KB).
+But 9-format stack regresses both ROMs:
+  PE: 478 → 465  (-2.7%)
+  MK: 385 → 337  (-12.5%)
 
-After F11: F9 LDR/STR imm5-offset (similar to F11 but with byte
-loads + I14 misaligned ROR for word). Then F4 shifts (idle_cycle
-extern reusable). Then F4 MUL with debug.
+Same i-cache-pressure pattern as F4 arith: inlining adds IR per
+block, JIT'd output grows, ARM-heavy MK pays cost without benefit.
 
-8 sub-formats inlined. Target ~10-12 before per-instr crosses
-whole-block.
+**Concerning trend:** both F4 arith and F11 STR alone produced
+correctness-OK results but stack-level fps regression. The first
+6 formats stacked positively (each +1-3%). The last 3 formats
+appear to hit diminishing-then-negative returns.
+
+Hypotheses:
+1. The IR-per-block bloat threshold has been crossed; per-block
+   compile/code-size overhead now dominates per-iter savings.
+2. PE/MK have different format-frequency profiles; later formats
+   are biased toward formats that don't help PE/MK as much.
+3. The format-detection chain in the per-instr emit (sequence of
+   if-checks per opcode) is becoming long; collapsing into one
+   switch IR could reduce per-block IR.
+
+**Mitigation options:**
+- Profile-guided format selection: only emit IR for formats present
+  in THIS block (skip the unused ones to keep block IR small).
+- Per-ROM format gating: env vars already gate per format; tune
+  the optimal subset for each ROM.
+- Consolidate IR emit patterns: e.g., F4 logical and F4 arith
+  could share more code (cpsr update, gpr load/store).
+
+**Next phase-4-prime step:** TWO directions to consider:
+A. Continue stacking — try F11 LDR (needs I14 misalignment ROR,
+   more complex IR) and F9 LDR/STR imm5-offset. Risk further MK
+   regression.
+B. Apply mitigation 1 (profile-guided format selection) to bring
+   per-block IR back down. Should recover MK without removing
+   any inlining infrastructure.
+
+Recommendation: B first. Then resume stacking with smaller blocks.
+
+9 sub-formats inlined. The strategic threshold may not be reached
+through naive stacking alone.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
