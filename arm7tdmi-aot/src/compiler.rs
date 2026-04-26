@@ -182,7 +182,12 @@ impl LlvmCompiler {
         let f3_inline_env = std::env::var("AOT_INLINE_F3").map(|v| v == "1").unwrap_or(false);
         let f12_inline_env = std::env::var("AOT_INLINE_F12").map(|v| v == "1").unwrap_or(false);
         let f13_inline_env = std::env::var("AOT_INLINE_F13").map(|v| v == "1").unwrap_or(false);
-        let any_format_inline = f1_inline_env || f3_inline_env || f12_inline_env || f13_inline_env;
+        let f2_inline_env = std::env::var("AOT_INLINE_F2").map(|v| v == "1").unwrap_or(false);
+        let any_format_inline = f1_inline_env
+            || f2_inline_env
+            || f3_inline_env
+            || f12_inline_env
+            || f13_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
             && self.fetch_only_thumb_fn.is_some()
             && any_format_inline;
@@ -397,6 +402,161 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC → always AdvancePC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f1_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F2 AddSub (ADD/SUB Rd, Rs, Rn or imm3).
+            // Encoding: 00011_I_S_NNN_SSS_DDD; bits 15:11 = 0b00011.
+            //   I (bit 10): 0 = reg (NNN = Rn), 1 = imm3 (NNN = imm value)
+            //   S (bit 9):  0 = ADD, 1 = SUB
+            //   NNN (bits 8:6): Rn or imm3
+            //   SSS (bits 5:3): Rs
+            //   DDD (bits 2:0): Rd
+            //
+            // Effects (mirrors arm7tdmi/src/cpu.rs aot_thumb_step F2 path
+            // and arm7tdmi/src/alu.rs::{alu_add_flags, alu_sub_flags}):
+            //   a = gpr[Rs]; b = imm3 (constant) or gpr[Rn] (runtime).
+            //   ADD: result = a + b
+            //        carry    = unsigned overflow = (result < a)
+            //        overflow = ((result ^ a) & (result ^ b)) bit 31
+            //   SUB: result = a - b
+            //        carry    = no-borrow = (a >= b unsigned)
+            //        overflow = ((a ^ b) & (a ^ result)) bit 31
+            //   gpr[Rd] = result
+            //   cpsr: N from result bit 31, Z from result==0, C from
+            //         carry, V from overflow.  pc = fetch_addr + 2; nfa = Seq.
+            let f2_top5 = (opcode >> 11) & 0x1f;
+            if inline_enabled && f2_inline_env && f2_top5 == 0b00011 {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let imm_flag = (opcode >> 10) & 0x1 != 0;
+                let sub = (opcode >> 9) & 0x1 != 0;
+                let rn_or_imm = ((opcode >> 6) & 0x7) as u32;
+                let rs = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load a = gpr[Rs].
+                let gpr_rs_off = (off.gpr + rs * 4) as u64;
+                let gpr_rs_off_v = i32_t.const_int(gpr_rs_off, false);
+                let gpr_rs_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rs_off_v], "f2_gpr_rs_ptr").ok()?
+                };
+                let a = builder.build_load(i32_t, gpr_rs_ptr, "f2_a").ok()?
+                    .into_int_value();
+
+                // b = imm3 const | gpr[Rn] runtime.
+                let b = if imm_flag {
+                    i32_t.const_int(rn_or_imm as u64, false)
+                } else {
+                    let gpr_rn_off = (off.gpr + rn_or_imm * 4) as u64;
+                    let gpr_rn_off_v = i32_t.const_int(gpr_rn_off, false);
+                    let gpr_rn_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rn_off_v], "f2_gpr_rn_ptr").ok()?
+                    };
+                    builder.build_load(i32_t, gpr_rn_ptr, "f2_b").ok()?
+                        .into_int_value()
+                };
+
+                let (result, carry_i32, ovf_i32) = if sub {
+                    // result = a - b
+                    let result = builder.build_int_sub(a, b, "f2_sub_res").ok()?;
+                    // carry (no-borrow) = (a >= b) unsigned
+                    let carry_cmp = builder
+                        .build_int_compare(IntPredicate::UGE, a, b, "f2_sub_c_cmp")
+                        .ok()?;
+                    let carry_i32 = builder.build_int_z_extend(carry_cmp, i32_t, "f2_sub_c").ok()?;
+                    // overflow = ((a ^ b) & (a ^ result)) bit 31
+                    let ab_xor = builder.build_xor(a, b, "f2_sub_ab_xor").ok()?;
+                    let ar_xor = builder.build_xor(a, result, "f2_sub_ar_xor").ok()?;
+                    let ovf_and = builder.build_and(ab_xor, ar_xor, "f2_sub_ovf_and").ok()?;
+                    let ovf_shift = builder
+                        .build_right_shift(ovf_and, i32_t.const_int(31, false), false, "f2_sub_ovf_s")
+                        .ok()?;
+                    let ovf_i32 = builder
+                        .build_and(ovf_shift, i32_t.const_int(1, false), "f2_sub_ovf")
+                        .ok()?;
+                    (result, carry_i32, ovf_i32)
+                } else {
+                    // result = a + b
+                    let result = builder.build_int_add(a, b, "f2_add_res").ok()?;
+                    // carry = unsigned overflow = (result < a)
+                    let carry_cmp = builder
+                        .build_int_compare(IntPredicate::ULT, result, a, "f2_add_c_cmp")
+                        .ok()?;
+                    let carry_i32 = builder.build_int_z_extend(carry_cmp, i32_t, "f2_add_c").ok()?;
+                    // overflow = ((result ^ a) & (result ^ b)) bit 31
+                    let ra_xor = builder.build_xor(result, a, "f2_add_ra_xor").ok()?;
+                    let rb_xor = builder.build_xor(result, b, "f2_add_rb_xor").ok()?;
+                    let ovf_and = builder.build_and(ra_xor, rb_xor, "f2_add_ovf_and").ok()?;
+                    let ovf_shift = builder
+                        .build_right_shift(ovf_and, i32_t.const_int(31, false), false, "f2_add_ovf_s")
+                        .ok()?;
+                    let ovf_i32 = builder
+                        .build_and(ovf_shift, i32_t.const_int(1, false), "f2_add_ovf")
+                        .ok()?;
+                    (result, carry_i32, ovf_i32)
+                };
+
+                // gpr[Rd] = result.
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f2_gpr_rd_ptr").ok()?
+                };
+                builder.build_store(gpr_rd_ptr, result).ok()?;
+
+                // cpsr: clear N|Z|C|V, set from result/carry/ovf.
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f2_cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f2_cpsr_old").ok()?
+                    .into_int_value();
+                let nzcv_clear = i32_t.const_int(0x0fff_ffff, false); // clear bits 31..28
+                let cleared = builder.build_and(cpsr_old, nzcv_clear, "f2_cpsr_cl").ok()?;
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "f2_n_bit")
+                    .ok()?;
+                let z_cmp = builder
+                    .build_int_compare(IntPredicate::EQ, result, i32_t.const_int(0, false), "f2_z_cmp")
+                    .ok()?;
+                let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f2_z_ext").ok()?;
+                let z_bit = builder
+                    .build_left_shift(z_ext, i32_t.const_int(30, false), "f2_z_bit")
+                    .ok()?;
+                let c_bit = builder
+                    .build_left_shift(carry_i32, i32_t.const_int(29, false), "f2_c_bit")
+                    .ok()?;
+                let v_bit = builder
+                    .build_left_shift(ovf_i32, i32_t.const_int(28, false), "f2_v_bit")
+                    .ok()?;
+                let cpsr_n = builder.build_or(cleared, n_bit, "f2_cpsr_n").ok()?;
+                let cpsr_nz = builder.build_or(cpsr_n, z_bit, "f2_cpsr_nz").ok()?;
+                let cpsr_nzc = builder.build_or(cpsr_nz, c_bit, "f2_cpsr_nzc").ok()?;
+                let cpsr_new = builder.build_or(cpsr_nzc, v_bit, "f2_cpsr_new").ok()?;
+                builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f2_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f2_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f2_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
