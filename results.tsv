@@ -29,3 +29,4 @@ arm-table-scaffold	2	540.2	539.6	394.8	393.0	0	0	0	0.0	0	0	0	accept	phase 8 step
 arm-emit-scaffold	1	549.6	550.5	405.9	403.7	0	0	0	0.0	0	0	0	accept	phase 8 step 3: emit_placeholder_arm_block scaffolded; sw=0 unchanged
 arm-emit-integration	-3	545.3	549.7	398.1	396.4	0	0	0	0.0	0	0	0	accept	phase 8 step 4: compile_rom_with_seeds_full processes arm specs into separate arm table
 arm-dispatch-wired	4	546.5	545.3	385.0	382.4	0	0	0	0.0	0	0	0	accept	phase 8 step 5+6: arm dispatch wired (try_aot_dispatch + sdl frontend); arm sweep gated AOT_SWEEP_ARM=1; mk sw=64kb still 1.16% cov (arm blocks emitted but not hit at runtime)
+arm-counters	-4	515.6	518.3	372.9	374.2	0	0	0	0.0	0	0	0	accept	phase 8 step 7: per-mode dispatch counters revealed mk arm-miss pcs are in BIOS region (0x00000000+)

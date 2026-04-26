@@ -162,6 +162,20 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     pub aot_dispatch_hits: u64,
     #[cfg(feature = "aot_dispatch")]
     pub aot_dispatch_misses: u64,
+    /// Phase-8 per-mode coverage breakdown. Sum equals
+    /// aot_dispatch_hits.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_hits_thumb: u64,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_hits_arm: u64,
+    /// Per-mode misses (sum equals aot_dispatch_misses). Reveals
+    /// what fraction of execution is in each mode for triaging
+    /// "why isn't AOT covering this" — if mostly arm-misses, the
+    /// thumb table is irrelevant for that game.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_misses_thumb: u64,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_misses_arm: u64,
 }
 
 // BlockCache holds handler function pointers keyed by entry-PC; cloning a CPU
@@ -197,6 +211,14 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             aot_dispatch_hits: 0,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_misses: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_arm: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_arm: 0,
         }
     }
 }
@@ -230,6 +252,14 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_dispatch_hits: 0,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_misses: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_arm: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_arm: 0,
         }
     }
 
@@ -1014,13 +1044,21 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // Phase-8: select Thumb or ARM lookup based on mode. Both
         // default to the no-op stub (returns 0) so try_aot_dispatch
         // can call unconditionally without an Option discriminator.
-        let lookup = match self.cpsr.state() {
-            CpuState::THUMB => self.aot_lookup_fn,
-            CpuState::ARM => self.aot_lookup_fn_arm,
+        let is_thumb = matches!(self.cpsr.state(), CpuState::THUMB);
+        let lookup = if is_thumb {
+            self.aot_lookup_fn
+        } else {
+            self.aot_lookup_fn_arm
         };
         let fn_addr = lookup(self.aot_table, self.pc);
         if fn_addr == 0 {
             return None;
+        }
+        // Per-mode hit counter (phase-8 debugging).
+        if is_thumb {
+            self.aot_dispatch_hits_thumb = self.aot_dispatch_hits_thumb.wrapping_add(1);
+        } else {
+            self.aot_dispatch_hits_arm = self.aot_dispatch_hits_arm.wrapping_add(1);
         }
         // Cold-start guard (I15): skip AOT until scalar has fetched
         // at least one instruction. AT cold start cpu.pc=0 (BIOS reset
@@ -1083,6 +1121,14 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_dispatch_hits: 0,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_misses: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_arm: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_arm: 0,
         }
     }
 
@@ -1449,6 +1495,13 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 // Hook installed (thumb or arm), lookup missed —
                 // count as scalar dispatch.
                 self.aot_dispatch_misses = self.aot_dispatch_misses.wrapping_add(1);
+                if matches!(self.cpsr.state(), CpuState::THUMB) {
+                    self.aot_dispatch_misses_thumb =
+                        self.aot_dispatch_misses_thumb.wrapping_add(1);
+                } else {
+                    self.aot_dispatch_misses_arm =
+                        self.aot_dispatch_misses_arm.wrapping_add(1);
+                }
             }
 
             let thumb = matches!(self.cpsr.state(), CpuState::THUMB);
