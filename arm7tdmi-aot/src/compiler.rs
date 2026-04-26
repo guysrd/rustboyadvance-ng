@@ -290,6 +290,7 @@ impl LlvmCompiler {
         let f8_inline_env = std::env::var("AOT_INLINE_F8").map(|v| v == "1").unwrap_or(false);
         let f5_inline_env = std::env::var("AOT_INLINE_F5").map(|v| v == "1").unwrap_or(false);
         let f14_inline_env = std::env::var("AOT_INLINE_F14").map(|v| v == "1").unwrap_or(false);
+        let f15_inline_env = std::env::var("AOT_INLINE_F15").map(|v| v == "1").unwrap_or(false);
         let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
@@ -306,6 +307,7 @@ impl LlvmCompiler {
             || f8_inline_env
             || f5_inline_env
             || f14_inline_env
+            || f15_inline_env
             || f12_inline_env
             || f13_inline_env
             || f19hi_inline_env;
@@ -330,7 +332,7 @@ impl LlvmCompiler {
         // also need a per-iter idle cycle, charged via the bus path
         // exactly as F6 does). Per F4 MUL rejection (commit 58e054b),
         // inline `*ts_ptr += 1` is suspect — bus extern is the safe path.
-        let load_32_ref = if (f6_inline_env || f14_inline_env) && self.load_32_fn.is_some() {
+        let load_32_ref = if (f6_inline_env || f14_inline_env || f15_inline_env) && self.load_32_fn.is_some() {
             let load_32_fn = self.load_32_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let load_32_sig = i32_t.fn_type(
@@ -348,7 +350,8 @@ impl LlvmCompiler {
         // idle) all need idle_cycle.
         let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env
             || f11_ldr_inline_env || f10_inline_env || f9_inline_env
-            || f7_inline_env || f8_inline_env || f14_inline_env)
+            || f7_inline_env || f8_inline_env || f14_inline_env
+            || f15_inline_env)
             && self.idle_cycle_fn.is_some()
         {
             let idle_fn = self.idle_cycle_fn.unwrap();
@@ -362,7 +365,7 @@ impl LlvmCompiler {
         };
 
         // Phase-4 F11 STR helper: bus.store_32 extern.
-        let store_32_ref = if (f11_str_inline_env || f9_inline_env || f7_inline_env || f14_inline_env) && self.store_32_fn.is_some() {
+        let store_32_ref = if (f11_str_inline_env || f9_inline_env || f7_inline_env || f14_inline_env || f15_inline_env) && self.store_32_fn.is_some() {
             let store_32_fn = self.store_32_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let store_32_sig = self.context.void_type().fn_type(
@@ -2798,6 +2801,205 @@ impl LlvmCompiler {
                     continue;
                 }
                 // POP-with-PC: fall through to step trampoline.
+            }
+
+            // Phase-4 inline IR for F15 LDMIA/STMIA Rb!, {rlist}.
+            // Encoding: 1100_L_BBB_RRRRRRRR; mask 0xf000 == 0xc000.
+            //   L=bit 11 (1=LDM, 0=STM), B=bits 10:8 (Rb), rlist=bits 7:0.
+            //
+            // Empty rlist (rlist == 0) hits the GBATEK ARMv4 quirk —
+            // LDM-empty is a block terminator (loads PC, pipeline-flush).
+            // We don't inline the empty case at all; it falls through to
+            // the step trampoline. Since rlist is constant at AOT compile
+            // time the check is a constant.
+            //
+            // Non-empty: unroll the per-register loop in IR-emit Rust.
+            //   addr = gpr[Rb] & !3, align_preserve = gpr[Rb] & 3.
+            //   First access NonSeq, subsequent Seq.
+            //   LDM: idle_cycle after loop. Writeback (addr_after +
+            //     align_preserve) only if Rb is NOT in rlist.
+            //   STM: no idle cycle. Writeback always (addr_after +
+            //     align_preserve). For STM with Rb in rlist:
+            //       value-stored-at-Rb = if Rb is the FIRST set bit then
+            //         init_addr (masked) else init_addr + (popcount-1)*4.
+            //   nfa = NonSeq; pc = fetch_addr + 2.
+            //
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F15 path.
+            if inline_enabled
+                && f15_inline_env
+                && (opcode & 0xf000) == 0xc000
+            {
+                let load = (opcode >> 11) & 0x1 != 0;
+                let rb = ((opcode >> 8) & 0x7) as u32;
+                let rlist = (opcode & 0xff) as u8;
+                // Empty rlist: fall through to step trampoline (handles
+                // the GBATEK quirk including LDM-empty pipeline flush).
+                if rlist != 0 {
+                    let off = offsets.unwrap();
+                    let fo = fetch_only_ref.unwrap();
+
+                    // fetch_only.
+                    builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                    // Load init Rb.
+                    let rb_off = (off.gpr + rb * 4) as u64;
+                    let rb_off_v = i32_t.const_int(rb_off, false);
+                    let rb_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[rb_off_v], "f15_rb_ptr").ok()?
+                    };
+                    let init_rb = builder.build_load(i32_t, rb_ptr, "f15_init_rb").ok()?
+                        .into_int_value();
+
+                    let mask3 = i32_t.const_int(3u32 as u64, false);
+                    let neg3_mask = i32_t.const_int(!3u32 as u64, false);
+
+                    // align_preserve = init_rb & 3.
+                    let align_preserve = builder.build_and(init_rb, mask3, "f15_align_pres").ok()?;
+                    // init_addr = init_rb & !3.
+                    let init_addr = builder.build_and(init_rb, neg3_mask, "f15_init_addr").ok()?;
+
+                    let popcount: u32 = (rlist.count_ones()) as u32;
+                    let rb_in_rlist = (rlist >> rb) & 1 != 0;
+
+                    if load {
+                        // LDM. Loads in low-to-high.
+                        let l32 = load_32_ref?;
+                        let mut access_byte: u8 = 0; // first NonSeq, rest Seq
+                        let mut iter_off: u32 = 0;
+                        for r in 0..8u32 {
+                            if (rlist >> r) & 1 != 0 {
+                                let addr = if iter_off == 0 {
+                                    init_addr
+                                } else {
+                                    builder.build_int_add(
+                                        init_addr,
+                                        i32_t.const_int(iter_off as u64, false),
+                                        "f15_ldm_addr",
+                                    ).ok()?
+                                };
+                                let access_v = i8_t.const_int(access_byte as u64, false);
+                                let lcall = builder.build_call(
+                                    l32,
+                                    &[cpu_ctx.into(), addr.into(), access_v.into()],
+                                    "f15_ldm_load",
+                                ).ok()?;
+                                let val = lcall.try_as_basic_value().unwrap_basic().into_int_value();
+                                let gpr_r_off = (off.gpr + r * 4) as u64;
+                                let gpr_r_off_v = i32_t.const_int(gpr_r_off, false);
+                                let gpr_r_ptr = unsafe {
+                                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_r_off_v], "f15_ldm_r_ptr").ok()?
+                                };
+                                builder.build_store(gpr_r_ptr, val).ok()?;
+                                access_byte = 1;
+                                iter_off = iter_off.wrapping_add(4);
+                            }
+                        }
+                        // idle_cycle.
+                        let idle = idle_cycle_ref?;
+                        builder.build_call(idle, &[cpu_ctx.into()], "f15_ldm_idle").ok()?;
+                        // Writeback only if Rb is NOT in rlist.
+                        if !rb_in_rlist {
+                            // gpr[Rb] = (init_addr + popcount*4) + align_preserve.
+                            let final_addr = builder.build_int_add(
+                                init_addr,
+                                i32_t.const_int((popcount * 4) as u64, false),
+                                "f15_ldm_final_addr",
+                            ).ok()?;
+                            let new_rb = builder.build_int_add(
+                                final_addr,
+                                align_preserve,
+                                "f15_ldm_new_rb",
+                            ).ok()?;
+                            builder.build_store(rb_ptr, new_rb).ok()?;
+                        }
+                    } else {
+                        // STM. Stores in low-to-high.
+                        let s32 = store_32_ref?;
+                        let mut access_byte: u8 = 0;
+                        let mut iter_off: u32 = 0;
+                        // For STM-with-Rb-in-rlist, count = popcount - 1
+                        // (matches scalar `let count = popcount - 1`).
+                        let count: u32 = popcount.wrapping_sub(1);
+                        // Find first-set bit index in rlist (lowest bit).
+                        let first_set = rlist.trailing_zeros();
+
+                        for r in 0..8u32 {
+                            if (rlist >> r) & 1 != 0 {
+                                let addr = if iter_off == 0 {
+                                    init_addr
+                                } else {
+                                    builder.build_int_add(
+                                        init_addr,
+                                        i32_t.const_int(iter_off as u64, false),
+                                        "f15_stm_addr",
+                                    ).ok()?
+                                };
+                                // Determine value to store.
+                                let val = if r != rb {
+                                    // gpr[r].
+                                    let gpr_r_off = (off.gpr + r * 4) as u64;
+                                    let gpr_r_off_v = i32_t.const_int(gpr_r_off, false);
+                                    let gpr_r_ptr = unsafe {
+                                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_r_off_v], "f15_stm_r_ptr").ok()?
+                                    };
+                                    builder.build_load(i32_t, gpr_r_ptr, "f15_stm_val")
+                                        .ok()?.into_int_value()
+                                } else {
+                                    // r == rb. If this is the first set
+                                    // bit, store init_addr; else store
+                                    // init_addr + count*4.
+                                    if r == first_set {
+                                        init_addr
+                                    } else {
+                                        builder.build_int_add(
+                                            init_addr,
+                                            i32_t.const_int((count * 4) as u64, false),
+                                            "f15_stm_rb_addrn",
+                                        ).ok()?
+                                    }
+                                };
+                                let access_v = i8_t.const_int(access_byte as u64, false);
+                                builder.build_call(
+                                    s32,
+                                    &[cpu_ctx.into(), addr.into(), val.into(), access_v.into()],
+                                    "f15_stm_store",
+                                ).ok()?;
+                                access_byte = 1;
+                                iter_off = iter_off.wrapping_add(4);
+                            }
+                        }
+                        // STM always writes back: gpr[Rb] = init_addr + popcount*4 + align_preserve.
+                        let final_addr = builder.build_int_add(
+                            init_addr,
+                            i32_t.const_int((popcount * 4) as u64, false),
+                            "f15_stm_final_addr",
+                        ).ok()?;
+                        let new_rb = builder.build_int_add(
+                            final_addr,
+                            align_preserve,
+                            "f15_stm_new_rb",
+                        ).ok()?;
+                        builder.build_store(rb_ptr, new_rb).ok()?;
+                    }
+
+                    // pc = fetch_addr + 2; nfa = NonSeq.
+                    let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                    let pc_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f15_pc_ptr").ok()?
+                    };
+                    builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f15_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(0, false)).ok()?;
+
+                    let cont_blk = self.context.append_basic_block(block_fn, "f15_cont");
+                    builder.build_unconditional_branch(cont_blk).ok()?;
+                    builder.position_at_end(cont_blk);
+                    continue;
+                }
+                // Empty rlist: fall through to step trampoline.
             }
 
             // Phase-4 inline IR for F3 MOV imm8 (top5=00100, op=00).
