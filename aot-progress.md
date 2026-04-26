@@ -293,10 +293,30 @@ per-format issue:
 System fps drift 432 ↔ 453 between days is normal. The architectural
 ceiling is real — none of the 19 sub-formats individually tank fps.
 
-**HONEST CURRENT STATE:**
+**HONEST CURRENT STATE (commit 9ee5b32 controlled bench):**
 - Correctness: 0 PE divs / 1 MK div historical at sw=64KB. ✓
-- fps: PE -22% / MK -7% vs scalar (consistent across measurement days).
-- Stacking has plateaued. No more fps wins from inline-IR coverage.
+- fps with inline-IR (19-fmt stack): PE -22% / MK -7% vs scalar
+- **fps with WHOLE-BLOCK (no inline IR, default): PE -14% / MK -6%**
+- **Inline-IR is a NET REGRESSION vs whole-block by +11% on PE, +2% on MK**
+
+**MAJOR FINDING:** The phase-4-prime inline-IR work is structurally
+WORSE than the simpler whole-block trampoline path. ~3000 lines of
+IR-emit code across 19 sub-formats produced a SLOWER aot than just
+calling the rust-side `aot_thumb_step` per-iter via the existing
+whole-block trampoline.
+
+**Why:** The Rust step trampoline (cpu.aot_thumb_step) is already
+well-optimized by rustc — its 17 inline format fast-paths produce
+tight native code. The LLVM IR equivalent per opcode is verbose
+(more native code per opcode), and cross-opcode optimization within
+a block doesn't materialize enough to offset the bloat. i-cache
+pressure compounds linearly with inlined formats.
+
+**Strategic implication:** the whole-block trampoline IS the optimal
+architecture for Thumb. Inline-IR paths should remain DEFAULT-OFF
+(already via env vars). The phase-7 (block chaining) and phase-8
+(ARM-mode) work should mirror the whole-block pattern, NOT extend
+the inline-IR pattern.
 
 **Remaining strategic levers per docs/aot-llvm-program.md ladder:**
 1. **Phase 7 — block chaining via LLVM tail-call.** Skip dispatcher
