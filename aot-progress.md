@@ -257,10 +257,10 @@ mid-write merge conflicts. Future swarms should either:
 were CPU contention, not -O2's fault. Reverted to -O3; defer the
 test until a quiet system.
 
-**Phase-4-prime coverage now: 12 sub-formats inlined.**
-F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F6, F10, F11_STR,
-F11_LDR, F12, F13, F19_HI. ~60-70% of dynamic Thumb opcodes
-covered.
+**Phase-4-prime coverage now: 13 sub-formats inlined.**
+F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F6, F9, F10, F11_STR,
+F11_LDR, F12, F13, F19_HI. ~75-85% of dynamic Thumb opcodes
+covered (F9 alone is ~15-20%).
 
 **Drive-by fix in F10 commit (a43a355):** SDL frontend was calling
 compile_rom_with_seeds_full_v3 — missing both ldr_word_fn (v4) and
@@ -276,7 +276,7 @@ F4 shifts + F11 LDR (now real) helped MK recover from the
 F11_STR-induced regression but still well below scalar 397.
 
 Still missing: F4 MUL (broken), F5 high-reg, F7+F8 reg-offset,
-F9 imm5-offset, F14 PUSH/POP, F15 LDM/STM.
+F14 PUSH/POP, F15 LDM/STM.
 
 **Earlier 9 sub-formats inlined** (correctness, gated default-off):
 F1, F2, F3, F4_LOG, F4_ARITH, F6, F11_STR, F12, F13, F19_HI.
