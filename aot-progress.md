@@ -99,24 +99,41 @@ PE / 1 div MK at sw=64KB. fps stack now:
 Coverage now F1+F3+F12+F13 (~30% dynamic estimate). 4 formats
 inlined; ~8-12 still needed before per-instr crosses whole-block.
 
-**Next phase-4-prime step:** F2 AddSub (ADD/SUB Rd, Rs, Rn or
-imm3). Encoding 00011_I_S_NNN_SSS_DDD. 4 cases (ADD/SUB × reg/imm).
-First format that needs full arithmetic flag updates (carry/overflow
-from add/sub). carry-add: result < op1 (unsigned overflow).
-carry-sub: !borrow = op1 >= op2. Overflow: signed-overflow detection
-via sign-bit comparison. Helpers in arm7tdmi/src/alu.rs::
-{alu_add_flags, alu_sub_flags} — port their bit logic to IR.
+**F2 inline IR landed (commit 3beb88e):** F2 AddSub (ADD/SUB Rd,
+Rs, Rn or imm3) — first format with full arithmetic flag updates.
+0 divs PE / 1 div MK historical at sw=64KB. fps stack:
+  F1+F3:                458
+  F1+F3+F12:            471
+  F1+F3+F12+F13:        470
+  F1+F2+F3+F12+F13:     478  (+1.7% vs 4-format)
 
-After F2: F4 ALU ops (16 sub-ops) — most-executed Thumb format
-besides F3. Includes MUL with variable cycles via idle_cycle calls
-(might need a runtime extern call for the cycle counting; could
-stay in trampoline path initially).
+F2 is common (~10-15% dynamic) so the stack step is more visible
+than F12/F13. Phase-4-prime coverage now: 5 formats inlined,
+~40-45% dynamic estimate.
 
-Then memory ops F6/F9/F11 with IO-region runtime checks per I3
-and I14 misaligned-word ROR for word LDR.
+**Next phase-4-prime step:** F4 ALU ops (16 sub-ops). Encoding
+010000_OOOO_SSS_DDD; mask 0xfc00 == 0x4000. 16 sub-ops:
+  0=AND  1=EOR  2=LSL  3=LSR  4=ASR  5=ADC  6=SBC  7=ROR
+  8=TST  9=NEG  10=CMP 11=CMN 12=ORR 13=MUL 14=BIC 15=MVN
+Each has different flag semantics:
+  - logical (AND/EOR/TST/ORR/BIC/MVN): N+Z from result; C+V untouched.
+  - arithmetic (ADC/SBC/CMP/CMN/NEG): full N+Z+C+V via add/sub helpers.
+  - shifts by reg (LSL/LSR/ASR/ROR): N+Z from result, C from shift carry, V untouched.
+  - MUL: N+Z from result; C unspecified (preserve); V untouched.
+         Has variable cycles based on operand value (CLZ ladder).
+         Could stay in trampoline path initially OR use a runtime
+         extern call for the cycle counting.
 
-Each addition is correctness-verifiable in isolation. Stacking
-continues until per-instr beats whole-block.
+F4 is most-executed Thumb format besides F3 (~15-20% dynamic).
+Big win if all 16 sub-ops can be inlined. Worth doing in pieces:
+maybe split into multiple commits, one per sub-op group (logical,
+arith, shift, mul).
+
+After F4: memory ops F6/F9/F11 with IO-region runtime checks per
+I3 and I14 misaligned-word ROR for word LDR.
+
+Each addition is correctness-verifiable in isolation. 5 formats
+done, target ~10-12 before per-instr crosses whole-block.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
