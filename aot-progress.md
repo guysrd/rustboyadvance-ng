@@ -222,18 +222,40 @@ Hypotheses:
 - Consolidate IR emit patterns: e.g., F4 logical and F4 arith
   could share more code (cpsr update, gpr load/store).
 
-**Next phase-4-prime step:** TWO directions to consider:
-A. Continue stacking — try F11 LDR (needs I14 misalignment ROR,
-   more complex IR) and F9 LDR/STR imm5-offset. Risk further MK
-   regression.
-B. Apply mitigation 1 (profile-guided format selection) to bring
-   per-block IR back down. Should recover MK without removing
-   any inlining infrastructure.
+**Parallel agent swarm launched (2026-04-26 ~17:30):** 8 opus agents
+working in worktrees on the remaining formats:
+- F4 shifts (LSL/LSR/ASR/ROR by reg, 4 sub-ops, runtime amount)
+- F4 MUL debug (root-cause the 3 MK divs from commit 58e054b)
+- F9 LDR/STR imm5 (4 sub-cases, byte/word, runtime addr)
+- F10 LDRH/STRH imm5 (halfword)
+- F11 LDR sp-rel (needs I14 ROR via aot_ldr_word extern)
+- F7+F8 reg-offset memory ops (4+4 sub-cases)
+- F14 PUSH/POP (multi-register, AOT-time loop unroll per rlist)
+- F19_HI is already landed (commit e16f838).
 
-Recommendation: B first. Then resume stacking with smaller blocks.
+Each gets full briefing: program doc, current state, F1/F3 IR
+templates as reference, bus extern infrastructure, V1 gate criteria,
+commit style. They'll commit independently in their worktrees;
+merge back when they return.
 
-9 sub-formats inlined. The strategic threshold may not be reached
-through naive stacking alone.
+**-O2 experiment in main checkout (this turn):** changed
+`OptimizationLevel::Aggressive` → `Default` in LlvmCompiler. -O3
+aggressive inlining/unrolling within JIT'd blocks bloats native
+code; -O2 typically gives 20-30% smaller code with similar perf.
+If MK regression is i-cache-pressure-driven (hypothesis from
+9-format -12.5% MK regression), -O2 should help. Measurement
+running x3 each on 8-format and 9-format stacks at sw=64KB.
+
+**Earlier 9 sub-formats inlined** (correctness, gated default-off):
+F1, F2, F3, F4_LOG, F4_ARITH, F6, F11_STR, F12, F13, F19_HI.
+
+The strategic threshold may not be reached through naive stacking
+alone. Mitigations being explored in parallel:
+1. -O2 (this turn experiment)
+2. IR consolidation via shared helpers (factor cpsr/gpr/pc-update)
+3. LLVM intrinsics over manual bit-twiddle (fshr, uadd.with.overflow)
+4. Profile-guided format selection per ROM
+5. Pivot to LLVM-free Rust fn-ptr dispatch (Option B from findings-ladder)
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
