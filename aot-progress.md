@@ -61,14 +61,35 @@ default-off, so the revert costs no fps. Phase-4-prime work
 unblocked — F1/F4/etc. inline IR can now extend from a verified F3
 template.
 
-**Next phase-4-prime step:** retry F1 LSL/LSR/ASR imm5 inline IR
-with the fixed cycle-accounting pattern (no inline-IR cycle ops;
-let fetch_only's load_16 charge cycles via the bus). The 88
-hash-divs from the prior (uncommitted) F1 attempt were probably
-mostly caused by the same WAITCNT-stale issue — F1 IR copied the
-`ts_ptr += baked_cycles` block from F3. With that block dropped,
-retry should be much closer to correct (residual divs would be
-genuine F1 shift-carry semantic bugs to debug).
+**F1 inline IR landed (commit 9c07858):** retried F1 LSL/LSR/ASR
+imm5 inline LLVM IR after the F3 cycle-accounting fix. dropped the
+WAITCNT-stale `*ts_ptr += baked_cycles` block, let fetch_only
+charge cycles via load_16 (bus path). 0 hash-divs at sw=64KB on
+both ROMs (MK has the usual 1 historical div).
+
+Encoding 000_oo_IIIII_SSS_DDD; six (op, imm) cases enumerated to
+constant-fold per opcode. cpsr update: N from result bit 31, Z
+from (result==0), C from carry, V untouched. Gated AOT_INLINE_F1=1
+default-off.
+
+Phase-4-prime coverage so far: F1 + F3 inline IR (~20-25% dynamic
+estimate). Per-instr fps still trampoline-bound (458 vs scalar 560);
+needs more formats before per-instr matches whole-block.
+
+**Next phase-4-prime step:** F4 ALU ops (most-executed Thumb format
+after F3). Encoding 010000_OOOO_SSS_DDD with 16 sub-ops (AND, EOR,
+LSL/LSR/ASR by reg, ADC, SBC, ROR, TST, NEG, CMP, CMN, ORR, MUL,
+BIC, MVN). MUL has variable cycles via idle_cycle calls. More
+complex than F1 but covers a real slice of dynamic instructions.
+
+Alternative simpler next: F9 LDR/STR imm5-offset (memory ops, no
+flag updates, but needs IO-region runtime check per I3 and I14
+misaligned-word ROR for LDR).
+
+Go format-by-format. Each addition is correctness-verifiable in
+isolation against the F3+F1 baseline. Stack 8-12 formats and the
+trampoline boundary becomes rare enough that LLVM cross-format
+optimization can finally kick in.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
