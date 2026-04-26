@@ -457,7 +457,18 @@ mod tests {
             Err(_) => return,
         };
         let entry = scan::cart_entry_pc(&rom).expect("decode cart B");
-        let table = compile_rom(&rom, 0x0800_0000, entry, Mode::Arm);
+        // The smoke test just verifies scan + table construction
+        // doesn't panic. Pass a no-op replay fn — the table won't
+        // actually be invoked.
+        unsafe extern "C" fn noop_replay(
+            _ctx: *mut u8,
+            _ops: *const u32,
+            _len: u32,
+            _entry: u32,
+        ) -> u32 {
+            0
+        }
+        let table = compile_rom(&rom, 0x0800_0000, entry, Mode::Arm, noop_replay);
         // Phase-0 step-4a: no blocks compiled yet.
         assert_eq!(table.block_count(), 0);
     }

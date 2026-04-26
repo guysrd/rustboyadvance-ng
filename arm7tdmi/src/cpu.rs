@@ -155,23 +155,13 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     /// call it unconditionally.
     #[cfg(feature = "aot_dispatch")]
     pub aot_lookup_fn_arm: fn(*const u8, u32) -> usize,
-    /// Coverage counters for `aot_score = aot_hits / (aot_hits +
-    /// scalar_hits)` reporting at replay end. Bumped from
-    /// `step_block`'s top-of-iteration logic.
-    #[cfg(feature = "aot_dispatch")]
-    pub aot_dispatch_hits: u64,
-    #[cfg(feature = "aot_dispatch")]
-    pub aot_dispatch_misses: u64,
-    /// Phase-8 per-mode coverage breakdown. Sum equals
-    /// aot_dispatch_hits.
+    /// Per-mode coverage counters bumped from `step_block`. The
+    /// un-segmented total is just `thumb + arm` — recovered at print
+    /// time, no extra runtime add per dispatch.
     #[cfg(feature = "aot_dispatch")]
     pub aot_dispatch_hits_thumb: u64,
     #[cfg(feature = "aot_dispatch")]
     pub aot_dispatch_hits_arm: u64,
-    /// Per-mode misses (sum equals aot_dispatch_misses). Reveals
-    /// what fraction of execution is in each mode for triaging
-    /// "why isn't AOT covering this" — if mostly arm-misses, the
-    /// thumb table is irrelevant for that game.
     #[cfg(feature = "aot_dispatch")]
     pub aot_dispatch_misses_thumb: u64,
     #[cfg(feature = "aot_dispatch")]
@@ -206,11 +196,8 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn_arm: aot_lookup_noop,
-            #[cfg(feature = "aot_dispatch")]
-            aot_dispatch_hits: 0,
-            #[cfg(feature = "aot_dispatch")]
-            aot_dispatch_misses: 0,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_hits_thumb: 0,
             #[cfg(feature = "aot_dispatch")]
@@ -247,11 +234,8 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn_arm: aot_lookup_noop,
-            #[cfg(feature = "aot_dispatch")]
-            aot_dispatch_hits: 0,
-            #[cfg(feature = "aot_dispatch")]
-            aot_dispatch_misses: 0,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_hits_thumb: 0,
             #[cfg(feature = "aot_dispatch")]
@@ -1116,11 +1100,8 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn_arm: aot_lookup_noop,
-            #[cfg(feature = "aot_dispatch")]
-            aot_dispatch_hits: 0,
-            #[cfg(feature = "aot_dispatch")]
-            aot_dispatch_misses: 0,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_hits_thumb: 0,
             #[cfg(feature = "aot_dispatch")]
@@ -1464,7 +1445,8 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             // path.
             #[cfg(feature = "aot_dispatch")]
             if let Some(can_chain) = self.try_aot_dispatch() {
-                self.aot_dispatch_hits = self.aot_dispatch_hits.wrapping_add(1);
+                // try_aot_dispatch already bumps the per-mode hit
+                // counters; the un-segmented total is just the sum.
                 if !can_chain {
                     return;
                 }
@@ -1493,8 +1475,8 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 || self.aot_lookup_fn_arm as *const () != aot_lookup_noop as *const ()
             {
                 // Hook installed (thumb or arm), lookup missed —
-                // count as scalar dispatch.
-                self.aot_dispatch_misses = self.aot_dispatch_misses.wrapping_add(1);
+                // count as scalar dispatch.  Only per-mode counters now;
+                // the un-segmented total is `thumb + arm`.
                 if matches!(self.cpsr.state(), CpuState::THUMB) {
                     self.aot_dispatch_misses_thumb =
                         self.aot_dispatch_misses_thumb.wrapping_add(1);

@@ -34,3 +34,4 @@ phase8-bios-scan	4	540.6	543.7	392.2	388.7	0	68	0	1.4	0	1	0	accept	phase 8 step 
 phase8-bios-sweep-gated	-7	526.6	532.7	381.9	383.0	0	0	0	0.0	0	0	0	accept	phase 8 step 9: AOT_SWEEP_BIOS=1 covers 54% on MK but 0.9% slower than scalar; gated off pending arm fast paths
 trace-in-pe-3run	-65	476.8	542.1	0.0	0.0	0	0	0	77.4	1	0	0	reject_perf	PE trace-in 24052 (hot blocks): 12% slower than scalar — AOT trampoline can't beat scalar even at hot-only coverage; confirms only phase 4 LLVM IR can deliver fps gain
 noise-char-5run	-41	507.6	549.0	0.0	0.0	0	0	0	70.9	0	0	0	accept	5-run noise characterization: PE sw=64KB AOT vs scalar = 7.5% real gap (508 vs 549 median, low variance)
+counter-cleanup	-1	544.6	546.6	395.2	393.9	-162	0	0	0.0	0	0	0	accept	cleanup: drop redundant un-segmented aot dispatch counters (already covered by per-mode hits/misses); fix ungated aot_lookup_fn_arm initializer + stale compile_rom test signature

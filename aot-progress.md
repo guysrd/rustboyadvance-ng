@@ -6,9 +6,21 @@ Started: 2026-04-25
 ## Resume marker
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
-the trampoline at-scale divs bug). 13 Thumb formats inlined as
+the trampoline at-scale divs bug). 17 Thumb formats inlined as
 Rust-level fast paths in `aot_thumb_step`. Per-instr LLVM emit
 (AOT_USE_PER_INSTR=1) probably also works now but untested.
+
+**2026-04-26 hygiene pass:** dropped the redundant un-segmented
+`aot_dispatch_hits`/`aot_dispatch_misses` counters (each AOT hit
+was bumping two counters when the per-mode counters already split
+by mode; un-segmented total is `thumb + arm` at print time). Also
+fixed two pre-existing build-without-aot issues: the
+`aot_lookup_fn_arm` initializer was missing its `cfg` gate at three
+sites, and the `compile_rom_pokeemerald_smoke` test was calling
+`compile_rom` with the old 4-arg signature. Sweep=0 baseline still
+clean (0 divs both ROMs, score=-1 noise). No measurable fps win at
+sw=64KB (within run-to-run noise band) — this is housekeeping, not
+a perf experiment.
 
 **Trampoline cycle drift fix (2026-04-26):** scalar fires
 `cached_block_should_abort()` on every block boundary; AOT was

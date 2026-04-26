@@ -453,14 +453,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 #[cfg(feature = "aot")]
                 {
-                    let h = gba.cpu.aot_dispatch_hits;
-                    let m = gba.cpu.aot_dispatch_misses;
                     let h_thumb = gba.cpu.aot_dispatch_hits_thumb;
                     let h_arm = gba.cpu.aot_dispatch_hits_arm;
-                    let total = h + m;
-                    let pct = if total > 0 { 100.0 * h as f64 / total as f64 } else { 0.0 };
                     let m_thumb = gba.cpu.aot_dispatch_misses_thumb;
                     let m_arm = gba.cpu.aot_dispatch_misses_arm;
+                    let h = h_thumb + h_arm;
+                    let m = m_thumb + m_arm;
+                    let total = h + m;
+                    let pct = if total > 0 { 100.0 * h as f64 / total as f64 } else { 0.0 };
                     println!(
                         "aot dispatch: {} hits ({} thumb / {} arm), {} misses ({} thumb / {} arm), {:.2}% coverage",
                         h, h_thumb, h_arm, m, m_thumb, m_arm, pct
