@@ -177,11 +177,13 @@ impl LlvmCompiler {
         // Phase-4 inline IR uses the fetch-only trampoline + cpu offsets.
         // Both must be registered to enable inline IR; otherwise we fall
         // back to the per-iter step trampoline call (phase-1 behavior).
-        // Also gated on AOT_INLINE_F3=1 (read once, not per-opcode!).
+        // Per-format env-var gates: AOT_INLINE_F1=1, AOT_INLINE_F3=1, ...
+        let f1_inline_env = std::env::var("AOT_INLINE_F1").map(|v| v == "1").unwrap_or(false);
         let f3_inline_env = std::env::var("AOT_INLINE_F3").map(|v| v == "1").unwrap_or(false);
+        let any_format_inline = f1_inline_env || f3_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
             && self.fetch_only_thumb_fn.is_some()
-            && f3_inline_env;
+            && any_format_inline;
         let (fetch_only_ref, offsets) = if inline_enabled {
             let fetch_only_fn = self.fetch_only_thumb_fn.unwrap();
             let off = self.cpu_offsets.unwrap();
@@ -231,6 +233,173 @@ impl LlvmCompiler {
             let fa = i32_t.const_int(fetch_addr as u64, false);
             let insn = i32_t.const_int(opcode as u64, false);
 
+            // Phase-4 inline IR for F1 MoveShiftedReg (LSL/LSR/ASR
+            // Rd, Rs, #imm5). Encoding: 000_oo_IIIII_SSS_DDD where
+            // oo ∈ {LSL=0, LSR=1, ASR=2}; oo=0b11 is F2 AddSub.
+            // Effects (matches arm7tdmi/src/alu.rs::{lsl,lsr,asr}
+            // immediate=true):
+            //   LSL #0:  result = Rs;            carry preserved
+            //   LSL #n:  result = Rs<<n;         carry = (Rs >> (32-n)) & 1
+            //   LSR #0:  result = 0;             carry = Rs >> 31
+            //   LSR #n:  result = Rs>>n logical; carry = (Rs >> (n-1)) & 1
+            //   ASR #0:  result = ashr 31;       carry = Rs >> 31
+            //   ASR #n:  result = ashr n;        carry = (Rs >> (n-1)) & 1
+            //   gpr[Rd] = result; cpsr.N = result bit 31; cpsr.Z = result==0;
+            //   cpsr.C = carry; cpsr.V preserved.
+            //   pc = fetch_addr + 2; nfa = Seq.
+            //
+            // No inline cycle accumulation — fetch_only call charges
+            // cycles via the bus path (always reads current cycle_luts).
+            // See compiler.rs F3 IR commentary for the WAITCNT bug
+            // story that scuttled the inline cycle-accounting attempt.
+            let f1_top3 = (opcode >> 13) & 0x7;
+            let f1_op_bits = ((opcode >> 11) & 0x3) as u32;
+            if inline_enabled && f1_inline_env && f1_top3 == 0b000 && f1_op_bits != 0b11 {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let imm = ((opcode >> 6) & 0x1f) as u32;
+                let rs = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[Rs].
+                let gpr_rs_off = (off.gpr + rs * 4) as u64;
+                let gpr_rs_off_v = i32_t.const_int(gpr_rs_off, false);
+                let gpr_rs_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rs_off_v], "f1_gpr_rs_ptr").ok()?
+                };
+                let rs_val = builder.build_load(i32_t, gpr_rs_ptr, "f1_rs_val").ok()?
+                    .into_int_value();
+
+                // Load old cpsr (used for LSL #0 carry preservation +
+                // final cpsr update).
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f1_cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f1_cpsr_old").ok()?
+                    .into_int_value();
+
+                let zero_i32 = i32_t.const_int(0, false);
+                // Compute (result, carry) — all constants from the opcode.
+                let (result, carry_i32) = match (f1_op_bits, imm) {
+                    (0, 0) => {
+                        // LSL #0: result = Rs; carry = (cpsr_old >> 29) & 1.
+                        let c_shift = builder
+                            .build_right_shift(cpsr_old, i32_t.const_int(29, false), false, "f1_c_old_s")
+                            .ok()?;
+                        let c_old = builder
+                            .build_and(c_shift, i32_t.const_int(1, false), "f1_c_old")
+                            .ok()?;
+                        (rs_val, c_old)
+                    }
+                    (0, n) => {
+                        let result = builder
+                            .build_left_shift(rs_val, i32_t.const_int(n as u64, false), "f1_lsl_res")
+                            .ok()?;
+                        let c_shift = builder
+                            .build_right_shift(rs_val, i32_t.const_int((32 - n) as u64, false), false, "f1_lsl_cs")
+                            .ok()?;
+                        let carry = builder
+                            .build_and(c_shift, i32_t.const_int(1, false), "f1_lsl_c")
+                            .ok()?;
+                        (result, carry)
+                    }
+                    (1, 0) => {
+                        let carry = builder
+                            .build_right_shift(rs_val, i32_t.const_int(31, false), false, "f1_lsr32_c")
+                            .ok()?;
+                        (zero_i32, carry)
+                    }
+                    (1, n) => {
+                        let result = builder
+                            .build_right_shift(rs_val, i32_t.const_int(n as u64, false), false, "f1_lsr_res")
+                            .ok()?;
+                        let c_shift = builder
+                            .build_right_shift(rs_val, i32_t.const_int((n - 1) as u64, false), false, "f1_lsr_cs")
+                            .ok()?;
+                        let carry = builder
+                            .build_and(c_shift, i32_t.const_int(1, false), "f1_lsr_c")
+                            .ok()?;
+                        (result, carry)
+                    }
+                    (2, 0) => {
+                        let result = builder
+                            .build_right_shift(rs_val, i32_t.const_int(31, false), true, "f1_asr32_res")
+                            .ok()?;
+                        let carry = builder
+                            .build_right_shift(rs_val, i32_t.const_int(31, false), false, "f1_asr32_c")
+                            .ok()?;
+                        (result, carry)
+                    }
+                    (2, n) => {
+                        let result = builder
+                            .build_right_shift(rs_val, i32_t.const_int(n as u64, false), true, "f1_asr_res")
+                            .ok()?;
+                        let c_shift = builder
+                            .build_right_shift(rs_val, i32_t.const_int((n - 1) as u64, false), false, "f1_asr_cs")
+                            .ok()?;
+                        let carry = builder
+                            .build_and(c_shift, i32_t.const_int(1, false), "f1_asr_c")
+                            .ok()?;
+                        (result, carry)
+                    }
+                    _ => unreachable!(),
+                };
+
+                // gpr[Rd] = result.
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f1_gpr_rd_ptr").ok()?
+                };
+                builder.build_store(gpr_rd_ptr, result).ok()?;
+
+                // cpsr update: clear N|Z|C, set N from result bit 31,
+                // Z from (result==0), C from carry. V untouched.
+                let nzc_clear = i32_t.const_int(0x1fff_ffff, false);
+                let cleared = builder.build_and(cpsr_old, nzc_clear, "f1_cpsr_cl").ok()?;
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "f1_n_bit")
+                    .ok()?;
+                let z_cmp = builder
+                    .build_int_compare(IntPredicate::EQ, result, zero_i32, "f1_z_cmp")
+                    .ok()?;
+                let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f1_z_ext").ok()?;
+                let z_bit = builder
+                    .build_left_shift(z_ext, i32_t.const_int(30, false), "f1_z_bit")
+                    .ok()?;
+                let c_bit = builder
+                    .build_left_shift(carry_i32, i32_t.const_int(29, false), "f1_c_bit")
+                    .ok()?;
+                let cpsr_n = builder.build_or(cleared, n_bit, "f1_cpsr_n").ok()?;
+                let cpsr_nz = builder.build_or(cpsr_n, z_bit, "f1_cpsr_nz").ok()?;
+                let cpsr_new = builder.build_or(cpsr_nz, c_bit, "f1_cpsr_new").ok()?;
+                builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f1_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq (= 1).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f1_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC → always AdvancePC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f1_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
             // Phase-4 inline IR for F3 MOV imm8 (top5=00100, op=00).
             // Encoding: 00100_RRR_IIIIIIII. Effects:
             //   gpr[Rd] = imm8 (zero-extended)
@@ -248,7 +417,7 @@ impl LlvmCompiler {
             // correctness verification + future iteration.
             let f3_top5 = (opcode >> 11) & 0x1f;
             let f3_op = (opcode >> 11) & 0x3;
-            if inline_enabled && f3_top5 == 0b00100 && f3_op == 0 {
+            if inline_enabled && f3_inline_env && f3_top5 == 0b00100 && f3_op == 0 {
                 let off = offsets.unwrap();
                 let fo = fetch_only_ref.unwrap();
                 let rd = ((opcode >> 8) & 0x7) as u32;
