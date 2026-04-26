@@ -183,9 +183,13 @@ impl LlvmCompiler {
         let f12_inline_env = std::env::var("AOT_INLINE_F12").map(|v| v == "1").unwrap_or(false);
         let f13_inline_env = std::env::var("AOT_INLINE_F13").map(|v| v == "1").unwrap_or(false);
         let f2_inline_env = std::env::var("AOT_INLINE_F2").map(|v| v == "1").unwrap_or(false);
+        // F4: logical sub-ops only this turn (AND/EOR/TST/ORR/BIC/MVN).
+        // ADC/SBC/NEG/CMP/CMN/MUL/shifts come in later commits.
+        let f4_log_inline_env = std::env::var("AOT_INLINE_F4_LOG").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
             || f3_inline_env
+            || f4_log_inline_env
             || f12_inline_env
             || f13_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
@@ -557,6 +561,120 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f2_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F4 ALU logical sub-ops only:
+            // AND(0), EOR(1), TST(8), ORR(12), BIC(14), MVN(15).
+            // Encoding: 010000_OOOO_SSS_DDD; mask 0xfc00 == 0x4000.
+            // Effects (mirrors arm7tdmi/src/cpu.rs F4 path; logical
+            // ops use arithmetic=false so C+V are preserved):
+            //   src = gpr[Rs]; dst = gpr[Rd]
+            //   AND: result = dst & src         (writeback)
+            //   EOR: result = dst ^ src         (writeback)
+            //   TST: result = dst & src         (no writeback)
+            //   ORR: result = dst | src         (writeback)
+            //   BIC: result = dst & ~src        (writeback)
+            //   MVN: result = ~src              (writeback)
+            //   cpsr: N from result bit 31, Z from result==0, C+V preserved.
+            //   pc = fetch_addr + 2; nfa = Seq.
+            // ADC/SBC/NEG/CMP/CMN/shifts/MUL not in this commit (different
+            // flag/cycle semantics).
+            let f4_top6 = (opcode >> 10) & 0x3f;
+            let f4_op = (opcode >> 6) & 0xf;
+            let f4_logical = matches!(f4_op, 0 | 1 | 8 | 12 | 14 | 15);
+            if inline_enabled && f4_log_inline_env && f4_top6 == 0b010000 && f4_logical {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let rs = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[Rs].
+                let gpr_rs_off = (off.gpr + rs * 4) as u64;
+                let gpr_rs_off_v = i32_t.const_int(gpr_rs_off, false);
+                let gpr_rs_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rs_off_v], "f4l_rs_ptr").ok()?
+                };
+                let src = builder.build_load(i32_t, gpr_rs_ptr, "f4l_src").ok()?
+                    .into_int_value();
+
+                // gpr[Rd] ptr (load only when needed; some ops don't use dst).
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f4l_rd_ptr").ok()?
+                };
+
+                // MVN doesn't read dst; the others do.
+                let need_dst = f4_op != 15;
+                let dst_opt = if need_dst {
+                    Some(builder.build_load(i32_t, gpr_rd_ptr, "f4l_dst").ok()?
+                        .into_int_value())
+                } else {
+                    None
+                };
+
+                let result = match f4_op {
+                    0 | 8 => builder.build_and(dst_opt.unwrap(), src, "f4l_and").ok()?,
+                    1 => builder.build_xor(dst_opt.unwrap(), src, "f4l_eor").ok()?,
+                    12 => builder.build_or(dst_opt.unwrap(), src, "f4l_orr").ok()?,
+                    14 => {
+                        let not_src = builder.build_not(src, "f4l_not_src").ok()?;
+                        builder.build_and(dst_opt.unwrap(), not_src, "f4l_bic").ok()?
+                    }
+                    15 => builder.build_not(src, "f4l_mvn").ok()?,
+                    _ => unreachable!(),
+                };
+
+                // Writeback unless TST (op=8).
+                if f4_op != 8 {
+                    builder.build_store(gpr_rd_ptr, result).ok()?;
+                }
+
+                // cpsr: clear N|Z (preserve C+V), set N+Z from result.
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f4l_cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f4l_cpsr_old").ok()?
+                    .into_int_value();
+                let nz_clear = i32_t.const_int(0x3fff_ffff, false); // clear bits 31, 30
+                let cleared = builder.build_and(cpsr_old, nz_clear, "f4l_cpsr_cl").ok()?;
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "f4l_n_bit")
+                    .ok()?;
+                let z_cmp = builder
+                    .build_int_compare(IntPredicate::EQ, result, i32_t.const_int(0, false), "f4l_z_cmp")
+                    .ok()?;
+                let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f4l_z_ext").ok()?;
+                let z_bit = builder
+                    .build_left_shift(z_ext, i32_t.const_int(30, false), "f4l_z_bit")
+                    .ok()?;
+                let cpsr_n = builder.build_or(cleared, n_bit, "f4l_cpsr_n").ok()?;
+                let cpsr_new = builder.build_or(cpsr_n, z_bit, "f4l_cpsr_nz").ok()?;
+                builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f4l_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f4l_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f4l_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
