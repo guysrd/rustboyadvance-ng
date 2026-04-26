@@ -289,6 +289,7 @@ impl LlvmCompiler {
         let f7_inline_env = std::env::var("AOT_INLINE_F7").map(|v| v == "1").unwrap_or(false);
         let f8_inline_env = std::env::var("AOT_INLINE_F8").map(|v| v == "1").unwrap_or(false);
         let f5_inline_env = std::env::var("AOT_INLINE_F5").map(|v| v == "1").unwrap_or(false);
+        let f14_inline_env = std::env::var("AOT_INLINE_F14").map(|v| v == "1").unwrap_or(false);
         let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
@@ -304,6 +305,7 @@ impl LlvmCompiler {
             || f7_inline_env
             || f8_inline_env
             || f5_inline_env
+            || f14_inline_env
             || f12_inline_env
             || f13_inline_env
             || f19hi_inline_env;
@@ -328,7 +330,7 @@ impl LlvmCompiler {
         // also need a per-iter idle cycle, charged via the bus path
         // exactly as F6 does). Per F4 MUL rejection (commit 58e054b),
         // inline `*ts_ptr += 1` is suspect — bus extern is the safe path.
-        let load_32_ref = if f6_inline_env && self.load_32_fn.is_some() {
+        let load_32_ref = if (f6_inline_env || f14_inline_env) && self.load_32_fn.is_some() {
             let load_32_fn = self.load_32_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let load_32_sig = i32_t.fn_type(
@@ -346,7 +348,7 @@ impl LlvmCompiler {
         // idle) all need idle_cycle.
         let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env
             || f11_ldr_inline_env || f10_inline_env || f9_inline_env
-            || f7_inline_env || f8_inline_env)
+            || f7_inline_env || f8_inline_env || f14_inline_env)
             && self.idle_cycle_fn.is_some()
         {
             let idle_fn = self.idle_cycle_fn.unwrap();
@@ -360,7 +362,7 @@ impl LlvmCompiler {
         };
 
         // Phase-4 F11 STR helper: bus.store_32 extern.
-        let store_32_ref = if (f11_str_inline_env || f9_inline_env || f7_inline_env) && self.store_32_fn.is_some() {
+        let store_32_ref = if (f11_str_inline_env || f9_inline_env || f7_inline_env || f14_inline_env) && self.store_32_fn.is_some() {
             let store_32_fn = self.store_32_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let store_32_sig = self.context.void_type().fn_type(
@@ -2639,6 +2641,163 @@ impl LlvmCompiler {
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
+            }
+
+            // Phase-4 inline IR for F14 PUSH/POP.
+            // Encoding: 1011_L_10_R_RRRRRRRR; mask 0xf600 == 0xb400.
+            //   L=bit 11 (0=PUSH, 1=POP), R=bit 8 (PUSH→include LR, POP→include PC).
+            //   rlist=bits 7:0 (R0..R7).
+            //
+            // PUSH (any rlist): inline IR. SP -= 4*N, stores in high-to-low
+            //   register order. flag_r=1 pushes LR first (top of stack).
+            //   First store NonSeq, subsequent Seq.
+            //   nfa = NonSeq; pc = fetch_addr + 2.
+            //
+            // POP without PC (flag_r=0): inline IR. Loads in low-to-high
+            //   register order. SP += 4*popcount.
+            //   First load NonSeq, subsequent Seq. idle_cycle. nfa = NonSeq.
+            //
+            // POP with PC (flag_r=1): block terminator (pipeline flush) —
+            //   fall through to step trampoline.
+            //
+            // rlist is constant at AOT compile time, so the per-register
+            // loop is unrolled in the IR-emit Rust code.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F14 path.
+            if inline_enabled
+                && f14_inline_env
+                && (opcode & 0xf600) == 0xb400
+            {
+                let pop = (opcode >> 11) & 0x1 != 0;
+                let flag_r = (opcode >> 8) & 0x1 != 0;
+                let rlist = (opcode & 0xff) as u8;
+                // Skip POP-with-PC (block terminator).
+                if !(pop && flag_r) {
+                    let off = offsets.unwrap();
+                    let fo = fetch_only_ref.unwrap();
+
+                    // fetch_only.
+                    builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                    // Load init_sp = gpr[REG_SP=13].
+                    let sp_off = (off.gpr + 13 * 4) as u64;
+                    let sp_off_v = i32_t.const_int(sp_off, false);
+                    let sp_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[sp_off_v], "f14_sp_ptr").ok()?
+                    };
+                    let init_sp = builder.build_load(i32_t, sp_ptr, "f14_init_sp").ok()?
+                        .into_int_value();
+
+                    let neg3_mask = i32_t.const_int(!3u32 as u64, false);
+
+                    if pop {
+                        // POP without PC. Loads low-to-high.
+                        let l32 = load_32_ref?;
+                        let mut access_byte: u8 = 0; // first NonSeq, rest Seq
+                        let mut offset: u32 = 0;
+                        for r in 0..8u32 {
+                            if (rlist >> r) & 1 != 0 {
+                                let addr_unaligned = if offset == 0 {
+                                    init_sp
+                                } else {
+                                    builder.build_int_add(
+                                        init_sp,
+                                        i32_t.const_int(offset as u64, false),
+                                        "f14_pop_addr_u",
+                                    ).ok()?
+                                };
+                                let addr = builder.build_and(addr_unaligned, neg3_mask, "f14_pop_addr").ok()?;
+                                let access_v = i8_t.const_int(access_byte as u64, false);
+                                let lcall = builder.build_call(
+                                    l32,
+                                    &[cpu_ctx.into(), addr.into(), access_v.into()],
+                                    "f14_pop_load",
+                                ).ok()?;
+                                let val = lcall.try_as_basic_value().unwrap_basic().into_int_value();
+                                let gpr_r_off = (off.gpr + r * 4) as u64;
+                                let gpr_r_off_v = i32_t.const_int(gpr_r_off, false);
+                                let gpr_r_ptr = unsafe {
+                                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_r_off_v], "f14_pop_r_ptr").ok()?
+                                };
+                                builder.build_store(gpr_r_ptr, val).ok()?;
+                                access_byte = 1;
+                                offset = offset.wrapping_add(4);
+                            }
+                        }
+                        // gpr[SP] += offset.
+                        let new_sp = builder.build_int_add(init_sp, i32_t.const_int(offset as u64, false), "f14_pop_new_sp").ok()?;
+                        builder.build_store(sp_ptr, new_sp).ok()?;
+
+                        // idle_cycle.
+                        let idle = idle_cycle_ref?;
+                        builder.build_call(idle, &[cpu_ctx.into()], "f14_pop_idle").ok()?;
+                    } else {
+                        // PUSH. flag_r first (LR at top of stack), then high-to-low.
+                        let s32 = store_32_ref?;
+                        let mut access_byte: u8 = 0;
+                        let mut offset: i32 = 0;
+
+                        let do_store = |builder: &inkwell::builder::Builder<'_>,
+                                        offset: i32,
+                                        access_byte: u8,
+                                        reg_idx: u32|
+                         -> Option<()> {
+                            let addr_unaligned = builder.build_int_add(
+                                init_sp,
+                                i32_t.const_int(offset as i64 as u64, false),
+                                "f14_push_addr_u",
+                            ).ok()?;
+                            let addr = builder.build_and(addr_unaligned, neg3_mask, "f14_push_addr").ok()?;
+                            let gpr_r_off = (off.gpr + reg_idx * 4) as u64;
+                            let gpr_r_off_v = i32_t.const_int(gpr_r_off, false);
+                            let gpr_r_ptr = unsafe {
+                                builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_r_off_v], "f14_push_r_ptr").ok()?
+                            };
+                            let val = builder.build_load(i32_t, gpr_r_ptr, "f14_push_val").ok()?
+                                .into_int_value();
+                            let access_v = i8_t.const_int(access_byte as u64, false);
+                            builder.build_call(
+                                s32,
+                                &[cpu_ctx.into(), addr.into(), val.into(), access_v.into()],
+                                "f14_push_store",
+                            ).ok()?;
+                            Some(())
+                        };
+
+                        if flag_r {
+                            offset -= 4;
+                            do_store(&builder, offset, access_byte, 14)?;
+                            access_byte = 1;
+                        }
+                        for r in (0..8u32).rev() {
+                            if (rlist >> r) & 1 != 0 {
+                                offset -= 4;
+                                do_store(&builder, offset, access_byte, r)?;
+                                access_byte = 1;
+                            }
+                        }
+                        // gpr[SP] = init_sp + offset (offset is negative).
+                        let new_sp = builder.build_int_add(init_sp, i32_t.const_int(offset as i64 as u64, false), "f14_push_new_sp").ok()?;
+                        builder.build_store(sp_ptr, new_sp).ok()?;
+                    }
+
+                    // pc = fetch_addr + 2; nfa = NonSeq.
+                    let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                    let pc_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f14_pc_ptr").ok()?
+                    };
+                    builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f14_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(0, false)).ok()?;
+
+                    let cont_blk = self.context.append_basic_block(block_fn, "f14_cont");
+                    builder.build_unconditional_branch(cont_blk).ok()?;
+                    builder.position_at_end(cont_blk);
+                    continue;
+                }
+                // POP-with-PC: fall through to step trampoline.
             }
 
             // Phase-4 inline IR for F3 MOV imm8 (top5=00100, op=00).
