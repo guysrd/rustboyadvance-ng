@@ -28,6 +28,53 @@ firing's gap drifts beyond +/- 3% from the documented baseline
 (PE scalar=560, AOT sw=0=553; MK scalar=398, AOT sw=0=388), append
 a note to findings-ladder.md and ping the operator.
 
+**2026-04-26 phase-4-prime F1 attempt (rejected, reverted):** tried
+adding F1 LSL/LSR/ASR imm5 inline LLVM IR alongside the existing F3
+inline path, gated by AOT_INLINE_F1=1 + AOT_USE_PER_INSTR=1 +
+AOT_SWEEP_CAP_KB=64. Result: 88 hash-divs on PE → V1 gate fail →
+revert (uncommitted, working-copy only).
+
+**Surprising side discovery:** F3 inline IR alone (AOT_INLINE_F3=1
++ per-instr + sw=64KB) shows **12 hash-divs on PE** at current
+HEAD. This contradicts the earlier "phase 4 step 1 done (commit
+2999628): 0 divs at sweep=4KB and 64KB" claim. Hashes match for
+the first ~30 frame samples then diverge starting at frame=1860.
+
+Possible causes (untriaged):
+- Struct-layout shift from the hygiene cleanup (commit c75dbee
+  removed un-segmented counter fields). However: aot_field_offsets()
+  uses live offset_of! so it should still be correct, and the
+  changed fields are AFTER the IR-accessed ones in struct order.
+- Subtle bug in F3 IR cycle accounting that only manifests at
+  specific input shapes (we re-verified 0 divs at sw=4KB last
+  measurement; maybe sw=64KB hits a hot block with a divergent
+  pattern that wasn't there before).
+- Some other commit between 2999628 and HEAD silently broke F3
+  IR. Recent suspect: the trampoline cycle drift fix (82d4170)
+  changed inter-block abort behavior — F3 IR doesn't go through
+  that path but maybe drift accumulation differs.
+
+Whole-block trampoline (default) and per-instr trampoline (no IR)
+both show 0 divs at sw=64KB → the bug is specifically in the F3
+inline IR codegen, not in the AOT infrastructure.
+
+**Implication for phase-4-prime work:** F3 IR correctness regression
+must be triaged before extending to F1/F4/etc. The IR-emit grind
+needs a working F3 baseline as the reference template; without
+that, any new format inherits whatever bug F3 has.
+
+**Next operator action:**
+1. Bisect F3-IR correctness regression: re-run AOT_INLINE_F3=1 +
+   per-instr + sw=64KB at commit 2999628 (the original verification)
+   to confirm 0-divs claim was true at the time.
+2. If 0-divs reproduces at 2999628, bisect forward to find the
+   commit that broke F3 IR. Likely candidates: c75dbee (struct
+   layout), 82d4170 (abort fix), 6cd1c57 (lookup-fn reorder).
+3. Fix F3 IR. Then F1 IR work can resume from a verified template.
+
+Until step 3 is done, the phase-4-prime path (Option A in
+findings-ladder.md) is blocked. Holding-NNN protocol continues.
+
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
 Rust-level fast paths in `aot_thumb_step`. Per-instr LLVM emit
