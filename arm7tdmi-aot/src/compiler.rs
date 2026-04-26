@@ -10,7 +10,7 @@ use inkwell::execution_engine::JitFunction;
 
 use crate::replay::{
     AotAbortFn, AotFetchOnlyFn, AotIdleCycleFn, AotLdrHalfFn, AotLdrWordFn, AotLoad32Fn,
-    AotReplayFn, AotStepFn, AotStore16Fn, AotStore32Fn,
+    AotLoad8Fn, AotReplayFn, AotStepFn, AotStore16Fn, AotStore32Fn, AotStore8Fn,
 };
 // Phase-8 ARM trampolines (used by emit_placeholder_arm_block; the per-instr
 // arm emit + step-arm + abort-arm registration come in a future commit).
@@ -93,6 +93,9 @@ pub struct LlvmCompiler {
     /// effect; store_16 wraps store_aligned_16 (chops `addr & ~1`).
     pub(crate) ldr_half_fn: Option<AotLdrHalfFn>,
     pub(crate) store_16_fn: Option<AotStore16Fn>,
+    /// Phase-4 byte load/store trampolines for F9 LDRB/STRB.
+    pub(crate) load_8_fn: Option<AotLoad8Fn>,
+    pub(crate) store_8_fn: Option<AotStore8Fn>,
 }
 
 impl LlvmCompiler {
@@ -122,6 +125,8 @@ impl LlvmCompiler {
             ldr_word_fn: None,
             ldr_half_fn: None,
             store_16_fn: None,
+            load_8_fn: None,
+            store_8_fn: None,
         })
     }
 
@@ -171,6 +176,15 @@ impl LlvmCompiler {
 
     pub fn register_store_16(&mut self, f: AotStore16Fn) {
         self.store_16_fn = Some(f);
+    }
+
+    /// Phase-4 hooks: F9 LDRB/STRB byte externs.
+    pub fn register_load_8(&mut self, f: AotLoad8Fn) {
+        self.load_8_fn = Some(f);
+    }
+
+    pub fn register_store_8(&mut self, f: AotStore8Fn) {
+        self.store_8_fn = Some(f);
     }
 
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
@@ -264,6 +278,7 @@ impl LlvmCompiler {
         let f11_str_inline_env = std::env::var("AOT_INLINE_F11_STR").map(|v| v == "1").unwrap_or(false);
         let f11_ldr_inline_env = std::env::var("AOT_INLINE_F11_LDR").map(|v| v == "1").unwrap_or(false);
         let f10_inline_env = std::env::var("AOT_INLINE_F10").map(|v| v == "1").unwrap_or(false);
+        let f9_inline_env = std::env::var("AOT_INLINE_F9").map(|v| v == "1").unwrap_or(false);
         let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
@@ -275,6 +290,7 @@ impl LlvmCompiler {
             || f11_str_inline_env
             || f11_ldr_inline_env
             || f10_inline_env
+            || f9_inline_env
             || f12_inline_env
             || f13_inline_env
             || f19hi_inline_env;
@@ -316,7 +332,7 @@ impl LlvmCompiler {
         // F6 + F4_SHIFT + F11 LDR + F10 (LDRH variant has 1I post-load
         // idle) all need idle_cycle.
         let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env
-            || f11_ldr_inline_env || f10_inline_env)
+            || f11_ldr_inline_env || f10_inline_env || f9_inline_env)
             && self.idle_cycle_fn.is_some()
         {
             let idle_fn = self.idle_cycle_fn.unwrap();
@@ -330,7 +346,7 @@ impl LlvmCompiler {
         };
 
         // Phase-4 F11 STR helper: bus.store_32 extern.
-        let store_32_ref = if f11_str_inline_env && self.store_32_fn.is_some() {
+        let store_32_ref = if (f11_str_inline_env || f9_inline_env) && self.store_32_fn.is_some() {
             let store_32_fn = self.store_32_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let store_32_sig = self.context.void_type().fn_type(
@@ -349,7 +365,7 @@ impl LlvmCompiler {
         // load_32 (cpu_ctx, addr, access_byte) -> u32 — but the wrapper
         // routes through `cpu.aot_ldr_word` which does I14 misaligned-
         // LDR ROR + cpsr.C side effect when `addr & 3 != 0`.
-        let ldr_word_ref = if f11_ldr_inline_env && self.ldr_word_fn.is_some() {
+        let ldr_word_ref = if (f11_ldr_inline_env || f9_inline_env) && self.ldr_word_fn.is_some() {
             let ldr_word_fn = self.ldr_word_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let ldr_word_sig = i32_t.fn_type(
@@ -391,6 +407,36 @@ impl LlvmCompiler {
             let s16_ref = module.add_function(&store_16_name, store_16_sig, None);
             self.engine.add_global_mapping(&s16_ref, store_16_fn as usize);
             Some(s16_ref)
+        } else {
+            None
+        };
+
+        // Phase-4 F9 helpers: load_8 + store_8 externs (LDRB/STRB).
+        let load_8_ref = if f9_inline_env && self.load_8_fn.is_some() {
+            let load_8_fn = self.load_8_fn.unwrap();
+            let i8_t_local = self.context.i8_type();
+            let load_8_sig = i8_t_local.fn_type(
+                &[ptr_t.into(), i32_t.into(), i8_t_local.into()],
+                false,
+            );
+            let load_8_name = format!("rba_aot_load_8_{}", id);
+            let l8_ref = module.add_function(&load_8_name, load_8_sig, None);
+            self.engine.add_global_mapping(&l8_ref, load_8_fn as usize);
+            Some(l8_ref)
+        } else {
+            None
+        };
+        let store_8_ref = if f9_inline_env && self.store_8_fn.is_some() {
+            let store_8_fn = self.store_8_fn.unwrap();
+            let i8_t_local = self.context.i8_type();
+            let store_8_sig = self.context.void_type().fn_type(
+                &[ptr_t.into(), i32_t.into(), i8_t_local.into(), i8_t_local.into()],
+                false,
+            );
+            let store_8_name = format!("rba_aot_store_8_{}", id);
+            let s8_ref = module.add_function(&store_8_name, store_8_sig, None);
+            self.engine.add_global_mapping(&s8_ref, store_8_fn as usize);
+            Some(s8_ref)
         } else {
             None
         };
@@ -1772,6 +1818,135 @@ impl LlvmCompiler {
 
                 // Continue.
                 let cont_blk = self.context.append_basic_block(block_fn, "f10_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F9 LDR/STR imm5-offset (byte/word).
+            // Encoding: 011_BL_IIIII_BBB_DDD; mask 0xe000 == 0x6000.
+            //   B=bit 12 (1 → byte), L=bit 11 (1 → load).
+            //   word ops: offset = imm5 << 2.
+            //   byte ops: offset = imm5.
+            //   addr = gpr[Rb] + offset (runtime base, constant offset).
+            //   LDR  word: gpr[Rd] = ldr_word(addr, NonSeq) (I14 ROR + cpsr.C);
+            //              idle_cycle; nfa = Seq.
+            //   LDRB byte: gpr[Rd] = load_8(addr, NonSeq) zero-extended;
+            //              idle_cycle; nfa = Seq.
+            //   STR  word: store_32(addr & ~3, gpr[Rd], NonSeq); nfa = NonSeq.
+            //   STRB byte: store_8(addr, gpr[Rd] as u8, NonSeq); nfa = NonSeq.
+            //   pc = fetch_addr + 2; no flag updates (LDR may set cpsr.C
+            //   internally on misaligned).
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F9 path.
+            if inline_enabled
+                && f9_inline_env
+                && (opcode & 0xe000) == 0x6000
+            {
+                let byte_op = (opcode >> 12) & 0x1 != 0;
+                let load = (opcode >> 11) & 0x1 != 0;
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let imm5 = ((opcode >> 6) & 0x1f) as u32;
+                let rb = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+                let offset_const = if byte_op { imm5 } else { imm5 << 2 };
+
+                // Cycle accounting + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[Rb] (base).
+                let gpr_rb_off = (off.gpr + rb * 4) as u64;
+                let gpr_rb_off_v = i32_t.const_int(gpr_rb_off, false);
+                let gpr_rb_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rb_off_v], "f9_rb_ptr").ok()?
+                };
+                let base = builder.build_load(i32_t, gpr_rb_ptr, "f9_base").ok()?
+                    .into_int_value();
+
+                // addr = base + offset_const.
+                let addr = builder
+                    .build_int_add(base, i32_t.const_int(offset_const as u64, false), "f9_addr")
+                    .ok()?;
+
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f9_rd_ptr").ok()?
+                };
+
+                if load {
+                    let idle = idle_cycle_ref?;
+                    let access_v = i8_t.const_int(0, false);
+                    let data_i32 = if byte_op {
+                        let l8 = load_8_ref?;
+                        let lcall = builder.build_call(
+                            l8,
+                            &[cpu_ctx.into(), addr.into(), access_v.into()],
+                            "f9_loadb",
+                        ).ok()?;
+                        let data_i8 = lcall.try_as_basic_value().unwrap_basic().into_int_value();
+                        // Zero-extend to i32.
+                        builder.build_int_z_extend(data_i8, i32_t, "f9_zext").ok()?
+                    } else {
+                        let lw = ldr_word_ref?;
+                        let lcall = builder.build_call(
+                            lw,
+                            &[cpu_ctx.into(), addr.into(), access_v.into()],
+                            "f9_loadw",
+                        ).ok()?;
+                        lcall.try_as_basic_value().unwrap_basic().into_int_value()
+                    };
+
+                    // bus.idle_cycle().
+                    builder.build_call(idle, &[cpu_ctx.into()], "f9_idle").ok()?;
+
+                    // gpr[Rd] = data.
+                    builder.build_store(gpr_rd_ptr, data_i32).ok()?;
+
+                    // nfa = Seq (= 1).
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f9_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+                } else {
+                    let val_i32 = builder.build_load(i32_t, gpr_rd_ptr, "f9_val").ok()?
+                        .into_int_value();
+                    let access_v = i8_t.const_int(0, false);
+                    if byte_op {
+                        let s8 = store_8_ref?;
+                        let val_i8 = builder.build_int_truncate(val_i32, i8_t, "f9_val8").ok()?;
+                        builder.build_call(
+                            s8,
+                            &[cpu_ctx.into(), addr.into(), val_i8.into(), access_v.into()],
+                            "f9_storeb",
+                        ).ok()?;
+                    } else {
+                        let s32 = store_32_ref?;
+                        builder.build_call(
+                            s32,
+                            &[cpu_ctx.into(), addr.into(), val_i32.into(), access_v.into()],
+                            "f9_storew",
+                        ).ok()?;
+                    }
+
+                    // nfa = NonSeq (= 0).
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f9_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(0, false)).ok()?;
+                }
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f9_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // Continue.
+                let cont_blk = self.context.append_basic_block(block_fn, "f9_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;

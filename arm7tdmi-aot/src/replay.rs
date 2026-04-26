@@ -196,6 +196,44 @@ pub unsafe extern "C" fn aot_store_16_for<I: MemoryInterface>(
     cpu.bus.store_16(addr & !0x1, val, access);
 }
 
+/// Phase-4 helpers: bus-side byte load/store with cycle accounting.
+/// Used by F9 LDRB/STRB inline IR. No alignment concerns (byte ops).
+pub type AotLoad8Fn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    access_byte: u8,
+) -> u8;
+
+pub unsafe extern "C" fn aot_load_8_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    access_byte: u8,
+) -> u8 {
+    use arm7tdmi::memory::MemoryAccess;
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    let access = if access_byte == 1 { MemoryAccess::Seq } else { MemoryAccess::NonSeq };
+    cpu.bus.load_8(addr, access)
+}
+
+pub type AotStore8Fn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    val: u8,
+    access_byte: u8,
+);
+
+pub unsafe extern "C" fn aot_store_8_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    val: u8,
+    access_byte: u8,
+) {
+    use arm7tdmi::memory::MemoryAccess;
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    let access = if access_byte == 1 { MemoryAccess::Seq } else { MemoryAccess::NonSeq };
+    cpu.bus.store_8(addr, val, access);
+}
+
 /// Phase-8 ARM step trampoline. Mirrors `aot_thumb_step_for` but
 /// dispatches via ARM_LUT instead of THUMB_LUT and uses 32-bit fetch.
 pub unsafe extern "C" fn aot_arm_step_for<I: MemoryInterface>(
