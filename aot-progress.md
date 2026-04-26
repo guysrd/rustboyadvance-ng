@@ -173,21 +173,43 @@ bit-by-bit; cpsr update matches. Mystery — reverted per V1 gate.
   both are i32 wrapping mul, should be identical.
 - Try multiplying-result-first then cycle-charge order inversion.
 
-**Next phase-4-prime step:** skip F4 MUL for now. Try memory ops:
-**F6 LDR pc-rel** (simplest memory op). Encoding 01001_DDD_IIIIIIII.
-Address = (exec_addr & ~3) + 4 + (imm8 << 2) — entirely constant at
-AOT time. Address is always in ROM (PC-rel literal pool). Two paths:
-1. Bake the loaded value as constant (read ROM bytes at AOT-scan
-   time, store i32 const in IR). Skip cycle accounting — wait,
-   need cycles for accuracy.
-2. Use a runtime extern that calls bus.load_32 + cycle accounting.
-   Lose constant-folding but get correct cycles.
+**F6 inline IR landed (commit 43a4508):** F6 LDR pc-rel via bus.load_32
++ idle_cycle externs (always-current cycle accounting). Constant
+addr at AOT time. nfa = NonSeq (different from most formats).
+0 divs PE / 1 div MK historical at sw=64KB.
 
-Path 2 is cleaner for now. Next steps after F6: F9 LDR/STR imm5
-(needs IO-region runtime check), F11 LDR/STR SP-rel (similar to
-F9 but SP base).
+fps stack at sw=64KB:
+  6-format PE: ~472    7-format PE: 480  8-format PE: 479 (tied)
+  6-format MK: ~384    7-format MK: 369  8-format MK: 385 (+4.3%)
 
-7 sub-formats inlined. Target ~10-12 before per-instr crosses
+The MK regression from F4 arith was recovered by F6 inlining (LDR
+pc-rel for literal-pool constants is hot, including in MK ARM-Thumb
+interop blocks). Net result: 8-format ≈ 7-format for PE, MK back to
+historical baseline.
+
+Phase-4-prime coverage: 8 sub-formats inlined, ~50-55% dynamic
+estimate. Bus extern infrastructure (load_32, idle_cycle) reusable
+for upcoming F9/F11.
+
+**Next phase-4-prime step:** F11 LDR/STR SP-relative.
+Encoding 1001_L_DDD_IIIIIIII; mask 0xf000 == 0x9000.
+  L (bit 11): 0 = STR, 1 = LDR
+  imm = (insn & 0xff) << 2 (constant)
+  addr = gpr[SP] + imm  (runtime base, constant offset)
+  LDR: gpr[Rd] = ldr_word(addr, NonSeq)  + idle_cycle (for LDR only)
+  STR: bus.store_32(addr, gpr[Rd], NonSeq)  + nfa = NonSeq
+  No flag updates.
+Need an aot_store_32 extern. F11 STR addr is gpr[SP] + imm; SP base
+is typically in IWRAM (stack region) which is RAM (not IO). Could
+inline as `iwram[(addr - 0x03000000) & 0x7FFC] = val` but the
+runtime IO-region check per I3 would be safer initially. Use bus
+extern path for now.
+
+After F11: F9 LDR/STR imm5-offset (similar to F11 but with byte
+loads + I14 misaligned ROR for word). Then F4 shifts (idle_cycle
+extern reusable). Then F4 MUL with debug.
+
+8 sub-formats inlined. Target ~10-12 before per-instr crosses
 whole-block.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
