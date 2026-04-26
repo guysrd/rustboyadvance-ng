@@ -184,21 +184,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(false);
         let table = if use_per_instr {
             eprintln!("--aot: phase-1 per-instruction dispatch (AOT_USE_PER_INSTR=1)");
-            // Phase-4 cpu state offsets for inline IR. arm7tdmi exposes
-            // them via Arm7tdmiCore::aot_field_offsets to keep the
-            // `next_fetch_access` field's pub(crate) visibility intact.
+            // Phase-4 cpu state offsets + bus pointers for inline IR.
+            // arm7tdmi exposes cpu offsets via Arm7tdmiCore::aot_field_offsets
+            // to keep `next_fetch_access`'s pub(crate) visibility intact.
+            // SysBus exposes scheduler_timestamp_ptr + thumb_fetch_cycles
+            // for inline cycle accumulation.
             use arm7tdmi::Arm7tdmiCore;
             let (pc_off, gpr_off, cpsr_off, nfa_off) =
                 Arm7tdmiCore::<SysBus>::aot_field_offsets();
+            let sched_ts_ptr = gba.cpu.bus.scheduler_timestamp_ptr() as u64;
+            let mut thumb_seq = [1u32; 16];
+            let mut thumb_nonseq = [1u32; 16];
+            for page in 0..16 {
+                let (s, n) = gba.cpu.bus.thumb_fetch_cycles(page);
+                thumb_seq[page] = s as u32;
+                thumb_nonseq[page] = n as u32;
+            }
             let cpu_offsets = arm7tdmi_aot::CpuOffsets {
                 pc: pc_off as u32,
                 gpr: gpr_off as u32,
                 cpsr: cpsr_off as u32,
                 next_fetch_access: nfa_off as u32,
+                scheduler_timestamp_ptr: sched_ts_ptr,
+                thumb_seq_cycles: thumb_seq,
+                thumb_nonseq_cycles: thumb_nonseq,
             };
             eprintln!(
-                "--aot: phase-4 cpu offsets pc={} gpr={} cpsr={} nfa={}",
-                cpu_offsets.pc, cpu_offsets.gpr, cpu_offsets.cpsr, cpu_offsets.next_fetch_access,
+                "--aot: phase-4 cpu offsets pc={} gpr={} cpsr={} nfa={} sched_ts={:#x} rom_seq8={} rom_nonseq8={}",
+                cpu_offsets.pc, cpu_offsets.gpr, cpu_offsets.cpsr,
+                cpu_offsets.next_fetch_access,
+                cpu_offsets.scheduler_timestamp_ptr,
+                cpu_offsets.thumb_seq_cycles[8],
+                cpu_offsets.thumb_nonseq_cycles[8],
             );
             Box::new(arm7tdmi_aot::compile_rom_with_seeds_step_offsets(
                 &rom_bytes,

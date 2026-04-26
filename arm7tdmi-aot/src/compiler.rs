@@ -11,20 +11,33 @@ use inkwell::execution_engine::JitFunction;
 use crate::replay::{AotAbortFn, AotFetchOnlyFn, AotReplayFn, AotStepFn};
 use crate::table::CompiledFn;
 
-/// Per-I cpu state field offsets baked into the compiled LLVM IR
-/// (per I8/I13 — single-pointer cpu_ctx ABI). The phase-4 inline-IR
-/// emit fns use these to GEP into the cpu_ctx without going through
-/// the trampoline. SDL frontend computes these via offset_of! and
-/// passes via `LlvmCompiler::register_cpu_offsets`.
+/// Per-I cpu state field offsets + bus pointers baked into the
+/// compiled LLVM IR (per I8/I13 — single-pointer cpu_ctx ABI).
+/// The phase-4 inline-IR emit fns use these to GEP into the cpu_ctx
+/// without going through the trampoline, and to do direct cycle
+/// accumulation via the scheduler timestamp pointer.
 ///
-/// All offsets are byte offsets within the `Arm7tdmiCore<I>` struct.
-/// `gpr_offset` points at gpr[0]; gpr[N] is at gpr_offset + N*4.
+/// SDL frontend computes via offset_of! / `bus.scheduler_timestamp_ptr` /
+/// `bus.thumb_fetch_cycles(page)` and passes via
+/// `LlvmCompiler::register_cpu_offsets`.
+///
+/// All cpu offsets are byte offsets within the `Arm7tdmiCore<I>`
+/// struct. `gpr` points at gpr[0]; gpr[N] is at gpr + N*4.
 #[derive(Clone, Copy, Debug)]
 pub struct CpuOffsets {
     pub pc: u32,
     pub gpr: u32,
     pub cpsr: u32,
     pub next_fetch_access: u32,
+    /// Raw ptr at scheduler.timestamp (usize). Stable for the bus's
+    /// lifetime. Inline IR adds K cycles via `*sched_ts_ptr += K`.
+    pub scheduler_timestamp_ptr: u64,
+    /// Per-page Thumb16 fetch cycle costs. Index by page =
+    /// (addr >> 24) & 0xf. Used to emit inline cycle-add constants
+    /// in IR. Per I7 these are stable until WAITCNT changes (which
+    /// triggers AOT recompile).
+    pub thumb_seq_cycles: [u32; 16],
+    pub thumb_nonseq_cycles: [u32; 16],
 }
 
 /// Compiler handle. The `Context` is leaked to `'static` so the
