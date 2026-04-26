@@ -9,6 +9,8 @@ use inkwell::execution_engine::ExecutionEngine;
 use inkwell::execution_engine::JitFunction;
 
 use crate::replay::{AotAbortFn, AotFetchOnlyFn, AotReplayFn, AotStepFn};
+// Phase-8 ARM trampolines (used by emit_placeholder_arm_block; the per-instr
+// arm emit + step-arm + abort-arm registration come in a future commit).
 use crate::table::CompiledFn;
 
 /// Per-I cpu state field offsets + bus pointers baked into the
@@ -58,6 +60,9 @@ pub struct LlvmCompiler {
     pub(crate) step_thumb_fn: Option<AotStepFn>,
     /// Phase-1 mid-block abort check for K=2 cadence.
     pub(crate) abort_thumb_fn: Option<AotAbortFn>,
+    /// Phase-8: ARM whole-block replay trampoline. Set via
+    /// register_replay_arm. None until enabled.
+    pub(crate) replay_arm_fn: Option<AotReplayFn>,
     /// Phase-4 cpu state offsets for inline IR emit. None until
     /// register_cpu_offsets is called; emit fns fall through to
     /// the trampoline call when offsets are missing.
@@ -85,6 +90,7 @@ impl LlvmCompiler {
             replay_thumb_fn: None,
             step_thumb_fn: None,
             abort_thumb_fn: None,
+            replay_arm_fn: None,
             cpu_offsets: None,
             fetch_only_thumb_fn: None,
         })
@@ -107,6 +113,11 @@ impl LlvmCompiler {
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
     pub fn register_replay_thumb(&mut self, f: AotReplayFn) {
         self.replay_thumb_fn = Some(f);
+    }
+
+    /// Phase-8: register ARM whole-block trampoline (per-I monomorphized).
+    pub fn register_replay_arm(&mut self, f: AotReplayFn) {
+        self.replay_arm_fn = Some(f);
     }
 
     /// Register the phase-1 per-instruction trampoline + abort check.
@@ -433,6 +444,72 @@ impl LlvmCompiler {
         builder.build_return(Some(&ret)).ok()?;
 
         // Add module + look up the JITed fn pointer.
+        self.engine.add_module(&module).ok()?;
+        let raw = self.engine.get_function_address(&block_name).ok()?;
+        Some(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
+    }
+
+    /// Phase-8 ARM placeholder block emit. Mirrors
+    /// `emit_placeholder_thumb_block` but calls the ARM whole-block
+    /// trampoline. The trampoline does the per-iter ARM step dispatch
+    /// (32-bit fetch, ARM_LUT cond check + handler).
+    ///
+    /// `opcodes_ptr` points to the ARM opcode arena (32-bit u32s).
+    /// Each opcode is one full ARM instruction word.
+    pub fn emit_placeholder_arm_block(
+        &mut self,
+        opcodes_ptr: *const u32,
+        opcodes_len: u32,
+        entry_pc: u32,
+    ) -> Option<CompiledFn> {
+        use inkwell::AddressSpace;
+
+        let replay_fn = self.replay_arm_fn?;
+
+        let module = self.context.create_module("aot_arm_blk");
+        let i32_t = self.context.i32_type();
+        let i64_t = self.context.i64_type();
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+
+        let trampoline_sig = i32_t.fn_type(
+            &[ptr_t.into(), ptr_t.into(), i32_t.into(), i32_t.into()],
+            false,
+        );
+        let trampoline_ref =
+            module.add_function("rba_aot_replay_arm", trampoline_sig, None);
+        self.engine
+            .add_global_mapping(&trampoline_ref, replay_fn as usize);
+
+        let block_sig = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.next_id += 1;
+        let block_name = format!("aot_arm_blk_{}", self.next_id);
+        let block_fn = module.add_function(&block_name, block_sig, None);
+        let entry = self.context.append_basic_block(block_fn, "entry");
+        let builder = self.context.create_builder();
+        builder.position_at_end(entry);
+
+        let cpu_ctx = block_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+        let opcodes_ptr_const = i64_t.const_int(opcodes_ptr as u64, false);
+        let opcodes_ptr_v = builder
+            .build_int_to_ptr(opcodes_ptr_const, ptr_t, "opc_ptr").ok()?;
+        let len_v = i32_t.const_int(opcodes_len as u64, false);
+        let entry_pc_v = i32_t.const_int(entry_pc as u64, false);
+
+        let call = builder
+            .build_call(
+                trampoline_ref,
+                &[
+                    cpu_ctx.into(),
+                    opcodes_ptr_v.into(),
+                    len_v.into(),
+                    entry_pc_v.into(),
+                ],
+                "ret",
+            ).ok()?;
+        let ret = call.try_as_basic_value().unwrap_basic().into_int_value();
+        builder.build_return(Some(&ret)).ok()?;
+
         self.engine.add_module(&module).ok()?;
         let raw = self.engine.get_function_address(&block_name).ok()?;
         Some(unsafe { std::mem::transmute::<usize, CompiledFn>(raw) })
