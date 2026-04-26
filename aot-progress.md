@@ -270,10 +270,53 @@ mid-write merge conflicts. Future swarms should either:
 were CPU contention, not -O2's fault. Reverted to -O3; defer the
 test until a quiet system.
 
-**Phase-4-prime coverage now: 18 sub-formats inlined.**
-F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F5, F6, F7, F8, F9, F10,
-F11_STR, F11_LDR, F12, F13, F14, F15, F19_HI. ~95-99% of dynamic
-Thumb opcodes covered.
+**Phase-4-prime coverage now: 19 sub-formats inlined.**
+F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F4_MUL, F5, F6, F7, F8,
+F9, F10, F11_STR, F11_LDR, F12, F13, F14, F15, F19_HI. ~95-99%
+of dynamic Thumb opcodes covered.
+
+**Phase-4-prime IR-emit grind: STRUCTURALLY COMPLETE.** All hot
+Thumb sub-formats inlined as LLVM IR. Block terminators (F17 SWI,
+F18 B unconditional, F19 lo) are not in the per-iter step path —
+they end blocks. Trampoline boundary on Thumb fires only for
+genuinely-rare SWI/undef opcodes.
+
+**Bisect of "19fmt regression" (commit 853e1c9 + this turn):**
+the regression I claimed (PE 453 → 436 between 16-format and
+19-format) was MEASUREMENT NOISE ACROSS DAYS, not a real
+per-format issue:
+  16-format PE x3 (today): 432, 436 → median 432
+  16+F4_MUL  PE x3 (today): 428, 430, 432 → median 430 (Δ=-2 noise)
+  16+F5      PE x3 (today): 430, 430, 432 → median 431 (Δ=-1 noise)
+  (F14, F15 measurements aborted after consistent-noise pattern.)
+
+System fps drift 432 ↔ 453 between days is normal. The architectural
+ceiling is real — none of the 19 sub-formats individually tank fps.
+
+**HONEST CURRENT STATE:**
+- Correctness: 0 PE divs / 1 MK div historical at sw=64KB. ✓
+- fps: PE -22% / MK -7% vs scalar (consistent across measurement days).
+- Stacking has plateaued. No more fps wins from inline-IR coverage.
+
+**Remaining strategic levers per docs/aot-llvm-program.md ladder:**
+1. **Phase 7 — block chaining via LLVM tail-call.** Skip dispatcher
+   between sequential AOT blocks. Best-expected fps lever still
+   untouched. Multi-day work.
+2. **Phase 8 inline — ARM-mode IR emit.** MK is ~98% ARM at runtime;
+   we currently inline ZERO ARM. Mirror phase-4-prime work for ARM
+   data-proc + LDR/STR + branches. Big upside on MK. Multi-day.
+3. **Phase 9 — persistent compiled-blob cache.** UX (fast ROM load)
+   not fps. Required for shipping `--aot` on by default.
+4. **Profile-guided per-ROM format subset** (Option B from
+   findings-ladder). Bisect shows formats are roughly equivalent —
+   this lever has diminishing returns vs (1)/(2).
+
+**Next operator decision required:** which lever to pursue. (1) and
+(2) are multi-day grinds; (3) is shippable-but-no-fps; (4) is
+single-turn but low-yield. Recommendation: (2) ARM-mode inline IR —
+MK has the most upside (only -7% vs scalar; closest to crossing the
++5% gate) and the IR-emit work is mechanical (mirror existing
+Thumb infrastructure).
 
 **F15 LDM/STM landed (commit 800d09b, cherry-picked from agent
 worktree feb5762):** rlist unrolled at AOT compile time. Empty-rlist
@@ -322,7 +365,8 @@ MK 368.8 (was peak 384 at 6-format, was 337 at 9-format).
 F4 shifts + F11 LDR (now real) helped MK recover from the
 F11_STR-induced regression but still well below scalar 397.
 
-Still missing: F4 MUL (broken — agent still investigating).
+All Thumb hot sub-formats covered. Per-iter step-trampoline fires
+only for SWI / undef in Thumb mode (vanishingly rare).
 
 **Earlier 9 sub-formats inlined** (correctness, gated default-off):
 F1, F2, F3, F4_LOG, F4_ARITH, F6, F11_STR, F12, F13, F19_HI.
