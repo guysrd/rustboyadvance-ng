@@ -279,6 +279,7 @@ impl LlvmCompiler {
         let f11_ldr_inline_env = std::env::var("AOT_INLINE_F11_LDR").map(|v| v == "1").unwrap_or(false);
         let f10_inline_env = std::env::var("AOT_INLINE_F10").map(|v| v == "1").unwrap_or(false);
         let f9_inline_env = std::env::var("AOT_INLINE_F9").map(|v| v == "1").unwrap_or(false);
+        let f7_inline_env = std::env::var("AOT_INLINE_F7").map(|v| v == "1").unwrap_or(false);
         let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
@@ -291,6 +292,7 @@ impl LlvmCompiler {
             || f11_ldr_inline_env
             || f10_inline_env
             || f9_inline_env
+            || f7_inline_env
             || f12_inline_env
             || f13_inline_env
             || f19hi_inline_env;
@@ -332,7 +334,7 @@ impl LlvmCompiler {
         // F6 + F4_SHIFT + F11 LDR + F10 (LDRH variant has 1I post-load
         // idle) all need idle_cycle.
         let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env
-            || f11_ldr_inline_env || f10_inline_env || f9_inline_env)
+            || f11_ldr_inline_env || f10_inline_env || f9_inline_env || f7_inline_env)
             && self.idle_cycle_fn.is_some()
         {
             let idle_fn = self.idle_cycle_fn.unwrap();
@@ -346,7 +348,7 @@ impl LlvmCompiler {
         };
 
         // Phase-4 F11 STR helper: bus.store_32 extern.
-        let store_32_ref = if (f11_str_inline_env || f9_inline_env) && self.store_32_fn.is_some() {
+        let store_32_ref = if (f11_str_inline_env || f9_inline_env || f7_inline_env) && self.store_32_fn.is_some() {
             let store_32_fn = self.store_32_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let store_32_sig = self.context.void_type().fn_type(
@@ -365,7 +367,7 @@ impl LlvmCompiler {
         // load_32 (cpu_ctx, addr, access_byte) -> u32 — but the wrapper
         // routes through `cpu.aot_ldr_word` which does I14 misaligned-
         // LDR ROR + cpsr.C side effect when `addr & 3 != 0`.
-        let ldr_word_ref = if (f11_ldr_inline_env || f9_inline_env) && self.ldr_word_fn.is_some() {
+        let ldr_word_ref = if (f11_ldr_inline_env || f9_inline_env || f7_inline_env) && self.ldr_word_fn.is_some() {
             let ldr_word_fn = self.ldr_word_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let ldr_word_sig = i32_t.fn_type(
@@ -412,7 +414,7 @@ impl LlvmCompiler {
         };
 
         // Phase-4 F9 helpers: load_8 + store_8 externs (LDRB/STRB).
-        let load_8_ref = if f9_inline_env && self.load_8_fn.is_some() {
+        let load_8_ref = if (f9_inline_env || f7_inline_env) && self.load_8_fn.is_some() {
             let load_8_fn = self.load_8_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let load_8_sig = i8_t_local.fn_type(
@@ -426,7 +428,7 @@ impl LlvmCompiler {
         } else {
             None
         };
-        let store_8_ref = if f9_inline_env && self.store_8_fn.is_some() {
+        let store_8_ref = if (f9_inline_env || f7_inline_env) && self.store_8_fn.is_some() {
             let store_8_fn = self.store_8_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let store_8_sig = self.context.void_type().fn_type(
@@ -1947,6 +1949,125 @@ impl LlvmCompiler {
 
                 // Continue.
                 let cont_blk = self.context.append_basic_block(block_fn, "f9_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F7 LDR/STR reg-offset (byte/word).
+            // Encoding: 0101_LB_0_RRR_BBB_DDD; mask 0xf200 == 0x5000.
+            //   L=bit 11 (load/store), B=bit 10 (byte/word).
+            //   Ro=bits 8:6 (reg offset), Rb=bits 5:3, Rd=bits 2:0.
+            //   addr = gpr[Rb] + gpr[Ro]  (both runtime).
+            //   Same memory-op pattern as F9 but with runtime offset
+            //   instead of constant imm5-derived offset.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F7 path.
+            if inline_enabled
+                && f7_inline_env
+                && (opcode & 0xf200) == 0x5000
+            {
+                let load = (opcode >> 11) & 0x1 != 0;
+                let byte_op = (opcode >> 10) & 0x1 != 0;
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let ro = ((opcode >> 6) & 0x7) as u32;
+                let rb = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[Rb] (base) and gpr[Ro] (offset).
+                let gpr_rb_off = (off.gpr + rb * 4) as u64;
+                let gpr_rb_off_v = i32_t.const_int(gpr_rb_off, false);
+                let gpr_rb_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rb_off_v], "f7_rb_ptr").ok()?
+                };
+                let base = builder.build_load(i32_t, gpr_rb_ptr, "f7_base").ok()?
+                    .into_int_value();
+
+                let gpr_ro_off = (off.gpr + ro * 4) as u64;
+                let gpr_ro_off_v = i32_t.const_int(gpr_ro_off, false);
+                let gpr_ro_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_ro_off_v], "f7_ro_ptr").ok()?
+                };
+                let offset_v = builder.build_load(i32_t, gpr_ro_ptr, "f7_off").ok()?
+                    .into_int_value();
+
+                // addr = base + offset.
+                let addr = builder.build_int_add(base, offset_v, "f7_addr").ok()?;
+
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f7_rd_ptr").ok()?
+                };
+
+                if load {
+                    let idle = idle_cycle_ref?;
+                    let access_v = i8_t.const_int(0, false);
+                    let data_i32 = if byte_op {
+                        let l8 = load_8_ref?;
+                        let lcall = builder.build_call(
+                            l8,
+                            &[cpu_ctx.into(), addr.into(), access_v.into()],
+                            "f7_loadb",
+                        ).ok()?;
+                        let data_i8 = lcall.try_as_basic_value().unwrap_basic().into_int_value();
+                        builder.build_int_z_extend(data_i8, i32_t, "f7_zext").ok()?
+                    } else {
+                        let lw = ldr_word_ref?;
+                        let lcall = builder.build_call(
+                            lw,
+                            &[cpu_ctx.into(), addr.into(), access_v.into()],
+                            "f7_loadw",
+                        ).ok()?;
+                        lcall.try_as_basic_value().unwrap_basic().into_int_value()
+                    };
+
+                    builder.build_call(idle, &[cpu_ctx.into()], "f7_idle").ok()?;
+                    builder.build_store(gpr_rd_ptr, data_i32).ok()?;
+
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f7_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+                } else {
+                    let val_i32 = builder.build_load(i32_t, gpr_rd_ptr, "f7_val").ok()?
+                        .into_int_value();
+                    let access_v = i8_t.const_int(0, false);
+                    if byte_op {
+                        let s8 = store_8_ref?;
+                        let val_i8 = builder.build_int_truncate(val_i32, i8_t, "f7_val8").ok()?;
+                        builder.build_call(
+                            s8,
+                            &[cpu_ctx.into(), addr.into(), val_i8.into(), access_v.into()],
+                            "f7_storeb",
+                        ).ok()?;
+                    } else {
+                        let s32 = store_32_ref?;
+                        builder.build_call(
+                            s32,
+                            &[cpu_ctx.into(), addr.into(), val_i32.into(), access_v.into()],
+                            "f7_storew",
+                        ).ok()?;
+                    }
+
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f7_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(0, false)).ok()?;
+                }
+
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f7_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                let cont_blk = self.context.append_basic_block(block_fn, "f7_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
