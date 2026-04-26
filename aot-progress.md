@@ -152,19 +152,42 @@ to consider once enough formats land:
    don't bloat output.
 3. Disable F4_ARITH for MK profile (env-var-gated already).
 
-**Next phase-4-prime step:** F4 shift-by-register (LSL/LSR/ASR/ROR
-sub-ops 2/3/4/7). Each does shift_by_register + idle_cycle(1).
-The idle_cycle is a bus.scheduler.update(1) call — needs either
-an idle-cycle extern OR an inline +1 to scheduler timestamp ptr
-(but the latter has the same WAITCNT-stale risk if scheduler
-timing depends on cycle_luts; idle is just +1 unrelated to LUTs
-so it's safe).
+**F4 MUL attempt rejected (commit 58e054b):** tried F4 MUL inline IR
+with inline cycle accumulation `*sched_ts_ptr += mul_cycles_count`.
+Reasoning: mul_cycles is operand-derived (not WAITCNT-derived) so
+inline cycle add should be safe. Result: 0 divs PE but **4 MK divs**
+(3 extra vs historical 1) reproducible across 3 runs at sw=64KB.
+End-cycle drift only -128 cycles, but 4 specific frames mismatch
+(2040, 3420, 4080, 5460). mul_cycles formula matches scalar
+bit-by-bit; cpsr update matches. Mystery — reverted per V1 gate.
 
-After F4 shifts: F4 MUL (variable cycles via CLZ ladder — likely
-extern call for cycle counting). Then memory ops F6/F9/F11 with
-IO-region runtime checks per I3 and I14 misaligned-word ROR.
+**Debug ideas for next operator:**
+- Add a per-frame instrumentation: dump cpu state pre/post each
+  MK MUL invocation, compare scalar vs F4_MUL-IR, find first
+  divergent gpr/cpsr.
+- Check if `*ts_ptr += m` 64-bit store has alignment issues — try
+  writing to ts_ptr as i32 (low 32 bits of usize timestamp; high
+  32 bits should never roll over within a replay).
+- Maybe MK exercises an MUL operand sequence where scalar's
+  `dst.wrapping_mul(src)` differs from LLVM's `mul i32` — but
+  both are i32 wrapping mul, should be identical.
+- Try multiplying-result-first then cycle-charge order inversion.
 
-7 sub-formats done. Target ~10-12 before per-instr crosses
+**Next phase-4-prime step:** skip F4 MUL for now. Try memory ops:
+**F6 LDR pc-rel** (simplest memory op). Encoding 01001_DDD_IIIIIIII.
+Address = (exec_addr & ~3) + 4 + (imm8 << 2) — entirely constant at
+AOT time. Address is always in ROM (PC-rel literal pool). Two paths:
+1. Bake the loaded value as constant (read ROM bytes at AOT-scan
+   time, store i32 const in IR). Skip cycle accounting — wait,
+   need cycles for accuracy.
+2. Use a runtime extern that calls bus.load_32 + cycle accounting.
+   Lose constant-folding but get correct cycles.
+
+Path 2 is cleaner for now. Next steps after F6: F9 LDR/STR imm5
+(needs IO-region runtime check), F11 LDR/STR SP-rel (similar to
+F9 but SP base).
+
+7 sub-formats inlined. Target ~10-12 before per-instr crosses
 whole-block.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
