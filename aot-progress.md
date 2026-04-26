@@ -76,20 +76,32 @@ Phase-4-prime coverage so far: F1 + F3 inline IR (~20-25% dynamic
 estimate). Per-instr fps still trampoline-bound (458 vs scalar 560);
 needs more formats before per-instr matches whole-block.
 
-**Next phase-4-prime step:** F4 ALU ops (most-executed Thumb format
-after F3). Encoding 010000_OOOO_SSS_DDD with 16 sub-ops (AND, EOR,
-LSL/LSR/ASR by reg, ADC, SBC, ROR, TST, NEG, CMP, CMN, ORR, MUL,
-BIC, MVN). MUL has variable cycles via idle_cycle calls. More
-complex than F1 but covers a real slice of dynamic instructions.
+**F12 inline IR landed (commit 741c624):** F12 LoadAddress
+(ADD Rd, [PC|SP], #imm8). PC-rel case bakes the entire address as
+a constant; SP-rel case loads gpr[SP] at runtime + baked imm.
+No flag updates, no PipelineFlushed. 0 divs PE / 1 div MK
+(historical) at sw=64KB. fps stack:
+  F1+F3:      458 fps PE per-instr
+  F1+F3+F12:  471 fps PE per-instr (+3%)
 
-Alternative simpler next: F9 LDR/STR imm5-offset (memory ops, no
-flag updates, but needs IO-region runtime check per I3 and I14
-misaligned-word ROR for LDR).
+Phase-4-prime coverage: F1 + F3 + F12 inline IR (~25-30% dynamic
+estimate). Per-instr fps still trampoline-bound vs scalar 560 but
+the gradient is right — each inlined format peels another slice
+of dispatch off the extern boundary.
+
+**Next phase-4-prime step:** F13 AddSp (ADD/SUB SP, #imm7<<2).
+Encoding 10110000_S_IIIIIII; mask 0xff00 == 0xb000.  Even simpler
+than F12: only 2 cases (ADD/SUB), one source register (SP=gpr[13]),
+no flag updates.  Should be ~30 lines of IR.
+
+After F13: F2 AddSub (ADD/SUB Rd, Rs, Rn or imm3) with full
+arithmetic flag updates (carry/overflow). Then F4 ALU ops (16
+sub-ops) for max coverage. Then memory ops (F6, F9, F11) which
+need IO-region runtime checks per I3.
 
 Go format-by-format. Each addition is correctness-verifiable in
-isolation against the F3+F1 baseline. Stack 8-12 formats and the
-trampoline boundary becomes rare enough that LLVM cross-format
-optimization can finally kick in.
+isolation. Stack 8-12 formats and the trampoline boundary becomes
+rare enough that LLVM cross-format optimization can finally kick in.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
