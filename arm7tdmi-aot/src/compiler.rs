@@ -181,7 +181,8 @@ impl LlvmCompiler {
         let f1_inline_env = std::env::var("AOT_INLINE_F1").map(|v| v == "1").unwrap_or(false);
         let f3_inline_env = std::env::var("AOT_INLINE_F3").map(|v| v == "1").unwrap_or(false);
         let f12_inline_env = std::env::var("AOT_INLINE_F12").map(|v| v == "1").unwrap_or(false);
-        let any_format_inline = f1_inline_env || f3_inline_env || f12_inline_env;
+        let f13_inline_env = std::env::var("AOT_INLINE_F13").map(|v| v == "1").unwrap_or(false);
+        let any_format_inline = f1_inline_env || f3_inline_env || f12_inline_env || f13_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
             && self.fetch_only_thumb_fn.is_some()
             && any_format_inline;
@@ -463,6 +464,60 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC → always AdvancePC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f12_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F13 AddSp (ADD/SUB SP, #imm7<<2).
+            // Encoding: 10110000_S_IIIIIII; mask 0xff00 == 0xb000.
+            //   S (bit 7): 0 = ADD, 1 = SUB.
+            //   offset = (insn & 0x7f) << 2 (constant at AOT time).
+            //   gpr[SP] = sp +/- offset (wrapping).
+            //   no flag updates; pc = fetch_addr + 2; nfa = Seq.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F13 path.
+            if inline_enabled && f13_inline_env && (opcode & 0xff00) == 0xb000 {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let sub = (opcode >> 7) & 0x1 != 0;
+                let offset = ((opcode & 0x7f) as u32) << 2;
+
+                // Cycle accounting + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[SP] (REG_SP = 13).
+                let sp_off = (off.gpr + 13 * 4) as u64;
+                let sp_off_v = i32_t.const_int(sp_off, false);
+                let sp_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[sp_off_v], "f13_sp_ptr").ok()?
+                };
+                let sp_val = builder.build_load(i32_t, sp_ptr, "f13_sp_val").ok()?
+                    .into_int_value();
+
+                let off_const = i32_t.const_int(offset as u64, false);
+                let new_sp = if sub {
+                    builder.build_int_sub(sp_val, off_const, "f13_sp_sub").ok()?
+                } else {
+                    builder.build_int_add(sp_val, off_const, "f13_sp_add").ok()?
+                };
+                builder.build_store(sp_ptr, new_sp).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f13_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq (= 1).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f13_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue.
+                let cont_blk = self.context.append_basic_block(block_fn, "f13_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
