@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpu_offsets.thumb_seq_cycles[8],
                 cpu_offsets.thumb_nonseq_cycles[8],
             );
-            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full_v2(
                 &rom_bytes,
                 0x0800_0000,
                 entry_pc,
@@ -234,6 +234,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // BIOS / cart entry / scan-from-thumb-BX traversal.
                 Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
                 Some(&bios_bin),
+                // Phase-4 F6 helpers: bus.load_32 + idle_cycle externs.
+                Some(arm7tdmi_aot::replay::aot_load_32_for::<SysBus>),
+                Some(arm7tdmi_aot::replay::aot_idle_cycle_for::<SysBus>),
             ))
         } else {
             Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(

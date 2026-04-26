@@ -8,7 +8,9 @@ use inkwell::execution_engine::ExecutionEngine;
 #[cfg(test)]
 use inkwell::execution_engine::JitFunction;
 
-use crate::replay::{AotAbortFn, AotFetchOnlyFn, AotReplayFn, AotStepFn};
+use crate::replay::{
+    AotAbortFn, AotFetchOnlyFn, AotIdleCycleFn, AotLoad32Fn, AotReplayFn, AotStepFn,
+};
 // Phase-8 ARM trampolines (used by emit_placeholder_arm_block; the per-instr
 // arm emit + step-arm + abort-arm registration come in a future commit).
 use crate::table::CompiledFn;
@@ -70,6 +72,12 @@ pub struct LlvmCompiler {
     /// Phase-4 fetch-only trampoline. Pairs with inline IR for the
     /// instruction's effect. Set via register_fetch_only.
     pub(crate) fetch_only_thumb_fn: Option<AotFetchOnlyFn>,
+    /// Phase-4 bus.load_32 trampoline (per I3). F6/F9/F11 inline IR
+    /// uses this to do the actual word load with cycle accounting.
+    pub(crate) load_32_fn: Option<AotLoad32Fn>,
+    /// Phase-4 idle-cycle trampoline. F6 uses this for its 1S+1N+1I
+    /// cycle accounting. Future F4 shifts/MUL paths will reuse.
+    pub(crate) idle_cycle_fn: Option<AotIdleCycleFn>,
 }
 
 impl LlvmCompiler {
@@ -93,6 +101,8 @@ impl LlvmCompiler {
             replay_arm_fn: None,
             cpu_offsets: None,
             fetch_only_thumb_fn: None,
+            load_32_fn: None,
+            idle_cycle_fn: None,
         })
     }
 
@@ -108,6 +118,19 @@ impl LlvmCompiler {
     /// alongside `register_cpu_offsets` for inline IR emit to fire.
     pub fn register_fetch_only_thumb(&mut self, f: AotFetchOnlyFn) {
         self.fetch_only_thumb_fn = Some(f);
+    }
+
+    /// Phase-4 hook: register the bus-side load_32 trampoline. F6 LDR
+    /// pc-rel inline IR calls this to do the actual word load with
+    /// per-I cycle accounting via the bus path (always reads current
+    /// cycle_luts; survives WAITCNT writes).
+    pub fn register_load_32(&mut self, f: AotLoad32Fn) {
+        self.load_32_fn = Some(f);
+    }
+
+    /// Phase-4 hook: register the bus-side idle-cycle trampoline.
+    pub fn register_idle_cycle(&mut self, f: AotIdleCycleFn) {
+        self.idle_cycle_fn = Some(f);
     }
 
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
@@ -188,11 +211,13 @@ impl LlvmCompiler {
         // trampoline path (separate cycle semantics).
         let f4_log_inline_env = std::env::var("AOT_INLINE_F4_LOG").map(|v| v == "1").unwrap_or(false);
         let f4_arith_inline_env = std::env::var("AOT_INLINE_F4_ARITH").map(|v| v == "1").unwrap_or(false);
+        let f6_inline_env = std::env::var("AOT_INLINE_F6").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
             || f3_inline_env
             || f4_log_inline_env
             || f4_arith_inline_env
+            || f6_inline_env
             || f12_inline_env
             || f13_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
@@ -207,6 +232,31 @@ impl LlvmCompiler {
             let fo_ref = module.add_function(&fo_name, fo_sig, None);
             self.engine.add_global_mapping(&fo_ref, fetch_only_fn as usize);
             (Some(fo_ref), Some(off))
+        } else {
+            (None, None)
+        };
+
+        // Phase-4 F6 helpers: bus.load_32 + idle_cycle externs.
+        // Registered when both fns are present AND F6 inline is enabled.
+        let (load_32_ref, idle_cycle_ref) = if f6_inline_env
+            && self.load_32_fn.is_some()
+            && self.idle_cycle_fn.is_some()
+        {
+            let load_32_fn = self.load_32_fn.unwrap();
+            let idle_fn = self.idle_cycle_fn.unwrap();
+            let i8_t_local = self.context.i8_type();
+            let load_32_sig = i32_t.fn_type(
+                &[ptr_t.into(), i32_t.into(), i8_t_local.into()],
+                false,
+            );
+            let load_32_name = format!("rba_aot_load_32_{}", id);
+            let l32_ref = module.add_function(&load_32_name, load_32_sig, None);
+            self.engine.add_global_mapping(&l32_ref, load_32_fn as usize);
+            let idle_sig = self.context.void_type().fn_type(&[ptr_t.into()], false);
+            let idle_name = format!("rba_aot_idle_{}", id);
+            let idle_ref = module.add_function(&idle_name, idle_sig, None);
+            self.engine.add_global_mapping(&idle_ref, idle_fn as usize);
+            (Some(l32_ref), Some(idle_ref))
         } else {
             (None, None)
         };
@@ -873,6 +923,76 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f4a_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F6 LDR PC-relative (literal pool).
+            // Encoding: 01001_DDD_IIIIIIII; mask 0xf800 == 0x4800.
+            //   imm = (insn & 0xff) << 2  (constant, word-scaled)
+            //   addr = (fetch_addr & ~3) + imm
+            //          (cpu.pc at handler entry = fetch_addr; (pc & ~3) is
+            //           always 4-aligned, so addr is always 4-aligned —
+            //           never triggers the I14 misaligned-LDR ROR path)
+            //   gpr[Rd] = bus.load_32(addr, NonSeq)
+            //   bus.idle_cycle()    (1S+1N+1I per execution)
+            //   pc = fetch_addr + 2; nfa = NonSeq (= 0)  ← different from
+            //   most formats which set nfa = Seq.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F6 path.
+            if inline_enabled
+                && f6_inline_env
+                && load_32_ref.is_some()
+                && idle_cycle_ref.is_some()
+                && (opcode & 0xf800) == 0x4800
+            {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let l32 = load_32_ref.unwrap();
+                let idle = idle_cycle_ref.unwrap();
+                let rd = ((opcode >> 8) & 0x7) as u32;
+                let imm = ((opcode & 0xff) as u32) << 2;
+                // addr is constant at AOT compile time.
+                let addr_const = (fetch_addr & !0b11).wrapping_add(imm);
+
+                // Cycle accounting (fetch) + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // val = bus.load_32(addr_const, NonSeq).  access byte = 0.
+                let addr_v = i32_t.const_int(addr_const as u64, false);
+                let access_v = i8_t.const_int(0, false);
+                let lcall = builder
+                    .build_call(l32, &[cpu_ctx.into(), addr_v.into(), access_v.into()], "f6_load")
+                    .ok()?;
+                let val = lcall.try_as_basic_value().unwrap_basic().into_int_value();
+
+                // bus.idle_cycle().
+                builder.build_call(idle, &[cpu_ctx.into()], "f6_idle").ok()?;
+
+                // gpr[Rd] = val.
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f6_gpr_rd_ptr").ok()?
+                };
+                builder.build_store(gpr_rd_ptr, val).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f6_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = NonSeq (= 0).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f6_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(0, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f6_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;

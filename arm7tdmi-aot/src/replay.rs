@@ -71,6 +71,43 @@ pub unsafe extern "C" fn aot_thumb_fetch_only_for<I: MemoryInterface>(
     cpu.aot_thumb_fetch_only(fetch_addr);
 }
 
+/// Phase-4 helper: bus-side aligned word load with cycle accounting.
+/// Used by F6 LDR pc-rel inline IR (and future F9/F11 paths).
+/// `addr` MUST be 4-byte aligned (caller guarantees per F6 semantics
+/// — see arm7tdmi/src/cpu.rs aot_thumb_step F6 path: addr =
+/// (fetch_addr & !3) + (imm8 << 2), always word-aligned).
+/// `access_byte`: 0 = NonSeq, 1 = Seq (matches MemoryAccess repr).
+pub type AotLoad32Fn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    access_byte: u8,
+) -> u32;
+
+pub unsafe extern "C" fn aot_load_32_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    addr: u32,
+    access_byte: u8,
+) -> u32 {
+    use arm7tdmi::memory::MemoryAccess;
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    let access = if access_byte == 1 { MemoryAccess::Seq } else { MemoryAccess::NonSeq };
+    cpu.bus.load_32(addr, access)
+}
+
+/// Phase-4 helper: charge one idle cycle (`bus.idle_cycle()`).
+/// Used by F6 (and future shift-by-reg / MUL paths) to avoid the
+/// inline `*ts_ptr += 1` pattern that the F4 MUL attempt suspected
+/// of LLVM-codegen issues (3 reproducible MK divs at sw=64KB).
+/// Bus path is always correct.
+pub type AotIdleCycleFn = unsafe extern "C" fn(cpu_ctx: *mut u8);
+
+pub unsafe extern "C" fn aot_idle_cycle_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+) {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    cpu.bus.idle_cycle();
+}
+
 /// Phase-8 ARM step trampoline. Mirrors `aot_thumb_step_for` but
 /// dispatches via ARM_LUT instead of THUMB_LUT and uses 32-bit fetch.
 pub unsafe extern "C" fn aot_arm_step_for<I: MemoryInterface>(

@@ -187,6 +187,34 @@ pub fn compile_rom_with_seeds_full(
     replay_arm_fn: Option<replay::AotReplayFn>,
     bios_bytes: Option<&[u8]>,
 ) -> AotTable {
+    compile_rom_with_seeds_full_v2(
+        rom, rom_base, entry_pc, entry_mode, seeds,
+        replay_thumb_fn, step_thumb_fn, abort_thumb_fn,
+        cpu_offsets, fetch_only_thumb_fn, replay_arm_fn, bios_bytes,
+        None, None,
+    )
+}
+
+/// Phase-4 variant that also accepts bus.load_32 + bus.idle_cycle
+/// trampolines. F6/F9/F11 inline IR uses these for memory ops with
+/// cycle accounting (always reads current cycle_luts; survives
+/// WAITCNT writes).
+pub fn compile_rom_with_seeds_full_v2(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+    cpu_offsets: Option<CpuOffsets>,
+    fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
+    replay_arm_fn: Option<replay::AotReplayFn>,
+    bios_bytes: Option<&[u8]>,
+    load_32_fn: Option<replay::AotLoad32Fn>,
+    idle_cycle_fn: Option<replay::AotIdleCycleFn>,
+) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
     // coverage on the SDL replay we ALSO sweep aligned halfwords as
@@ -272,6 +300,12 @@ pub fn compile_rom_with_seeds_full(
     }
     if let Some(fo) = fetch_only_thumb_fn {
         compiler.register_fetch_only_thumb(fo);
+    }
+    if let Some(l32) = load_32_fn {
+        compiler.register_load_32(l32);
+    }
+    if let Some(idle) = idle_cycle_fn {
+        compiler.register_idle_cycle(idle);
     }
     if let Some(arm) = replay_arm_fn {
         compiler.register_replay_arm(arm);
