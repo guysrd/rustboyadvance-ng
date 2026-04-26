@@ -252,6 +252,29 @@ impl SysBus {
         self.scheduler.update(1);
     }
 
+    /// Phase-4 hook: raw `*mut usize` pointing at `scheduler.timestamp`.
+    /// The AOT compiler bakes this as a constant in the LLVM IR so
+    /// inline cycle accounting can do `*ts_ptr += K` directly without
+    /// going through bus.add_cycles. Pointer is stable for the bus's
+    /// lifetime (Shared<Scheduler> is Rc<UnsafeCell<Scheduler>>).
+    /// `timestamp` is at offset 0 in the `Scheduler` struct.
+    pub fn scheduler_timestamp_ptr(&self) -> *mut usize {
+        let sched_ref: &Scheduler = &self.scheduler;
+        sched_ref as *const Scheduler as *mut usize
+    }
+
+    /// Phase-4 hook: cycle cost for a Thumb16 fetch at the given page,
+    /// for both Seq and NonSeq access. Used by the AOT compiler at
+    /// emit time to bake cycle-cost constants into the LLVM IR.
+    /// Per I7, these are stable until WAITCNT changes (which triggers
+    /// AOT recompile).
+    pub fn thumb_fetch_cycles(&self, page: usize) -> (usize, usize) {
+        (
+            self.cycle_luts.s_cycles16[page],
+            self.cycle_luts.n_cycles16[page],
+        )
+    }
+
     #[inline(always)]
     pub fn add_cycles(&mut self, addr: Addr, access: MemoryAccess, width: MemoryAccessWidth) {
         use MemoryAccess::*;
