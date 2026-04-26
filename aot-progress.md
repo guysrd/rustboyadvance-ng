@@ -127,26 +127,45 @@ Phase-4-prime coverage: 6 sub-formats inlined (F1, F2, F3, F4 logical,
 F12, F13), ~50% dynamic estimate. PE per-instr 486 vs scalar 560 =
 -13%. MK 394 vs 397 = -0.8% parity.
 
-**Next phase-4-prime step:** F4 ALU arithmetic sub-ops:
-ADC(5), SBC(6), NEG(9), CMP(10), CMN(11). Mirror F2's carry/overflow
-bit logic but adapted per op:
-  ADC: result = a + b + cin;  uses 64-bit add for carry
-  SBC: result = a - b - !cin = a + ~b + cin  (alu_sbc = alu_adc(a, !b))
-  NEG: result = 0 - src;      same as SUB(0, src)
-  CMP: result = a - b (no writeback);  same flag math as SUB
-  CMN: result = a + b (no writeback);  same flag math as ADD
-Setting-flags-no-writeback: TST/CMP/CMN — already handled the
-TST case in F4 logical; need same for CMP/CMN here.
+**F4 arithmetic inline IR landed (commit cd3f27e):** ADC/SBC use
+64-bit add for carry detection; NEG/CMP/CMN reuse F2's bit-logic
+formulas. CMP/CMN are setting-flags-no-writeback. 0 divs PE / 1
+div MK at sw=64KB.
 
-After F4 arith: F4 shift-by-reg (LSL/LSR/ASR/ROR) which has
-idle_cycle (extern call) — could start with skip-the-idle-cycle
-trampoline-fallback OR add an idle-cycle extern. Then F4 MUL
-which has variable cycles (CLZ ladder). Then memory ops
-F6/F9/F11 with IO-region checks.
+fps median-of-N at sw=64KB:
+  6-format PE: ~472    7-format PE: 480  (+1.7%)
+  6-format MK: ~384    7-format MK: 369  (-3.7%)
 
-5 formats done in this stretch (F1, F2, F4_LOG, F12, F13 all
-new since the F3 fix; F3 is the original). Target ~10-12 formats
-before per-instr crosses whole-block.
+PE neutral-to-slight-gain; MK regressed modestly. Cause: f4 arith
+IR has more ops per opcode (esp 64-bit add for ADC/SBC), bloating
+JIT'd output and increasing i-cache pressure during MK's ARM-heavy
+execution. MK only runs ~1.4% Thumb at sw=64KB so the per-iter
+saving from inlined F4 arith is tiny but per-block size grew.
+
+This is a known stacking-pattern hazard: each format inlining
+slightly bloats the JIT'd code, and ARM-heavy ROMs that don't
+benefit from Thumb inlining still pay the i-cache cost. Mitigations
+to consider once enough formats land:
+1. Profile-guided format selection — only inline formats present
+   in this block.
+2. Per-block module-level dead-code-elim so unused IR fragments
+   don't bloat output.
+3. Disable F4_ARITH for MK profile (env-var-gated already).
+
+**Next phase-4-prime step:** F4 shift-by-register (LSL/LSR/ASR/ROR
+sub-ops 2/3/4/7). Each does shift_by_register + idle_cycle(1).
+The idle_cycle is a bus.scheduler.update(1) call — needs either
+an idle-cycle extern OR an inline +1 to scheduler timestamp ptr
+(but the latter has the same WAITCNT-stale risk if scheduler
+timing depends on cycle_luts; idle is just +1 unrelated to LUTs
+so it's safe).
+
+After F4 shifts: F4 MUL (variable cycles via CLZ ladder — likely
+extern call for cycle counting). Then memory ops F6/F9/F11 with
+IO-region runtime checks per I3 and I14 misaligned-word ROR.
+
+7 sub-formats done. Target ~10-12 before per-instr crosses
+whole-block.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
