@@ -174,6 +174,60 @@ If it doesn't measure faster, drop 4P-B and pivot.
 (debug-only, expect divs). 4P-B framework intact. Next session
 either implements path 1 or reverts depending on user direction.
 
+## 2026-04-27 phase-4P-C live cycle_luts attempt + REVERT
+
+User regenerated /tmp/.rec recordings into stable
+/home/user/pokeemerlad/recordings/ (PE 472 hashes / 471 fps,
+MK 187 hashes / 282 fps scalar). Tried Path 1 from the prior
+findings: replace baked const-arrays with int_to_ptr loads from a
+`*const usize` baked at AOT setup time pointing at
+SysBus.cycle_luts.s_cycles16 / n_cycles16 data. Always-current
+values, gen-check uninstalled.
+
+**Result: bug persists, reverted.**
+- pe baseline (no AOT_BAKED_CYCLES): 459 fps, 60 divs vs scalar
+  reference, 70% AOT coverage. (60 divs is pre-existing baseline
+  drift — divergence starts at frame 12900 of 28377; the postmortem's
+  "0 PE divs" was on a different recording. Not from 4P-C.)
+- pe baked (AOT_BAKED_CYCLES=1, live ptrs): 334 fps, 470 divs (=
+  every fb_hash diverged), 1.46% AOT coverage. fb_hash 0f08d2b0...
+  stuck from frame 60 onwards (= BIOS animation hash). Game
+  effectively never gets past BIOS into game code.
+
+Diagnosis attempts:
+- Found one bug: pipeline_restore was using `load_16` (charges
+  cycles) but the per-opcode helper already covered those addresses,
+  so cycles were double-counted by 2 fetches per block. Fixed to use
+  `read_16_no_cycles`. Did NOT fix the deadlock.
+- Verified compile: 32922 thumb blocks emitted, 0 failed. So the
+  table IS populated. Yet runtime Thumb dispatch hits collapsed from
+  21M (baseline) to 6k under baked.
+- ARM dispatch went up massively: 38M hits, 2.6B misses. CPU appears
+  stuck in ARM mode somehow. PE is mostly Thumb during gameplay so
+  this is wrong — possibly cpsr.T-bit getting cleared by the baked
+  path's cycle math (impossible from helper IR alone — helper
+  doesn't touch cpsr — but symptom is suspicious).
+- Did NOT identify root cause. Live ptr captured at AOT setup;
+  pointer arithmetic in helper IR looks correct on paper; cycle
+  values would be live-current from SysBus's Box<[usize]> data.
+
+**Reverted all 4P-C uncommitted WIP. Tree is back at 4ce352f
+(4P-B + AOT_NO_GEN_CHECK debug env).** Kept the script path update
+to scripts/aot_measure.sh so future runs use the stable
+recordings/ location instead of /tmp.
+
+**Strategic next step (recommendation):** drop the 4P-{A,B,C} grind
+and pivot to phase 7 (block chaining) or phase 8 (ARM-mode IR per
+postmortem). Both are higher-expected-fps levers per the program-doc
+ladder, neither depends on solving the WAITCNT-stale problem, and
+both work with the existing whole-block path that's already correct.
+
+The 4P framework (gen counter on bus, pipeline_restore extern,
+helper-IR plumbing) stays in tree as documented unused machinery.
+A future operator with more debugging time can revisit live cycle_luts
+once the deadlock root cause is found (suspicion: GEP indexing or
+int_to_ptr semantics around the `*const usize` -> i64 array I built).
+
 ---
 
 # Older entries below

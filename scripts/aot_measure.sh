@@ -20,12 +20,12 @@ cd /home/user/pokeemerlad/rustboyadvance-ng
 
 SWEEP_KB=${1:-0}
 PE_ROM=/home/user/pokeemerlad/pokeemerald/pokeemerald.gba
-MK_ROM="/tmp/mks/Mario Kart - Super Circuit (USA).gba"
-PE_REC=/tmp/pokeemerald_run.rec
-MK_REC=/tmp/mks.rec
+MK_ROM=/home/user/pokeemerlad/recordings/roms/mks.gba
+PE_REC=/home/user/pokeemerlad/recordings/pokeemerald_run.rec
+MK_REC=/home/user/pokeemerlad/recordings/mks.rec
 BIOS=core/benches/roms/normatt_gba_bios.bin
-PE_REF=/tmp/hashes_scalar_fresh2.txt
-MK_REF=/tmp/mk_scalar_fresh.txt
+PE_REF=/home/user/pokeemerlad/recordings/pe_scalar_ref.txt
+MK_REF=/home/user/pokeemerlad/recordings/mk_scalar_ref.txt
 
 echo "AOT_SWEEP_CAP_KB=$SWEEP_KB" >&2
 
