@@ -9,8 +9,8 @@ use inkwell::execution_engine::ExecutionEngine;
 use inkwell::execution_engine::JitFunction;
 
 use crate::replay::{
-    AotAbortFn, AotFetchOnlyFn, AotIdleCycleFn, AotLoad32Fn, AotReplayFn, AotStepFn,
-    AotStore32Fn,
+    AotAbortFn, AotFetchOnlyFn, AotIdleCycleFn, AotLdrWordFn, AotLoad32Fn, AotReplayFn,
+    AotStepFn, AotStore32Fn,
 };
 // Phase-8 ARM trampolines (used by emit_placeholder_arm_block; the per-instr
 // arm emit + step-arm + abort-arm registration come in a future commit).
@@ -83,6 +83,11 @@ pub struct LlvmCompiler {
     /// (and future F9 STR / F14 PUSH) inline IR uses this to do
     /// the actual word store with cycle accounting via the bus.
     pub(crate) store_32_fn: Option<AotStore32Fn>,
+    /// Phase-4 ldr_word trampoline. F11 LDR sp-rel inline IR uses
+    /// this; addr is runtime-computed (gpr[SP] + imm) so can hit
+    /// the I14 misaligned-LDR ROR path which the extern handles
+    /// internally (incl. cpsr.C side effect).
+    pub(crate) ldr_word_fn: Option<AotLdrWordFn>,
 }
 
 impl LlvmCompiler {
@@ -109,6 +114,7 @@ impl LlvmCompiler {
             load_32_fn: None,
             idle_cycle_fn: None,
             store_32_fn: None,
+            ldr_word_fn: None,
         })
     }
 
@@ -142,6 +148,13 @@ impl LlvmCompiler {
     /// Phase-4 hook: register the bus-side store_32 trampoline.
     pub fn register_store_32(&mut self, f: AotStore32Fn) {
         self.store_32_fn = Some(f);
+    }
+
+    /// Phase-4 hook: register the ldr_word trampoline (handles I14
+    /// misaligned-LDR ROR + cpsr.C side effect inside the extern).
+    /// Used by F11 LDR sp-rel inline IR.
+    pub fn register_ldr_word(&mut self, f: AotLdrWordFn) {
+        self.ldr_word_fn = Some(f);
     }
 
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
@@ -228,9 +241,12 @@ impl LlvmCompiler {
         // (NOT inline ts_ptr += 1 — see F4 MUL rejection commit 58e054b).
         let f4_shift_inline_env = std::env::var("AOT_INLINE_F4_SHIFT").map(|v| v == "1").unwrap_or(false);
         let f6_inline_env = std::env::var("AOT_INLINE_F6").map(|v| v == "1").unwrap_or(false);
-        // F11 split: STR-only this commit; LDR has misalignment ROR semantics
-        // per I14 that needs separate IR work (or a ldr_word extern).
+        // F11 split: STR-only and LDR-only gated separately. Both share
+        // top4 = 0x9 but masks are disjoint (STR=0x9000, LDR=0x9800).
+        // LDR routes through the ldr_word extern which handles I14
+        // misaligned-LDR ROR + cpsr.C side effect inside the extern.
         let f11_str_inline_env = std::env::var("AOT_INLINE_F11_STR").map(|v| v == "1").unwrap_or(false);
+        let f11_ldr_inline_env = std::env::var("AOT_INLINE_F11_LDR").map(|v| v == "1").unwrap_or(false);
         let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
@@ -240,6 +256,7 @@ impl LlvmCompiler {
             || f4_shift_inline_env
             || f6_inline_env
             || f11_str_inline_env
+            || f11_ldr_inline_env
             || f12_inline_env
             || f13_inline_env
             || f19hi_inline_env;
@@ -278,7 +295,9 @@ impl LlvmCompiler {
         } else {
             None
         };
-        let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env)
+        // F6 + F4_SHIFT + F11 LDR (for the 1I post-load idle) all need
+        // idle_cycle.
+        let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env || f11_ldr_inline_env)
             && self.idle_cycle_fn.is_some()
         {
             let idle_fn = self.idle_cycle_fn.unwrap();
@@ -303,6 +322,25 @@ impl LlvmCompiler {
             let s32_ref = module.add_function(&store_32_name, store_32_sig, None);
             self.engine.add_global_mapping(&s32_ref, store_32_fn as usize);
             Some(s32_ref)
+        } else {
+            None
+        };
+
+        // Phase-4 F11 LDR helper: ldr_word extern. Same signature as
+        // load_32 (cpu_ctx, addr, access_byte) -> u32 — but the wrapper
+        // routes through `cpu.aot_ldr_word` which does I14 misaligned-
+        // LDR ROR + cpsr.C side effect when `addr & 3 != 0`.
+        let ldr_word_ref = if f11_ldr_inline_env && self.ldr_word_fn.is_some() {
+            let ldr_word_fn = self.ldr_word_fn.unwrap();
+            let i8_t_local = self.context.i8_type();
+            let ldr_word_sig = i32_t.fn_type(
+                &[ptr_t.into(), i32_t.into(), i8_t_local.into()],
+                false,
+            );
+            let ldr_word_name = format!("rba_aot_ldr_word_{}", id);
+            let lw_ref = module.add_function(&ldr_word_name, ldr_word_sig, None);
+            self.engine.add_global_mapping(&lw_ref, ldr_word_fn as usize);
+            Some(lw_ref)
         } else {
             None
         };
@@ -1495,6 +1533,94 @@ impl LlvmCompiler {
                 continue;
             }
 
+            // Phase-4 inline IR for F11 LDR SP-relative (word).
+            // Encoding: 1001_1_DDD_IIIIIIII; mask 0xf800 == 0x9800.
+            //   imm = (insn & 0xff) << 2  (constant, word-scaled)
+            //   addr = gpr[SP] + imm  (runtime base, constant offset)
+            //   data = ldr_word(addr, NonSeq)
+            //          (extern handles I14 misaligned-LDR ROR + cpsr.C)
+            //   bus.idle_cycle()    (1S+1N+1I cycle profile)
+            //   gpr[Rd] = data
+            //   pc = fetch_addr + 2; nfa = Seq (= 1)  ← differs from STR
+            //   cpsr.C touched only inside ldr_word when addr & 3 != 0,
+            //   per I14. IR caller doesn't separately update flags.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F11 LDR path.
+            // Both F11 LDR (mask 0x9800) and F11 STR (mask 0x9000) share
+            // top4 = 0x9 but the masks are disjoint so order doesn't
+            // matter; LDR placed first to mirror typical ld-first reading.
+            if inline_enabled
+                && f11_ldr_inline_env
+                && ldr_word_ref.is_some()
+                && idle_cycle_ref.is_some()
+                && (opcode & 0xf800) == 0x9800
+            {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let lw = ldr_word_ref.unwrap();
+                let idle = idle_cycle_ref.unwrap();
+                let rd = ((opcode >> 8) & 0x7) as u32;
+                let imm = ((opcode & 0xff) as u32) << 2;
+
+                // Cycle accounting (fetch) + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load gpr[SP] (REG_SP = 13).
+                let sp_off = (off.gpr + 13 * 4) as u64;
+                let sp_off_v = i32_t.const_int(sp_off, false);
+                let sp_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[sp_off_v], "f11l_sp_ptr").ok()?
+                };
+                let sp_val = builder.build_load(i32_t, sp_ptr, "f11l_sp_val").ok()?
+                    .into_int_value();
+
+                // addr = SP + imm.
+                let addr = builder
+                    .build_int_add(sp_val, i32_t.const_int(imm as u64, false), "f11l_addr")
+                    .ok()?;
+
+                // data = ldr_word(addr, NonSeq=0). Extern handles I14 ROR
+                // + cpsr.C side effect when addr & 3 != 0.
+                let access_v = i8_t.const_int(0, false);
+                let lcall = builder.build_call(
+                    lw,
+                    &[cpu_ctx.into(), addr.into(), access_v.into()],
+                    "f11l_load",
+                ).ok()?;
+                let data = lcall.try_as_basic_value().unwrap_basic().into_int_value();
+
+                // bus.idle_cycle() — match scalar order (ldr_word, idle,
+                // gpr store).
+                builder.build_call(idle, &[cpu_ctx.into()], "f11l_idle").ok()?;
+
+                // gpr[Rd] = data.
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f11l_gpr_rd_ptr").ok()?
+                };
+                builder.build_store(gpr_rd_ptr, data).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f11l_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq (= 1) — LDR sets Seq, STR sets NonSeq.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f11l_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f11l_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
             // Phase-4 inline IR for F11 STR SP-relative (word).
             // Encoding: 1001_0_DDD_IIIIIIII; mask 0xf800 == 0x9000.
             //   imm = (insn & 0xff) << 2  (constant, word-scaled)
@@ -1504,8 +1630,6 @@ impl LlvmCompiler {
             //   pc = fetch_addr + 2; nfa = NonSeq (= 0)
             //   No flag updates.
             // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F11 STR path.
-            // F11 LDR (mask 0x9800) NOT inlined here — needs I14 misaligned-
-            // word ROR which is a follow-up.
             if inline_enabled
                 && f11_str_inline_env
                 && store_32_ref.is_some()

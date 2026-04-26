@@ -932,6 +932,21 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.pipeline[1] = val as u32;
     }
 
+    /// AOT-side helper: word-sized LDR with I14 misaligned-LDR ROR
+    /// semantics. Used by F11 LDR sp-rel inline IR (and future F9 LDR
+    /// word) which has a runtime-computed address — unlike F6 where
+    /// the address is constant-aligned at AOT compile time.
+    ///
+    /// Forwards to the private `ldr_word` in `memory.rs`. Side effect:
+    /// when `addr & 3 != 0`, sets `cpsr.C` from the rotated result's
+    /// top bit (per I14). The IR caller must NOT separately update
+    /// cpsr.C around this call.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_ldr_word(&mut self, addr: u32, access: MemoryAccess) -> u32 {
+        self.ldr_word(addr, access)
+    }
+
     /// AOT-side helper: mid-block abort check (K=2 cadence per I2).
     /// Mirrors the scalar `replay_cached_block` per-iter abort guard.
     /// Returns true if the AOT block should yield to the dispatcher.
