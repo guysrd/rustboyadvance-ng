@@ -34,46 +34,41 @@ inline path, gated by AOT_INLINE_F1=1 + AOT_USE_PER_INSTR=1 +
 AOT_SWEEP_CAP_KB=64. Result: 88 hash-divs on PE → V1 gate fail →
 revert (uncommitted, working-copy only).
 
-**Surprising side discovery:** F3 inline IR alone (AOT_INLINE_F3=1
-+ per-instr + sw=64KB) shows **12 hash-divs on PE** at current
-HEAD. This contradicts the earlier "phase 4 step 1 done (commit
-2999628): 0 divs at sweep=4KB and 64KB" claim. Hashes match for
-the first ~30 frame samples then diverge starting at frame=1860.
+**F3 IR regression bisected + fixed (commit 84ef3fa):** the side
+discovery that F3 IR alone showed 12 hash-divs at sw=64KB was
+bisected to commit afb1ebd "phase 4 step 2: inline cycle
+accumulation in F3 IR". root cause: F3 IR baked per-page Seq/NonSeq
+cycle costs as LLVM constants at AOT compile time, but PE writes
+WAITCNT during BIOS boot which updates SysBus.cycle_luts — baked
+constants go stale, IR charges old cycles while scalar charges
+new cycles, drift accumulates, fb_hashes diverge starting frame=1860.
 
-Possible causes (untriaged):
-- Struct-layout shift from the hygiene cleanup (commit c75dbee
-  removed un-segmented counter fields). However: aot_field_offsets()
-  uses live offset_of! so it should still be correct, and the
-  changed fields are AFTER the IR-accessed ones in struct order.
-- Subtle bug in F3 IR cycle accounting that only manifests at
-  specific input shapes (we re-verified 0 divs at sw=4KB last
-  measurement; maybe sw=64KB hits a hot block with a divergent
-  pattern that wasn't there before).
-- Some other commit between 2999628 and HEAD silently broke F3
-  IR. Recent suspect: the trampoline cycle drift fix (82d4170)
-  changed inter-block abort behavior — F3 IR doesn't go through
-  that path but maybe drift accumulation differs.
+Per I7 the proper fix is synchronous AOT recompile on WAITCNT
+write. Not implemented (and I19's "second WAITCNT write disables
+AOT" isn't either). Simpler fix landed: drop the
+`*sched_ts_ptr += baked_cycles` block from F3 IR, restore
+aot_thumb_fetch_only to load_16 (which charges cycles via the bus
+path, always reads current cycle_luts).
 
-Whole-block trampoline (default) and per-instr trampoline (no IR)
-both show 0 divs at sw=64KB → the bug is specifically in the F3
-inline IR codegen, not in the AOT infrastructure.
+Verification post-fix:
+- F3 IR + per-instr + sw=64KB: 0 divs (was 12) ✓
+- default whole-block sw=0: 0/0 divs both ROMs (unchanged)
+- default whole-block sw=64KB: PE 0 / MK 1 (historical baseline)
+- harness V1+V2+V4 all pass
 
-**Implication for phase-4-prime work:** F3 IR correctness regression
-must be triaged before extending to F1/F4/etc. The IR-emit grind
-needs a working F3 baseline as the reference template; without
-that, any new format inherits whatever bug F3 has.
+afb1ebd was claimed "no measurable fps win" and gated AOT_INLINE_F3=1
+default-off, so the revert costs no fps. Phase-4-prime work
+unblocked — F1/F4/etc. inline IR can now extend from a verified F3
+template.
 
-**Next operator action:**
-1. Bisect F3-IR correctness regression: re-run AOT_INLINE_F3=1 +
-   per-instr + sw=64KB at commit 2999628 (the original verification)
-   to confirm 0-divs claim was true at the time.
-2. If 0-divs reproduces at 2999628, bisect forward to find the
-   commit that broke F3 IR. Likely candidates: c75dbee (struct
-   layout), 82d4170 (abort fix), 6cd1c57 (lookup-fn reorder).
-3. Fix F3 IR. Then F1 IR work can resume from a verified template.
-
-Until step 3 is done, the phase-4-prime path (Option A in
-findings-ladder.md) is blocked. Holding-NNN protocol continues.
+**Next phase-4-prime step:** retry F1 LSL/LSR/ASR imm5 inline IR
+with the fixed cycle-accounting pattern (no inline-IR cycle ops;
+let fetch_only's load_16 charge cycles via the bus). The 88
+hash-divs from the prior (uncommitted) F1 attempt were probably
+mostly caused by the same WAITCNT-stale issue — F1 IR copied the
+`ts_ptr += baked_cycles` block from F3. With that block dropped,
+retry should be much closer to correct (residual divs would be
+genuine F1 shift-carry semantic bugs to debug).
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
