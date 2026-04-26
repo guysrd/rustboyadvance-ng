@@ -48,6 +48,11 @@ pub struct AotTable {
     /// keeps the leaf allocation stable so we can hand out raw
     /// pointers via the I18 inlined lookup.
     pages: Box<[Option<Box<Leaf>>]>,
+    /// Phase-8 ARM lookup table. Same shape as `pages` but separate
+    /// to disambiguate ARM-mode blocks from Thumb-mode blocks at the
+    /// same pc. Dispatcher selects the right table based on
+    /// cpu.cpsr.state().
+    arm_pages: Box<[Option<Box<Leaf>>]>,
     /// Arena of per-block opcode buffers. Each phase-0 placeholder
     /// block has a stable raw ptr into this arena baked into its
     /// LLVM IR (the trampoline call argument). Box<[u32]> keeps
@@ -56,19 +61,29 @@ pub struct AotTable {
     /// associated ExecutionEngine should already have been dropped
     /// (if any) so no in-flight calls reference these buffers.
     pub(crate) thumb_opcode_arena: Vec<Box<[u32]>>,
+    /// Phase-8 ARM-block opcode arena. Separate from thumb arena so
+    /// ARM blocks don't accidentally share buffers (different
+    /// instruction widths anyway).
+    pub(crate) arm_opcode_arena: Vec<Box<[u32]>>,
     /// Compiled-block count, maintained as inserts happen so we
     /// don't have to walk all 65536 leaves to report it.
     pub(crate) compiled_count: usize,
+    /// Phase-8 ARM-compiled-block count.
+    pub(crate) arm_compiled_count: usize,
 }
 
 impl AotTable {
     pub fn new() -> Self {
         // Vec → Boxed slice of length 65536, all None.
         let v: Vec<Option<Box<Leaf>>> = (0..TOP_LEVEL_SIZE).map(|_| None).collect();
+        let v_arm: Vec<Option<Box<Leaf>>> = (0..TOP_LEVEL_SIZE).map(|_| None).collect();
         Self {
             pages: v.into_boxed_slice(),
+            arm_pages: v_arm.into_boxed_slice(),
             thumb_opcode_arena: Vec::new(),
+            arm_opcode_arena: Vec::new(),
             compiled_count: 0,
+            arm_compiled_count: 0,
         }
     }
 
@@ -99,6 +114,33 @@ impl AotTable {
         ptr
     }
 
+    /// Phase-8: insert an ARM CompiledFn at lookup_pc. Separate from
+    /// `insert` (Thumb) so ARM blocks don't collide with Thumb blocks
+    /// at the same pc.
+    pub fn insert_arm(&mut self, pc: u32, f: CompiledFn) {
+        let top = (pc >> 16) as usize;
+        let leaf_idx = ((pc >> 1) & 0x7fff) as usize;
+        let leaf = self.arm_pages[top].get_or_insert_with(|| {
+            Box::new(std::array::from_fn(|_| None))
+        });
+        if leaf[leaf_idx].is_none() {
+            self.arm_compiled_count += 1;
+        }
+        leaf[leaf_idx] = Some(f);
+    }
+
+    /// Phase-8: ARM opcode buffer arena. Separate from thumb arena.
+    pub fn intern_arm_opcodes(&mut self, opcodes: &[u32]) -> *const u32 {
+        let boxed: Box<[u32]> = opcodes.to_vec().into_boxed_slice();
+        let ptr = boxed.as_ptr();
+        self.arm_opcode_arena.push(boxed);
+        ptr
+    }
+
+    pub fn arm_block_count(&self) -> usize {
+        self.arm_compiled_count
+    }
+
     /// Diagnostic: total compiled-block count. Maintained as
     /// inserts happen so this is O(1).
     pub fn block_count(&self) -> usize {
@@ -126,6 +168,18 @@ pub fn aot_lookup(table: &AotTable, pc: u32) -> Option<CompiledFn> {
     // is always in bounds. Use get_unchecked to drop the bounds check
     // from the hot path.
     let page = unsafe { table.pages.get_unchecked(top) };
+    let leaf = page.as_ref()?;
+    let leaf_idx = ((pc >> 1) & 0x7fff) as usize;
+    leaf[leaf_idx]
+}
+
+/// Phase-8: ARM-mode lookup. Same shape as `aot_lookup` but indexes
+/// the parallel `arm_pages` table to disambiguate ARM blocks from
+/// Thumb blocks at the same pc.
+#[inline(always)]
+pub fn aot_lookup_arm(table: &AotTable, pc: u32) -> Option<CompiledFn> {
+    let top = (pc >> 16) as usize;
+    let page = unsafe { table.arm_pages.get_unchecked(top) };
     let leaf = page.as_ref()?;
     let leaf_idx = ((pc >> 1) & 0x7fff) as usize;
     leaf[leaf_idx]

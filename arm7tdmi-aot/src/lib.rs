@@ -18,7 +18,7 @@ pub mod table;
 
 pub use compiler::{CpuOffsets, LlvmCompiler};
 pub use scan::{BlockEnd, BlockSpec, Mode, scan_rom};
-pub use table::{AotTable, CompiledFn, aot_lookup};
+pub use table::{AotTable, CompiledFn, aot_lookup, aot_lookup_arm};
 
 use arm7tdmi::Arm7tdmiCore;
 use arm7tdmi::memory::MemoryInterface;
