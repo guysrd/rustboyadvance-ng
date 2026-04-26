@@ -29,6 +29,8 @@ pub struct CpuOffsets {
     pub gpr: u32,
     pub cpsr: u32,
     pub next_fetch_access: u32,
+    /// Pipeline at offset `pipeline`; pipeline[0] at +0, pipeline[1] at +4.
+    pub pipeline: u32,
     /// Raw ptr at scheduler.timestamp (usize). Stable for the bus's
     /// lifetime. Inline IR adds K cycles via `*sched_ts_ptr += K`.
     pub scheduler_timestamp_ptr: u64,

@@ -253,16 +253,18 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
     /// THUMB_LUT handler dispatch + AdvancePC bookkeeping). Mirrors
     /// what scalar `replay_cached_block` does for one iteration.
     /// Phase-4 cpu state offsets for the AOT inline-IR emit.
-    /// next_fetch_access is `pub(crate)` so external crates can't use
-    /// `std::mem::offset_of!` directly — exposing the offsets via this
-    /// fn keeps the field visibility narrow while letting the AOT
-    /// compiler bake them as constants.
-    pub fn aot_field_offsets() -> (usize, usize, usize, usize) {
+    /// next_fetch_access + pipeline are `pub(crate)` so external
+    /// crates can't use `std::mem::offset_of!` directly — exposing
+    /// the offsets via this fn keeps the field visibility narrow
+    /// while letting the AOT compiler bake them as constants.
+    /// Returns (pc, gpr, cpsr, next_fetch_access, pipeline).
+    pub fn aot_field_offsets() -> (usize, usize, usize, usize, usize) {
         (
             std::mem::offset_of!(Arm7tdmiCore<I>, pc),
             std::mem::offset_of!(Arm7tdmiCore<I>, gpr),
             std::mem::offset_of!(Arm7tdmiCore<I>, cpsr),
             std::mem::offset_of!(Arm7tdmiCore<I>, next_fetch_access),
+            std::mem::offset_of!(Arm7tdmiCore<I>, pipeline),
         )
     }
 

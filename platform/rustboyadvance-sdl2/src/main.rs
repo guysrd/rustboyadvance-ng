@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // SysBus exposes scheduler_timestamp_ptr + thumb_fetch_cycles
             // for inline cycle accumulation.
             use arm7tdmi::Arm7tdmiCore;
-            let (pc_off, gpr_off, cpsr_off, nfa_off) =
+            let (pc_off, gpr_off, cpsr_off, nfa_off, pipe_off) =
                 Arm7tdmiCore::<SysBus>::aot_field_offsets();
             let sched_ts_ptr = gba.cpu.bus.scheduler_timestamp_ptr() as u64;
             let mut thumb_seq = [1u32; 16];
@@ -205,6 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gpr: gpr_off as u32,
                 cpsr: cpsr_off as u32,
                 next_fetch_access: nfa_off as u32,
+                pipeline: pipe_off as u32,
                 scheduler_timestamp_ptr: sched_ts_ptr,
                 thumb_seq_cycles: thumb_seq,
                 thumb_nonseq_cycles: thumb_nonseq,
