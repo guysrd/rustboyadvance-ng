@@ -257,10 +257,14 @@ mid-write merge conflicts. Future swarms should either:
 were CPU contention, not -O2's fault. Reverted to -O3; defer the
 test until a quiet system.
 
-**Phase-4-prime coverage now: 13 sub-formats inlined.**
-F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F6, F9, F10, F11_STR,
-F11_LDR, F12, F13, F19_HI. ~75-85% of dynamic Thumb opcodes
-covered (F9 alone is ~15-20%).
+**Phase-4-prime coverage now: 14 sub-formats inlined.**
+F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F6, F7, F9, F10,
+F11_STR, F11_LDR, F12, F13, F19_HI. ~80-90% of dynamic Thumb
+opcodes covered.
+
+**14-format quiet measurement (sw=64KB, 3-run median, pre-F7):**
+PE 459.1 / MK 378.8 at 70.98% AOT coverage.
+vs scalar PE 560 / MK 397 = -18% / -4.5%.
 
 **Drive-by fix in F10 commit (a43a355):** SDL frontend was calling
 compile_rom_with_seeds_full_v3 — missing both ldr_word_fn (v4) and
@@ -275,8 +279,8 @@ MK 368.8 (was peak 384 at 6-format, was 337 at 9-format).
 F4 shifts + F11 LDR (now real) helped MK recover from the
 F11_STR-induced regression but still well below scalar 397.
 
-Still missing: F4 MUL (broken), F5 high-reg, F7+F8 reg-offset,
-F14 PUSH/POP, F15 LDM/STM.
+Still missing: F4 MUL (broken), F5 high-reg, F8 sign-extended
+half-word, F14 PUSH/POP, F15 LDM/STM.
 
 **Earlier 9 sub-formats inlined** (correctness, gated default-off):
 F1, F2, F3, F4_LOG, F4_ARITH, F6, F11_STR, F12, F13, F19_HI.
