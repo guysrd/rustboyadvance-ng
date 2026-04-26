@@ -92,6 +92,25 @@ multi-day refactor scope of:
 - Or: deliver as-is at -8% fps gap PE / parity MK and call phase 1
   shippable.
 
+**Phase 8 results (commits edc3a39, f0f037c, 4d37779, 712ffb6,
+c55048f, 61acefd, eaf409d, 27f5aa4):** ARM block scaffolding all
+the way through: extern wrappers, AotTable arm pages, emit fn,
+compile_rom integration, dispatcher dual-table lookup, SDL frontend
+plumbing, BIOS exception-vector seed scan, BIOS-wide ARM sweep.
+
+Results:
+- BIOS exception-vector seeds (default-on): MK 1.42% coverage,
+  +0.9% fps (small win from IRQ handler caching).
+- AOT_SWEEP_BIOS=1: MK 54.69% coverage but -0.9% fps (broad
+  coverage = more trampoline overhead).
+- PE trace-in 24052 (77% coverage): -12.1% fps (commit ab4b7ab
+  confirms trampoline cant beat scalar at any coverage).
+
+Phase 1 trampoline architecture conclusively does NOT beat scalar
+regardless of coverage strategy. Phase 4 per-format LLVM IR emit
+remains the only path to a fps win. The infrastructure is ready;
+the work is mechanical IR-emit code per format.
+
 **Phase 4 infrastructure complete (commits 376722b, 990bd11, 1846504):**
 - `SysBus::scheduler_timestamp_ptr() -> *mut usize` — stable raw ptr
   at scheduler.timestamp. Inline IR adds K via `*ts_ptr += K`.
