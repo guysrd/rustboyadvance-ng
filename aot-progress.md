@@ -161,17 +161,30 @@ End-cycle drift only -128 cycles, but 4 specific frames mismatch
 (2040, 3420, 4080, 5460). mul_cycles formula matches scalar
 bit-by-bit; cpsr update matches. Mystery — reverted per V1 gate.
 
-**Debug ideas for next operator:**
-- Add a per-frame instrumentation: dump cpu state pre/post each
-  MK MUL invocation, compare scalar vs F4_MUL-IR, find first
-  divergent gpr/cpsr.
-- Check if `*ts_ptr += m` 64-bit store has alignment issues — try
-  writing to ts_ptr as i32 (low 32 bits of usize timestamp; high
-  32 bits should never roll over within a replay).
-- Maybe MK exercises an MUL operand sequence where scalar's
-  `dst.wrapping_mul(src)` differs from LLVM's `mul i32` — but
-  both are i32 wrapping mul, should be identical.
-- Try multiplying-result-first then cycle-charge order inversion.
+**F4 MUL re-landed (this commit):** root cause of the 58e054b
+divs identified — scalar calls `bus.idle_cycle()` `m` times in
+a loop, and each call ticks the scheduler by 1. If a scheduler
+event has a deadline `ts0+k` for some `1 <= k <= m`, scalar fires
+that event AT cycle `ts0+k`. The inline `*ts_ptr += m` skipped
+straight from `ts0` to `ts0+m`, so the event fired at the wrong
+cycle (stamp `ts0+m`). Most events don't care, but some bus/IO
+events latch state at the firing cycle — explaining why divs
+were rare (4 frames out of 6500), reproducible (deterministic
+event timing), and end-cycle drift was small (-128 cycles cumulative,
+events still fire eventually, just late).
+
+Fix: emit IR that calls `aot_idle_cycle_for` extern UP TO 4 times,
+gated by conditional branches on `src & 0xffffff00 != 0`,
+`src & 0xffff0000 != 0`, `src & 0xff000000 != 0`. Each call ticks
+the scheduler by 1, exact match with scalar. Bus path is already
+known-correct (it's what F4 SHIFT, F6, F11 LDR all use).
+
+Result: 0 divs PE, 1 div MK historical at sw=64KB, reproducible
+across 3 runs. End-cycle drift +68 cycles MK (well within V2 gate),
+0 cycles PE.
+
+Coverage now F1+F2+F3+F4_LOG+F4_ARITH+F4_SHIFT+F4_MUL+F5+F6+F7+
+F8+F9+F10+F11_STR+F11_LDR+F12+F13+F14+F19_HI = 18 sub-formats inlined.
 
 **F6 inline IR landed (commit 43a4508):** F6 LDR pc-rel via bus.load_32
 + idle_cycle externs (always-current cycle accounting). Constant

@@ -277,6 +277,13 @@ impl LlvmCompiler {
         // from shift-by-32+. cycle accounting uses idle_cycle extern
         // (NOT inline ts_ptr += 1 — see F4 MUL rejection commit 58e054b).
         let f4_shift_inline_env = std::env::var("AOT_INLINE_F4_SHIFT").map(|v| v == "1").unwrap_or(false);
+        // F4 MUL (op=0b1101) — operand-derived cycle count m∈{1,2,3,4}
+        // from get_required_multipiler_array_cycles. cycle accounting
+        // uses up to 4 conditional idle_cycle extern calls (NOT inline
+        // ts_ptr += m — that pattern was rejected in commit 58e054b
+        // with 3 reproducible MK divs, root cause was scheduler events
+        // firing at wrong cycle relative to the bulk add).
+        let f4_mul_inline_env = std::env::var("AOT_INLINE_F4_MUL").map(|v| v == "1").unwrap_or(false);
         let f6_inline_env = std::env::var("AOT_INLINE_F6").map(|v| v == "1").unwrap_or(false);
         // F11 split: STR-only and LDR-only gated separately. Both share
         // top4 = 0x9 but masks are disjoint (STR=0x9000, LDR=0x9800).
@@ -298,6 +305,7 @@ impl LlvmCompiler {
             || f4_log_inline_env
             || f4_arith_inline_env
             || f4_shift_inline_env
+            || f4_mul_inline_env
             || f6_inline_env
             || f11_str_inline_env
             || f11_ldr_inline_env
@@ -349,6 +357,7 @@ impl LlvmCompiler {
         // F6 + F4_SHIFT + F11 LDR + F10 (LDRH variant has 1I post-load
         // idle) all need idle_cycle.
         let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env
+            || f4_mul_inline_env
             || f11_ldr_inline_env || f10_inline_env || f9_inline_env
             || f7_inline_env || f8_inline_env || f14_inline_env
             || f15_inline_env)
@@ -1590,6 +1599,187 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f4a_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F4 MUL (op=0b1101).
+            // Encoding: 010000_1101_SSS_DDD; mask 0xffc0 == 0x4340.
+            // Effects (mirrors arm7tdmi/src/cpu.rs aot_thumb_step F4 MUL):
+            //   src = gpr[Rs]; dst = gpr[Rd]
+            //   m = get_required_multipiler_array_cycles(src):
+            //       if (src & 0xff)       == src → 1
+            //       elif (src & 0xffff)   == src → 2
+            //       elif (src & 0xffffff) == src → 3
+            //       else                         → 4
+            //   for k in 0..m: bus.idle_cycle()         (BEFORE mul)
+            //   result = dst.wrapping_mul(src)
+            //   gpr[Rd] = result
+            //   cpsr: clear N|Z|C|V; set N from result bit 31, Z from
+            //         (result==0); C=0, V=0  (alu_update_flags(_, false, false, false))
+            //   pc = fetch_addr + 2; nfa = Seq.
+            //
+            // Cycle-accounting strategy (PER COMMIT 58e054b POSTMORTEM):
+            // The original F4 MUL attempt did `*ts_ptr += m` inline. That
+            // produced 3 extra MK divs at sw=64KB. Hypothesis: scalar
+            // bus.idle_cycle() pumps the scheduler `m` times (one tick
+            // each), so any scheduler event whose deadline falls within
+            // [ts0, ts0+m] fires AT the matching tick. The inline bulk
+            // add jumps ts straight from ts0 → ts0+m, so the event fires
+            // once at ts0+m instead of at its real deadline. fb_hash
+            // diverges at frames where MUL straddles a scheduler deadline.
+            // Fix: replicate scalar exactly — call aot_idle_cycle_for
+            // up to 4 times, gated by m. Bus path is known-correct (it's
+            // what scalar uses).
+            let f4m_top6 = (opcode >> 10) & 0x3f;
+            let f4m_op = (opcode >> 6) & 0xf;
+            if inline_enabled
+                && f4_mul_inline_env
+                && idle_cycle_ref.is_some()
+                && f4m_top6 == 0b010000
+                && f4m_op == 0b1101
+            {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let idle = idle_cycle_ref.unwrap();
+                let rs = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting (fetch) + pipeline shift via fetch_only.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load src = gpr[Rs], dst = gpr[Rd].
+                let gpr_rs_off = (off.gpr + rs * 4) as u64;
+                let gpr_rs_off_v = i32_t.const_int(gpr_rs_off, false);
+                let gpr_rs_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rs_off_v], "f4m_rs_ptr").ok()?
+                };
+                let src = builder.build_load(i32_t, gpr_rs_ptr, "f4m_src").ok()?
+                    .into_int_value();
+
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f4m_rd_ptr").ok()?
+                };
+                let dst = builder.build_load(i32_t, gpr_rd_ptr, "f4m_dst").ok()?
+                    .into_int_value();
+
+                // Compute m via three bit-mask checks. Scalar formula
+                // (cpu.rs::get_required_multipiler_array_cycles):
+                //   if rs & 0xff       == rs → 1
+                //   elif rs & 0xffff   == rs → 2
+                //   elif rs & 0xffffff == rs → 3
+                //   else                     → 4
+                // Equivalent: count how many of (src&~0xff != 0,
+                // src&~0xffff != 0, src&~0xffffff != 0) are true; m = 1+count.
+                // We just chain idle_cycle calls via conditional branches.
+                //
+                // Always 1 idle (m >= 1 is unconditional).
+                // Branch on (src & 0xffffff00) != 0 → idle 2nd time.
+                // Branch on (src & 0xffff0000) != 0 → idle 3rd time.
+                // Branch on (src & 0xff000000) != 0 → idle 4th time.
+                // Each ladder rung is a conditional br + cont label.
+
+                let zero_i32 = i32_t.const_int(0, false);
+
+                // First idle (always).
+                builder.build_call(idle, &[cpu_ctx.into()], "f4m_idle1").ok()?;
+
+                // Rung 2: m >= 2 ⇔ src & 0xffffff00 != 0.
+                let mask_ge2 = builder
+                    .build_and(src, i32_t.const_int(0xffff_ff00u64, false), "f4m_m2_msk")
+                    .ok()?;
+                let is_ge2 = builder
+                    .build_int_compare(IntPredicate::NE, mask_ge2, zero_i32, "f4m_m2_cmp")
+                    .ok()?;
+                let m2_blk = self.context.append_basic_block(block_fn, "f4m_m2");
+                let after_m2 = self.context.append_basic_block(block_fn, "f4m_a2");
+                builder.build_conditional_branch(is_ge2, m2_blk, after_m2).ok()?;
+                builder.position_at_end(m2_blk);
+                builder.build_call(idle, &[cpu_ctx.into()], "f4m_idle2").ok()?;
+                builder.build_unconditional_branch(after_m2).ok()?;
+                builder.position_at_end(after_m2);
+
+                // Rung 3: m >= 3 ⇔ src & 0xffff0000 != 0.
+                let mask_ge3 = builder
+                    .build_and(src, i32_t.const_int(0xffff_0000u64, false), "f4m_m3_msk")
+                    .ok()?;
+                let is_ge3 = builder
+                    .build_int_compare(IntPredicate::NE, mask_ge3, zero_i32, "f4m_m3_cmp")
+                    .ok()?;
+                let m3_blk = self.context.append_basic_block(block_fn, "f4m_m3");
+                let after_m3 = self.context.append_basic_block(block_fn, "f4m_a3");
+                builder.build_conditional_branch(is_ge3, m3_blk, after_m3).ok()?;
+                builder.position_at_end(m3_blk);
+                builder.build_call(idle, &[cpu_ctx.into()], "f4m_idle3").ok()?;
+                builder.build_unconditional_branch(after_m3).ok()?;
+                builder.position_at_end(after_m3);
+
+                // Rung 4: m >= 4 ⇔ src & 0xff000000 != 0.
+                let mask_ge4 = builder
+                    .build_and(src, i32_t.const_int(0xff00_0000u64, false), "f4m_m4_msk")
+                    .ok()?;
+                let is_ge4 = builder
+                    .build_int_compare(IntPredicate::NE, mask_ge4, zero_i32, "f4m_m4_cmp")
+                    .ok()?;
+                let m4_blk = self.context.append_basic_block(block_fn, "f4m_m4");
+                let after_m4 = self.context.append_basic_block(block_fn, "f4m_a4");
+                builder.build_conditional_branch(is_ge4, m4_blk, after_m4).ok()?;
+                builder.position_at_end(m4_blk);
+                builder.build_call(idle, &[cpu_ctx.into()], "f4m_idle4").ok()?;
+                builder.build_unconditional_branch(after_m4).ok()?;
+                builder.position_at_end(after_m4);
+
+                // result = dst * src (LLVM mul wraps i32 by definition).
+                let result = builder.build_int_mul(dst, src, "f4m_res").ok()?;
+
+                // gpr[Rd] = result. (MUL is not a setting-flags-no-writeback op.)
+                builder.build_store(gpr_rd_ptr, result).ok()?;
+
+                // cpsr: clear N|Z|C|V (bits 31..28), set N from result
+                // bit 31, Z from (result == 0). C=0, V=0 — alu_update_flags
+                // is called with arithmetic=false, c=false, v=false; the
+                // helper unconditionally writes ALL FOUR flags.
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f4m_cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f4m_cpsr_old").ok()?
+                    .into_int_value();
+                let nzcv_clear = i32_t.const_int(0x0fff_ffff, false);
+                let cleared = builder.build_and(cpsr_old, nzcv_clear, "f4m_cpsr_cl").ok()?;
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "f4m_n_bit")
+                    .ok()?;
+                let z_cmp = builder
+                    .build_int_compare(IntPredicate::EQ, result, zero_i32, "f4m_z_cmp")
+                    .ok()?;
+                let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f4m_z_ext").ok()?;
+                let z_bit = builder
+                    .build_left_shift(z_ext, i32_t.const_int(30, false), "f4m_z_bit")
+                    .ok()?;
+                let cpsr_n = builder.build_or(cleared, n_bit, "f4m_cpsr_n").ok()?;
+                let cpsr_new = builder.build_or(cpsr_n, z_bit, "f4m_cpsr_nz").ok()?;
+                builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f4m_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f4m_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f4m_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
