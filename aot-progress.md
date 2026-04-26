@@ -105,6 +105,75 @@ opt-in.
   change, scalar handles those frames; pre-WAITCNT, baked cycles
   match scalar's LUT-from-construction values).
 
+## 2026-04-27 phase-4P-B empirical findings
+
+Built synthetic 18-byte /tmp/synth.rec (replays don't survive /tmp
+cleanups; this is a portable substitute) and ran the V1 fb-hash
+comparison on PE with 19-fmt + skip-bios + sw=64KB. Observations:
+
+**baseline (19-fmt, no AOT_BAKED_CYCLES):** PE 494.4 fps, 1 div, 68%
+AOT coverage. Matches the existing baseline behaviour — fetch_only
+goes through the bus path, cycles are always current, divs gate at
+historical 1 from a known cpsr.C edge case.
+
+**baked + gen-check (AOT_BAKED_CYCLES=1, default):** PE 537.5 fps,
+0 divs, 0% AOT coverage. Gen-check kicked in after 7 dispatch hits —
+PE writes WAITCNT extremely early (within the first ~50 emulated
+cycles after skip-bios), bumping the gen counter to 1. The lookup
+gate then short-circuits ALL future dispatches to None, so AOT is
+effectively disabled for the rest of the replay. Correctness ✓
+(0 divs vs scalar reference); fps measurement ✗ (the path under test
+isn't running enough to evaluate).
+
+**baked, gen-check disabled (AOT_BAKED_CYCLES=1 +
+AOT_NO_GEN_CHECK=1, debug-only env var added this commit):**
+PE 352 fps, 59 divs, 1.47% coverage. Emulation deadlocks — every
+fb_hash from frame 30 to 1770 is identical (0f08d2b0...). 162M
+dispatch attempts vs 30M for baseline; blocks averaging ~3 cycles
+each before aborting. Diagnosed root cause: post-WAITCNT, baked
+cycles are stale (PE drops ROM cycle cost from 3/5 to faster
+values), the over-charge accumulates into the scheduler, K=2 abort
+fires every iter because scheduler events appear "due", blocks die
+after 2 opcodes, dispatcher loops re-entering same blocks. So the
+spike confirms gen-check IS load-bearing for correctness — but also
+that we can't measure the fps lever on PE without addressing the
+WAITCNT-stale problem.
+
+**Where this leaves the lever:**
+The architecture is sound (in-module IR helper inlines cleanly under
+-O3, block-exit pipeline_restore replaces N per-opcode pipeline
+shifts). What we CAN'T validate yet on PE is whether eliminating
+the per-opcode extern boundary actually wins the 5-15% expected.
+The 7 AOT hits before gen-check fired aren't enough to compare.
+
+**Three forward paths (pick one, next session):**
+
+1. **Live cycle_luts read** (~50 LOC): the helper IR loads
+   cycle_luts[page] from a `*const usize` baked at AOT setup time
+   (Box<[usize]> data is stable for bus lifetime). No staleness
+   issue, gen-check unnecessary. Drops the gen-check stop-gap
+   entirely and lets the baked path run for the WHOLE replay on
+   any ROM. This is the cleanest fix.
+
+2. **I7 synchronous recompile**: full implementation per the program
+   doc — on WAITCNT change, flush AOT table + recompile ROM with
+   new cycle constants. Multi-day; the actual recompile pass takes
+   ~140s in our test, blocking the CPU thread. UX is bad.
+
+3. **Drop 4P-B**: revert to non-baked 19-fmt, accept that the per-
+   opcode extern boundary cost (~10% by my back-of-envelope math)
+   isn't worth the complexity to fight. Move to phase 7 (block
+   chaining) or phase 8 (ARM-mode IR) instead.
+
+**Recommendation:** Path 1. Cheap, eliminates the WAITCNT-stale
+class of problems entirely, lets us actually measure whether the
+inline-cycle-math approach is faster than the extern fetch_only.
+If it doesn't measure faster, drop 4P-B and pivot.
+
+**State of tree:** AOT_NO_GEN_CHECK env var added this commit
+(debug-only, expect divs). 4P-B framework intact. Next session
+either implements path 1 or reverts depending on user direction.
+
 ---
 
 # Older entries below

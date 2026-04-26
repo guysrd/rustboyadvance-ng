@@ -396,7 +396,10 @@ pub fn compile_rom_with_seeds_full_v8(
     let baked_cycles_env = std::env::var("AOT_BAKED_CYCLES")
         .map(|v| v == "1")
         .unwrap_or(false);
-    if baked_cycles_env && pipeline_restore_thumb_fn.is_some() {
+    let skip_gen_check = std::env::var("AOT_NO_GEN_CHECK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if baked_cycles_env && pipeline_restore_thumb_fn.is_some() && !skip_gen_check {
         if let Some(off) = cpu_offsets {
             if off.aot_gen_counter_ptr != 0 {
                 table.set_gen_check(
@@ -409,6 +412,8 @@ pub fn compile_rom_with_seeds_full_v8(
                 );
             }
         }
+    } else if baked_cycles_env && skip_gen_check {
+        eprintln!("AOT: AOT_NO_GEN_CHECK=1 — gen-check DISABLED (debug only, expect divs on waitcnt-writing roms)");
     }
     table
 }
