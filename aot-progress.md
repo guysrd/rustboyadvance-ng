@@ -262,6 +262,23 @@ F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F5, F6, F7, F8, F9, F10,
 F11_STR, F11_LDR, F12, F13, F14, F19_HI. ~92-97% of dynamic
 Thumb opcodes covered.
 
+**2 agents running in background (2026-04-26 ~final stretch):**
+- F4 MUL fix attempt (`a83c832d`): hypothesis is replace inline
+  `*ts_ptr += m_cycles` with conditional ladder of `idle_cycle`
+  extern calls (the bus path; known correct).
+- F15 LDM/STM (`aef8326c`): full impl with empty-rlist quirk
+  fall-through to step trampoline + writeback rules.
+
+Stricter isolation rules than the prior 8-agent swarm: no git
+stash, no branch switching, no main-checkout writes. Will
+cherry-pick on completion.
+
+**After F4 MUL + F15:** 100% per-iter Thumb dispatch coverage
+(F17/F18/F19_lo are block terminators, not in step path).
+Phase-4-prime IR-emit grind closes out. Strategic next:
+phase 7 (block chaining), phase 8 (ARM-mode inline IR — MK
+benefit since it's 98% ARM), or phase 9 (persistent cache).
+
 **16-format quiet measurement (sw=64KB, 3-run median, pre-F5):**
 PE 453.3 / MK 381.0. vs scalar 560 / 397 = -19% / -4%.
 F7+F8 addition (was 14-format → 16-format) was net-noise on fps —
