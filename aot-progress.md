@@ -66,6 +66,24 @@ iteration).
 The PE gap at high coverage is the main concern. MK is essentially
 parity since AOT coverage is only 1.16% there (ARM-heavy code).
 
+**Variance + low-coverage characterization (3-run median):**
+- sweep=0 PE scalar: 564 fps (range 20 fps).
+- sweep=2KB PE whole-block: 550 fps. -2.5% vs scalar.
+- sweep=2KB PE per-instr: 550 fps. Same as whole-block at low cov.
+
+Even at 0.50% coverage AOT costs ~2.5%. That's the per-dispatch
+lookup overhead in `try_aot_dispatch` (table page lookup + None
+check + leaf index, ~5-10ns per dispatch even on miss). For 280M
+dispatches per replay = ~1.4-2.8s overhead = ~5% of 30s.
+
+Implication: the AOT plumbing has a fixed per-dispatch cost
+regardless of hit rate. Higher coverage AMORTIZES this by replacing
+expensive scalar work with AOT work. Lower coverage doesn't help.
+
+To reduce AOT plumbing cost: shrink try_aot_dispatch hot path.
+E.g., skip the cold-start guard once pipeline is initialized
+(set a bool flag and check that instead of `pipeline[0] == 0`).
+
 Open observations:
 - `compile_rom_with_seeds_step_offsets` at sweep=64KB takes ~70-76s
   to compile via LLVM JIT (regardless of phase-4 changes). LLVM is
