@@ -24,3 +24,4 @@ phase4-infra3	-4	543.7	546.8	384.1	384.6	0	0	0	0.0	0	0	0	accept	phase 4 infra st
 phase4-inline-cycle	-6	545.4	548.8	397.6	400.2	0	0	0	0.0	0	0	0	accept	phase 4: inline cycle accumulation in F3 IR (correct, drift=-150 sw=4KB; no measurable fps gain - IR overhead matches saved extern cost)
 dispatch-reorder	-43	496.2	538.3	389.2	390.0	34	68	0	70.9	0	1	0	accept	reorder dispatch guards: mode check + lookup before cold-start guard; sw=0 score=-1 noise
 inline-always-rej	-65	479.9	541.5	384.9	388.0	34	68	0	70.9	0	1	0	reject_perf	tried #[inline(always)] on bus loads — pe -11.4% at sw=64KB (was -7.8%); reverted, code bloat hurts I-cache
+arm-scaffold	-4	545.6	547.8	392.2	394.3	-46	0	0	0.0	0	0	0	accept	phase 8 scaffold: aot_arm_step + abort + replay extern (no dispatcher integration yet)

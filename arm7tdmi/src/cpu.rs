@@ -909,6 +909,74 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.bus.cached_block_should_abort()
     }
 
+    /// AOT-side helper: per-iter ARM step (fetch + pipeline shift +
+    /// cond check + ARM_LUT handler dispatch + AdvancePC bookkeeping).
+    /// Phase-8 scaffolding — mirrors `aot_thumb_step` but for ARM mode.
+    ///
+    /// Returns:
+    ///   0 → AdvancePC (continue to next instruction).
+    ///   1 → PipelineFlushed (handler updated cpu.pc + cpu.pipeline
+    ///       at branch target; caller exits the block).
+    ///
+    /// Pipeline-head pc convention: scalar's self.pc at handler-call
+    /// time IS `fetch_addr` (= exec_addr + 8 in ARM mode). After
+    /// AdvancePC scalar advances pc by 4 → exec_addr + 12 = fetch_addr + 4.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_arm_step(&mut self, fetch_addr: u32, insn: u32) -> u32 {
+        let access = self.next_fetch_access;
+        let val = self.load_32(fetch_addr, access);
+        self.pipeline[0] = self.pipeline[1];
+        self.pipeline[1] = val;
+        self.pc = fetch_addr;
+
+        // ARM cond field (bits 28..32). AL = 0xE = always; skip cond
+        // check on AL for the common case.
+        let cond_bits = ((insn >> 28) & 0xf) as u8;
+        if cond_bits != 0xE {
+            // Cond is not AL; check it.
+            let cond = match num::FromPrimitive::from_u8(cond_bits) {
+                Some(c) => c,
+                None => unsafe { std::hint::unreachable_unchecked() },
+            };
+            if !self.check_arm_cond(cond) {
+                // Cond false — skip handler entirely. Scalar mirror:
+                // `advance_arm(); next_fetch_access = NonSeq;`.
+                self.next_fetch_access = MemoryAccess::NonSeq;
+                self.pc = fetch_addr.wrapping_add(4);
+                return 0; // AdvancePC
+            }
+        }
+
+        // Dispatch via ARM_LUT (same hash as scalar's step_arm_exec).
+        let hash = (((insn >> 16) & 0xff0) | ((insn >> 4) & 0xf)) as usize;
+        let arm_info = &Self::ARM_LUT[hash];
+        match (arm_info.handler_fn)(self, insn) {
+            CpuAction::AdvancePC(next_access) => {
+                self.next_fetch_access = next_access;
+                self.pc = fetch_addr.wrapping_add(4);
+                0
+            }
+            CpuAction::PipelineFlushed => 1,
+        }
+    }
+
+    /// AOT-side helper: ARM mode mid-block abort check. Mirrors
+    /// `aot_block_should_abort_thumb` but the mode-flip check fires
+    /// if cpu state flipped to Thumb.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_block_should_abort_arm(&mut self) -> bool {
+        if matches!(self.cpsr.state(), CpuState::THUMB) {
+            return true;
+        }
+        if self.bus.take_block_cache_dirty() {
+            self.block_cache.flush();
+            return true;
+        }
+        self.bus.cached_block_should_abort()
+    }
+
     /// Try to dispatch an AOT-compiled block at the current pc. Returns
     /// `Some(can_chain)` on hit, `None` on miss (caller falls through
     /// to block_cache + scalar replay).

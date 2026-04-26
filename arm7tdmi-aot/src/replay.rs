@@ -71,6 +71,24 @@ pub unsafe extern "C" fn aot_thumb_fetch_only_for<I: MemoryInterface>(
     cpu.aot_thumb_fetch_only(fetch_addr);
 }
 
+/// Phase-8 ARM step trampoline. Mirrors `aot_thumb_step_for` but
+/// dispatches via ARM_LUT instead of THUMB_LUT and uses 32-bit fetch.
+pub unsafe extern "C" fn aot_arm_step_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    fetch_addr: u32,
+    insn: u32,
+) -> u32 {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    cpu.aot_arm_step(fetch_addr, insn)
+}
+
+pub unsafe extern "C" fn aot_block_should_abort_arm_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+) -> u32 {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    if cpu.aot_block_should_abort_arm() { 1 } else { 0 }
+}
+
 /// Phase-1 mid-block abort check (K=2 cadence, called from
 /// compile_thumb_block before iters with k odd && k != 0).
 /// Returns 1 if the AOT block should yield to the dispatcher
@@ -133,6 +151,35 @@ pub unsafe extern "C" fn aot_replay_thumb_block_for<I: MemoryInterface>(
             // target. Per phase-0 ABI, return 0 (NOT 0b01) — the
             // dispatcher just reads cpu.pc on re-entry.
             // For phase 1+ this changes to 0b01 with target in pc_out.
+            return 0;
+        }
+    }
+
+    0
+}
+
+/// Phase-8 whole-block ARM trampoline. Mirrors `aot_replay_thumb_block_for`
+/// but uses 4-byte-stride per-iter (ARM is 32-bit) and ARM-specific
+/// mode-flip / step / abort helpers.
+#[inline]
+pub unsafe extern "C" fn aot_replay_arm_block_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    opcodes_ptr: *const u32,
+    opcodes_len: u32,
+    entry_pc: u32,
+) -> u32 {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+
+    for k in 0..opcodes_len {
+        if k != 0 && (k & ABORT_CADENCE_MASK) == 1 && cpu.aot_block_should_abort_arm() {
+            return 0b10;
+        }
+
+        let insn = unsafe { *opcodes_ptr.add(k as usize) };
+        let exec_addr = entry_pc.wrapping_add(4u32.wrapping_mul(k));
+        let fetch_addr = exec_addr.wrapping_add(8);
+
+        if cpu.aot_arm_step(fetch_addr, insn) == 1 {
             return 0;
         }
     }
