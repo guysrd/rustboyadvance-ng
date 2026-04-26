@@ -106,6 +106,19 @@ pub trait MemoryInterface {
         false
     }
 
+    /// Phase-4 helper: read a halfword without charging cycles. The
+    /// AOT inline IR does its own cycle accumulation via direct
+    /// scheduler.timestamp += K stores, then calls this for pipeline
+    /// maintenance — without this, going through `load_16` would
+    /// double-charge cycles.
+    ///
+    /// Default impl falls back to `load_16` (correct for buses where
+    /// cycle accounting is no-op like SimpleMemory). Real buses
+    /// override to use their internal no-cycle read path.
+    #[inline]
+    fn read_16_no_cycles(&mut self, addr: u32) -> u16 {
+        self.load_16(addr, MemoryAccess::Seq)
+    }
 }
 
 impl<I: MemoryInterface> MemoryInterface for Arm7tdmiCore<I> {
@@ -141,6 +154,11 @@ impl<I: MemoryInterface> MemoryInterface for Arm7tdmiCore<I> {
     #[inline]
     fn idle_cycle(&mut self) {
         self.bus.idle_cycle();
+    }
+
+    #[inline]
+    fn read_16_no_cycles(&mut self, addr: u32) -> u16 {
+        self.bus.read_16_no_cycles(addr & !1)
     }
 
     #[cfg(feature = "cached_interp")]
