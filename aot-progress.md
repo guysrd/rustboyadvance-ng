@@ -111,29 +111,42 @@ F2 is common (~10-15% dynamic) so the stack step is more visible
 than F12/F13. Phase-4-prime coverage now: 5 formats inlined,
 ~40-45% dynamic estimate.
 
-**Next phase-4-prime step:** F4 ALU ops (16 sub-ops). Encoding
-010000_OOOO_SSS_DDD; mask 0xfc00 == 0x4000. 16 sub-ops:
-  0=AND  1=EOR  2=LSL  3=LSR  4=ASR  5=ADC  6=SBC  7=ROR
-  8=TST  9=NEG  10=CMP 11=CMN 12=ORR 13=MUL 14=BIC 15=MVN
-Each has different flag semantics:
-  - logical (AND/EOR/TST/ORR/BIC/MVN): N+Z from result; C+V untouched.
-  - arithmetic (ADC/SBC/CMP/CMN/NEG): full N+Z+C+V via add/sub helpers.
-  - shifts by reg (LSL/LSR/ASR/ROR): N+Z from result, C from shift carry, V untouched.
-  - MUL: N+Z from result; C unspecified (preserve); V untouched.
-         Has variable cycles based on operand value (CLZ ladder).
-         Could stay in trampoline path initially OR use a runtime
-         extern call for the cycle counting.
+**F4 logical inline IR landed (commit b2e456e):** F4 ALU logical
+sub-ops AND/EOR/TST/ORR/BIC/MVN. Logical ops preserve C+V
+(arithmetic=false in alu_update_flags). 0 divs PE / 1 div MK
+historical at sw=64KB.
 
-F4 is most-executed Thumb format besides F3 (~15-20% dynamic).
-Big win if all 16 sub-ops can be inlined. Worth doing in pieces:
-maybe split into multiple commits, one per sub-op group (logical,
-arith, shift, mul).
+fps stack:
+  F1+F3:                       458
+  F1+F3+F12:                   471
+  F1+F3+F12+F13:               470
+  F1+F2+F3+F12+F13:            478
+  F1+F2+F3+F4_LOG+F12+F13:     486 (+1.7%)
 
-After F4: memory ops F6/F9/F11 with IO-region runtime checks per
-I3 and I14 misaligned-word ROR for word LDR.
+Phase-4-prime coverage: 6 sub-formats inlined (F1, F2, F3, F4 logical,
+F12, F13), ~50% dynamic estimate. PE per-instr 486 vs scalar 560 =
+-13%. MK 394 vs 397 = -0.8% parity.
 
-Each addition is correctness-verifiable in isolation. 5 formats
-done, target ~10-12 before per-instr crosses whole-block.
+**Next phase-4-prime step:** F4 ALU arithmetic sub-ops:
+ADC(5), SBC(6), NEG(9), CMP(10), CMN(11). Mirror F2's carry/overflow
+bit logic but adapted per op:
+  ADC: result = a + b + cin;  uses 64-bit add for carry
+  SBC: result = a - b - !cin = a + ~b + cin  (alu_sbc = alu_adc(a, !b))
+  NEG: result = 0 - src;      same as SUB(0, src)
+  CMP: result = a - b (no writeback);  same flag math as SUB
+  CMN: result = a + b (no writeback);  same flag math as ADD
+Setting-flags-no-writeback: TST/CMP/CMN — already handled the
+TST case in F4 logical; need same for CMP/CMN here.
+
+After F4 arith: F4 shift-by-reg (LSL/LSR/ASR/ROR) which has
+idle_cycle (extern call) — could start with skip-the-idle-cycle
+trampoline-fallback OR add an idle-cycle extern. Then F4 MUL
+which has variable cycles (CLZ ladder). Then memory ops
+F6/F9/F11 with IO-region checks.
+
+5 formats done in this stretch (F1, F2, F4_LOG, F12, F13 all
+new since the F3 fix; F3 is the original). Target ~10-12 formats
+before per-instr crosses whole-block.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
