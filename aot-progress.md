@@ -92,6 +92,19 @@ multi-day refactor scope of:
 - Or: deliver as-is at -8% fps gap PE / parity MK and call phase 1
   shippable.
 
+**5-run noise characterization (2026-04-26):**
+- PE scalar: 562, 549, 550, 549, 549 → median 549.0, mean 551.6
+- PE AOT sw=64KB: 508, 516, 504, 508, 506 → median 507.6, mean 508.5
+- Gap: 7.5% (real, not noise)
+
+Per-dispatch math: 7.5% × 27s scalar = 2s overhead / 181M AOT
+dispatches = ~11ns per AOT dispatch. The AOT path adds ~11ns per
+hit vs scalar's per-iter dispatch. Most likely the 17-way format
+detection in aot_thumb_step (~3-5ns) + LLVM extern boundary
+(~5ns/block ÷ 7 iters/block = ~0.7ns/iter) + lookup (~5ns/block
+÷ 7 = 0.7ns/iter). Doesn't fully add up — some unaccounted cache
+or branch-prediction effects too.
+
 **Phase 8 results (commits edc3a39, f0f037c, 4d37779, 712ffb6,
 c55048f, 61acefd, eaf409d, 27f5aa4):** ARM block scaffolding all
 the way through: extern wrappers, AotTable arm pages, emit fn,
