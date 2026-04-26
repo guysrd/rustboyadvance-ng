@@ -200,6 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 thumb_seq[page] = s as u32;
                 thumb_nonseq[page] = n as u32;
             }
+            let aot_gen_ptr = gba.cpu.bus.aot_gen_counter_ptr() as u64;
+            let aot_gen_baked = gba.cpu.bus.aot_gen_counter();
             let cpu_offsets = arm7tdmi_aot::CpuOffsets {
                 pc: pc_off as u32,
                 gpr: gpr_off as u32,
@@ -209,6 +211,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scheduler_timestamp_ptr: sched_ts_ptr,
                 thumb_seq_cycles: thumb_seq,
                 thumb_nonseq_cycles: thumb_nonseq,
+                aot_gen_counter_ptr: aot_gen_ptr,
+                aot_gen_baked,
             };
             eprintln!(
                 "--aot: phase-4 cpu offsets pc={} gpr={} cpsr={} nfa={} sched_ts={:#x} rom_seq8={} rom_nonseq8={}",

@@ -156,6 +156,12 @@ pub struct SysBus {
 
     cycle_luts: CycleLookupTables,
 
+    /// Phase-4P-A: WAITCNT generation counter. Starts at 0, bumps on
+    /// every WAITCNT write. AOT inline-cycle paths bake this at compile
+    /// time and verify at block prologue; on mismatch the block yields
+    /// to scalar (correctness-first stop-gap until I7 recompile).
+    aot_gen_counter: u32,
+
     pub trace_access: bool,
 
     /// Cached-interpreter invalidation signal. Set whenever the CPU or DMA
@@ -198,6 +204,7 @@ impl SysBus {
             ewram,
             iwram,
             cycle_luts: luts,
+            aot_gen_counter: 0,
             trace_access: false,
 
             #[cfg(feature = "cached_interp")]
@@ -247,6 +254,24 @@ impl SysBus {
 
     pub fn on_waitcnt_written(&mut self, waitcnt: WaitControl) {
         self.cycle_luts.update_gamepak_waitstates(waitcnt);
+        // Phase-4P-A: bump gen counter so AOT inline paths see stale.
+        // wraping_add is fine — even at u32 wrap, the chance of a
+        // false-match is 1 in 4 billion writes.
+        self.aot_gen_counter = self.aot_gen_counter.wrapping_add(1);
+    }
+
+    /// Phase-4P-A: raw `*const u32` to the WAITCNT generation counter.
+    /// Pointer is stable for the bus lifetime; AOT compiler bakes it
+    /// and emits a load+cmp at block prologue.
+    pub fn aot_gen_counter_ptr(&self) -> *const u32 {
+        &self.aot_gen_counter as *const u32
+    }
+
+    /// Phase-4P-A: read current generation counter value. Used by the
+    /// AOT compiler at compile time to bake the expected value into
+    /// each compiled block's prologue check.
+    pub fn aot_gen_counter(&self) -> u32 {
+        self.aot_gen_counter
     }
     pub fn idle_cycle(&mut self) {
         self.scheduler.update(1);

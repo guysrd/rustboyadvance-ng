@@ -5,18 +5,51 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**STATE: phase 1 fps-rejected, awaiting phase 4-prime commitment.**
-See `docs/findings-ladder.md` for the formal re-plan per the program
-doc's permanent-fail rule. Phase 1 correctness deliverables are
-accepted; the fps gate (`score > 0 on at least one ROM`) is failed
-on both ROMs (PE -10.5% / MK -0.6% at sweep=64KB; score = -61).
+**STATE (2026-04-26 evening): phase-4-prime done as "19 fmts inlined,
+net regression vs whole-block at 19/19" (postmortem in
+`docs/findings-phase4-prime-postmortem.md`). Pivoting to phase
+4P-A/B/C per `docs/findings-phase4p-batched.md`: optimise the
+existing 19-fmt path (NOT add more formats) so it actually beats
+scalar.**
 
-The cron loop should NOT continue with small experiments — each
-firing has reverted at noise floor. Three exit options in the
-findings doc: (A) commit to multi-day phase-4-prime IR-emit grind,
-(B) pivot to LLVM-free Rust fn-ptr dispatch, (C) ship phase 1
-correctness only, AOT off by default. Recommendation: Option A
-when a sustained work block is available; pause cron otherwise.
+Levers per findings-phase4p-batched.md:
+- 4P-A: WAITCNT generation counter infrastructure (this commit, data-only)
+- 4P-B: replace per-opcode fetch_only with inline `*sched_ts += baked`
+        + block-exit pipeline restore (needs 4P-A)
+- 4P-C: lazy flag materialisation (needs 4P-B)
+
+Acceptance for the program: `pe_fps_aot > pe_fps_scalar * 1.05 AND
+mk_fps_aot > mk_fps_scalar * 1.05`. Today's 19-fmt is at PE 431 / MK
+364 vs scalar 503 / 368. PE needs +17%, MK needs +1%.
+
+Cron firing action: continue 4P ladder commits. Each commit env-gated
+default-off, V1+V2+V4 verified before next phase begins.
+
+---
+
+## 2026-04-26 phase-4P-A foundation
+
+Data-only infrastructure for upcoming inline-cycle work:
+- SysBus.aot_gen_counter (u32) bumps on every WAITCNT write.
+- SysBus.aot_gen_counter_ptr() returns *const u32 for IR baking.
+- CpuOffsets gains aot_gen_counter_ptr (u64) + aot_gen_baked (u32).
+- SDL frontend captures both, passes to compile_rom_with_seeds_full_v7.
+
+No IR emission yet. The naive "load gen, cmp baked, br ok else abort"
+shape was tried and pulled because returning 0b10 on mismatch
+infinite-loops the dispatcher (no cycles charged → no scheduler
+events → no break-out). Phase 4P-B will pick a poison-on-mismatch
+path that breaks the loop (per-block poison flag OR session-wide
+AOT-disable per I19) and land it together with the actual inline
+cycle work.
+
+Behaviourally a no-op vs prior 19-fmt baseline. cargo build clean.
+gba-tests under --features cached_interp pass.
+
+---
+
+# Older entries below
+
 
 **Per-firing action while paused:** ONE 3-run scalar + 3-run AOT
 sweep=0 measurement appended to `results.tsv` as `holding-NNN`.

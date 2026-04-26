@@ -45,6 +45,14 @@ pub struct CpuOffsets {
     /// triggers AOT recompile).
     pub thumb_seq_cycles: [u32; 16],
     pub thumb_nonseq_cycles: [u32; 16],
+    /// Phase-4P-A: raw `*const u32` to the bus's WAITCNT gen counter.
+    /// Inline-cycle paths emit a prologue check that the live counter
+    /// matches `aot_gen_baked`; on mismatch, return 0b10 (yield to
+    /// scalar) so stale baked cycles don't cause divergence.
+    /// 0 = no gen check (legacy / disabled).
+    pub aot_gen_counter_ptr: u64,
+    /// Phase-4P-A: counter value captured at AOT compile time.
+    pub aot_gen_baked: u32,
 }
 
 /// Compiler handle. The `Context` is leaked to `'static` so the
