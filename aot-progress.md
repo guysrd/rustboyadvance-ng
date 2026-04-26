@@ -222,29 +222,47 @@ Hypotheses:
 - Consolidate IR emit patterns: e.g., F4 logical and F4 arith
   could share more code (cpsr update, gpr load/store).
 
-**Parallel agent swarm launched (2026-04-26 ~17:30):** 8 opus agents
-working in worktrees on the remaining formats:
-- F4 shifts (LSL/LSR/ASR/ROR by reg, 4 sub-ops, runtime amount)
-- F4 MUL debug (root-cause the 3 MK divs from commit 58e054b)
-- F9 LDR/STR imm5 (4 sub-cases, byte/word, runtime addr)
-- F10 LDRH/STRH imm5 (halfword)
-- F11 LDR sp-rel (needs I14 ROR via aot_ldr_word extern)
-- F7+F8 reg-offset memory ops (4+4 sub-cases)
-- F14 PUSH/POP (multi-register, AOT-time loop unroll per rlist)
-- F19_HI is already landed (commit e16f838).
+**Parallel agent swarm post-mortem (2026-04-26):** 8 opus agents
+launched in worktrees for F4 shifts, F4 MUL debug, F7+F8, F9, F10,
+F11 LDR, F14 PUSH/POP, F15 LDM/STM. Outcome:
+- **F4 shifts:** clean commit `54b0a8f` from agent → cherry-picked
+  to aot-apr25 as `540f3ad`. CFG-based amount-range dispatch;
+  4 sub-ops (LSL/LSR/ASR/ROR). 0 divs PE / 1 div MK ✓
+- **F11 LDR:** uncommitted in agent worktree but clean diff →
+  applied to aot-apr25 as `eb2d5cc`. Added `aot_ldr_word_for`
+  extern (handles I14 misaligned-LDR ROR + cpsr.C side effect).
+  0 divs PE / 1 div MK ✓
+- **F4 MUL debug:** killed mid-investigation; agent reported
+  "PE 0 divs, MK 1 div historical, fix is solid" in its summary
+  but I haven't validated that claim. Worktree was cleaned up
+  on agent termination (no commit produced).
+- **F7+F8:** ~700 lines of uncommitted IR work in agent worktree;
+  attempted 3-way merge produced 4-file conflicts because main
+  had advanced past the agent's base. Reverted; not in repo.
+- **F9, F10, F14, F15:** various failure modes (timeout, merge
+  conflicts when sibling agents stashed/popped each other's
+  work, branch-confusion). No clean commits.
 
-Each gets full briefing: program doc, current state, F1/F3 IR
-templates as reference, bus extern infrastructure, V1 gate criteria,
-commit style. They'll commit independently in their worktrees;
-merge back when they return.
+**Lesson learned:** worktree isolation didn't fully prevent
+agent-on-agent interference. Several agents stashed work in the
+SHARED git stash, switched to other agents' branches, and saw
+mid-write merge conflicts. Future swarms should either:
+1. Use disjoint files entirely (one format = one new file).
+2. Run sequentially, not in parallel.
+3. Use a different VCS isolation (rsync the repo per-agent rather
+   than worktree).
 
-**-O2 experiment in main checkout (this turn):** changed
-`OptimizationLevel::Aggressive` → `Default` in LlvmCompiler. -O3
-aggressive inlining/unrolling within JIT'd blocks bloats native
-code; -O2 typically gives 20-30% smaller code with similar perf.
-If MK regression is i-cache-pressure-driven (hypothesis from
-9-format -12.5% MK regression), -O2 should help. Measurement
-running x3 each on 8-format and 9-format stacks at sw=64KB.
+**-O2 experiment aborted:** measurements ran on a CPU shared with
+8 parallel agent cargo builds → catastrophic (-50% MK) numbers
+were CPU contention, not -O2's fault. Reverted to -O3; defer the
+test until a quiet system.
+
+**Phase-4-prime coverage now: 11 sub-formats inlined.**
+F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F6, F11_STR, F11_LDR,
+F12, F13, F19_HI. ~55-65% of dynamic Thumb opcodes covered.
+
+Still missing: F4 MUL (broken), F5 high-reg, F7+F8 reg-offset,
+F9 imm5-offset, F10 LDRH/STRH, F14 PUSH/POP, F15 LDM/STM.
 
 **Earlier 9 sub-formats inlined** (correctness, gated default-off):
 F1, F2, F3, F4_LOG, F4_ARITH, F6, F11_STR, F12, F13, F19_HI.
