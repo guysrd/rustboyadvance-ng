@@ -338,11 +338,72 @@ pub fn compile_rom_with_seeds_full(
         // Standard ARMv4 BIOS exception vectors:
         //   0x00 reset, 0x04 undef, 0x08 swi, 0x0C prefetch_abort,
         //   0x10 data_abort, 0x14 reserved, 0x18 irq, 0x1C fiq.
-        let bios_seeds: Vec<(u32, Mode)> = vec![
+        let mut bios_seeds: Vec<(u32, Mode)> = vec![
             (0x00000000, Mode::Arm),
             (0x00000008, Mode::Arm),
             (0x00000018, Mode::Arm),
         ];
+        // AOT_SWEEP_BIOS=1: sweep every aligned word in BIOS as a
+        // candidate ARM block (4096 entries). Without this only the
+        // exception-vector-reachable code is scanned which misses
+        // indirect-jumped helpers (e.g., MK's hot ARM at 0x1830-0x1880,
+        // reached via `LDR pc, [r0, ...]` — opaque to scan).
+        //
+        // Default OFF because empirically: at 54% MK coverage, AOT
+        // trampoline mode is ~0.9% slower than scalar (same overhead
+        // story as PE thumb at high coverage). The sweep is correct
+        // (0 divs preserved, drift within gate) but doesn't yet
+        // deliver fps gain in trampoline mode. Once ARM hot formats
+        // get inlined fast paths in aot_arm_step (mirror to thumb's
+        // 17 inlined formats), broader coverage should help.
+        let bios_sweep = std::env::var("AOT_SWEEP_BIOS").map(|v| v == "1").unwrap_or(false);
+        if bios_sweep {
+            let bios_arm_sweep_end = bios.len().min(0x4000);
+            let mut sw_off = 0u32;
+            while (sw_off as usize) + 3 < bios_arm_sweep_end {
+                bios_seeds.push((sw_off, Mode::Arm));
+                sw_off = sw_off.wrapping_add(4);
+            }
+        }
+        // Resolve LDR-pc-literal indirections at the exception vectors.
+        // Pattern: BIOS at 0x18 is typically `ldr pc, [pc, #-0x4]` which
+        // loads the real IRQ handler address from offset 0x1c. Same trick
+        // for 0x08 (swi) → 0x0c. Read the 32-bit literal and add as seed.
+        let read_u32 = |off: usize| -> Option<u32> {
+            if off + 4 > bios.len() {
+                return None;
+            }
+            Some(u32::from_le_bytes([bios[off], bios[off + 1], bios[off + 2], bios[off + 3]]))
+        };
+        for vec_addr in &[0x08u32, 0x18u32] {
+            // Decode the LDR pc instruction at vec_addr to find the
+            // literal pool offset. ldr pc, [pc, #imm] encoding:
+            //   bits 31:28 = cond (0xE = AL)
+            //   bits 27:20 = LDR encoding (varies)
+            //   bits 19:16 = Rn (=15 for pc-rel)
+            //   bits 15:12 = Rd (=15 for pc target)
+            //   bits 11:0 = imm12 offset
+            //   bit 23 = U (1=add, 0=subtract)
+            // We just check that the instruction looks like `ldr pc,
+            // [pc, ...]` and follow it.
+            if let Some(insn) = read_u32(*vec_addr as usize) {
+                // Match: cond=0xE, ldr (bits 27:20 ~ 0x59 or 0x51), Rn=15, Rd=15.
+                let rd = (insn >> 12) & 0xf;
+                let rn = (insn >> 16) & 0xf;
+                let is_ldr = (insn >> 26) & 0x3 == 0b01 && (insn >> 20) & 0x1 == 1;
+                if is_ldr && rn == 15 && rd == 15 {
+                    let imm12 = (insn & 0xfff) as i32;
+                    let u_bit = (insn >> 23) & 1;
+                    let offset = if u_bit == 1 { imm12 } else { -imm12 };
+                    // pc at this insn = vec_addr + 8 (ARM pipeline-head).
+                    let literal_addr = (*vec_addr as i32 + 8 + offset) as u32;
+                    if let Some(target) = read_u32(literal_addr as usize) {
+                        // Strip thumb-bit just in case (always arm here).
+                        bios_seeds.push((target & !1, Mode::Arm));
+                    }
+                }
+            }
+        }
         let bios_blocks = scan_rom(bios, 0x00000000, bios_seeds);
         let mut bios_emitted = 0usize;
         let mut bios_failed = 0usize;

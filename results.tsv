@@ -31,3 +31,4 @@ arm-emit-integration	-3	545.3	549.7	398.1	396.4	0	0	0	0.0	0	0	0	accept	phase 8 s
 arm-dispatch-wired	4	546.5	545.3	385.0	382.4	0	0	0	0.0	0	0	0	accept	phase 8 step 5+6: arm dispatch wired (try_aot_dispatch + sdl frontend); arm sweep gated AOT_SWEEP_ARM=1; mk sw=64kb still 1.16% cov (arm blocks emitted but not hit at runtime)
 arm-counters	-4	515.6	518.3	372.9	374.2	0	0	0	0.0	0	0	0	accept	phase 8 step 7: per-mode dispatch counters revealed mk arm-miss pcs are in BIOS region (0x00000000+)
 phase8-bios-scan	4	540.6	543.7	392.2	388.7	0	68	0	1.4	0	1	0	accept	phase 8 step 8: bios arm scan adds 6 blocks (irq vector etc); MK 392.2 vs scalar 388.7 = +0.9% (3-run median)
+phase8-bios-sweep-gated	-7	526.6	532.7	381.9	383.0	0	0	0	0.0	0	0	0	accept	phase 8 step 9: AOT_SWEEP_BIOS=1 covers 54% on MK but 0.9% slower than scalar; gated off pending arm fast paths
