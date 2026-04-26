@@ -89,19 +89,34 @@ estimate). Per-instr fps still trampoline-bound vs scalar 560 but
 the gradient is right — each inlined format peels another slice
 of dispatch off the extern boundary.
 
-**Next phase-4-prime step:** F13 AddSp (ADD/SUB SP, #imm7<<2).
-Encoding 10110000_S_IIIIIII; mask 0xff00 == 0xb000.  Even simpler
-than F12: only 2 cases (ADD/SUB), one source register (SP=gpr[13]),
-no flag updates.  Should be ~30 lines of IR.
+**F13 inline IR landed (commit 74ebec8):** F13 AddSp (ADD/SUB SP,
+#imm7<<2). 2 cases, no flag updates, no PipelineFlushed. 0 divs
+PE / 1 div MK at sw=64KB. fps stack now:
+  F1+F3:           458 fps PE per-instr
+  F1+F3+F12:       471 fps PE per-instr (+3%)
+  F1+F3+F12+F13:   470 fps PE per-instr (noise vs F12 stack)
 
-After F13: F2 AddSub (ADD/SUB Rd, Rs, Rn or imm3) with full
-arithmetic flag updates (carry/overflow). Then F4 ALU ops (16
-sub-ops) for max coverage. Then memory ops (F6, F9, F11) which
-need IO-region runtime checks per I3.
+Coverage now F1+F3+F12+F13 (~30% dynamic estimate). 4 formats
+inlined; ~8-12 still needed before per-instr crosses whole-block.
 
-Go format-by-format. Each addition is correctness-verifiable in
-isolation. Stack 8-12 formats and the trampoline boundary becomes
-rare enough that LLVM cross-format optimization can finally kick in.
+**Next phase-4-prime step:** F2 AddSub (ADD/SUB Rd, Rs, Rn or
+imm3). Encoding 00011_I_S_NNN_SSS_DDD. 4 cases (ADD/SUB × reg/imm).
+First format that needs full arithmetic flag updates (carry/overflow
+from add/sub). carry-add: result < op1 (unsigned overflow).
+carry-sub: !borrow = op1 >= op2. Overflow: signed-overflow detection
+via sign-bit comparison. Helpers in arm7tdmi/src/alu.rs::
+{alu_add_flags, alu_sub_flags} — port their bit logic to IR.
+
+After F2: F4 ALU ops (16 sub-ops) — most-executed Thumb format
+besides F3. Includes MUL with variable cycles via idle_cycle calls
+(might need a runtime extern call for the cycle counting; could
+stay in trampoline path initially).
+
+Then memory ops F6/F9/F11 with IO-region runtime checks per I3
+and I14 misaligned-word ROR for word LDR.
+
+Each addition is correctness-verifiable in isolation. Stacking
+continues until per-instr beats whole-block.
 
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
