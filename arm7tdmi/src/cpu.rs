@@ -150,6 +150,11 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     /// when AOT is enabled. Saves ~0.5ns per dispatch vs Option check.
     #[cfg(feature = "aot_dispatch")]
     pub aot_lookup_fn: fn(*const u8, u32) -> usize,
+    /// Phase-8 ARM-mode lookup. Dispatcher uses this when cpsr=ARM.
+    /// Defaults to the no-op stub (returns 0) so try_aot_dispatch can
+    /// call it unconditionally.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_lookup_fn_arm: fn(*const u8, u32) -> usize,
     /// Coverage counters for `aot_score = aot_hits / (aot_hits +
     /// scalar_hits)` reporting at replay end. Bumped from
     /// `step_block`'s top-of-iteration logic.
@@ -187,6 +192,7 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: aot_lookup_noop,
+            aot_lookup_fn_arm: aot_lookup_noop,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_hits: 0,
             #[cfg(feature = "aot_dispatch")]
@@ -219,6 +225,7 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: aot_lookup_noop,
+            aot_lookup_fn_arm: aot_lookup_noop,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_hits: 0,
             #[cfg(feature = "aot_dispatch")]
@@ -247,6 +254,17 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
     ) {
         self.aot_table = table;
         self.aot_lookup_fn = lookup_fn;
+    }
+
+    /// Phase-8: install ARM-mode AOT lookup hook. Called alongside
+    /// `install_aot_hook` (which sets the Thumb hook + table ptr).
+    /// The same `aot_table` is used by both lookups.
+    #[cfg(feature = "aot_dispatch")]
+    pub fn install_aot_hook_arm(
+        &mut self,
+        lookup_fn: fn(*const u8, u32) -> usize,
+    ) {
+        self.aot_lookup_fn_arm = lookup_fn;
     }
 
     /// AOT-side helper: per-iter Thumb step (fetch + pipeline shift +
@@ -993,18 +1011,13 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
     #[cfg(feature = "aot_dispatch")]
     #[inline]
     fn try_aot_dispatch(&mut self) -> Option<bool> {
-        // aot_lookup_fn is always non-Option (defaults to a no-op stub
-        // returning 0). When AOT is disabled, the no-op makes
-        // `fn_addr == 0` true and we early-out below — saving the
-        // Option discriminator branch on every dispatch.
-        let lookup = self.aot_lookup_fn;
-        // Phase 0 only emits Thumb blocks. Skip AOT lookup in ARM
-        // mode to avoid PC-key collisions (ARM 4-byte aligned pcs
-        // can match Thumb (entry_pc + 4) keys when entry_pc is
-        // 4-byte aligned).
-        if !matches!(self.cpsr.state(), CpuState::THUMB) {
-            return None;
-        }
+        // Phase-8: select Thumb or ARM lookup based on mode. Both
+        // default to the no-op stub (returns 0) so try_aot_dispatch
+        // can call unconditionally without an Option discriminator.
+        let lookup = match self.cpsr.state() {
+            CpuState::THUMB => self.aot_lookup_fn,
+            CpuState::ARM => self.aot_lookup_fn_arm,
+        };
         let fn_addr = lookup(self.aot_table, self.pc);
         if fn_addr == 0 {
             return None;
@@ -1065,6 +1078,7 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             aot_table: std::ptr::null(),
             #[cfg(feature = "aot_dispatch")]
             aot_lookup_fn: aot_lookup_noop,
+            aot_lookup_fn_arm: aot_lookup_noop,
             #[cfg(feature = "aot_dispatch")]
             aot_dispatch_hits: 0,
             #[cfg(feature = "aot_dispatch")]
@@ -1429,8 +1443,11 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 continue;
             }
             #[cfg(feature = "aot_dispatch")]
-            if self.aot_lookup_fn as *const () != aot_lookup_noop as *const () {
-                // Hook installed, lookup missed — count as scalar dispatch.
+            if self.aot_lookup_fn as *const () != aot_lookup_noop as *const ()
+                || self.aot_lookup_fn_arm as *const () != aot_lookup_noop as *const ()
+            {
+                // Hook installed (thumb or arm), lookup missed —
+                // count as scalar dispatch.
                 self.aot_dispatch_misses = self.aot_dispatch_misses.wrapping_add(1);
             }
 

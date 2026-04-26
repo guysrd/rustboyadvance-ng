@@ -41,6 +41,19 @@ fn aot_lookup_for_hook(table_ptr: *const u8, pc: u32) -> usize {
     }
 }
 
+/// Phase-8 ARM-mode lookup hook. Dispatcher selects between this and
+/// `aot_lookup_for_hook` based on cpu.cpsr.state() at dispatch time.
+fn aot_lookup_arm_for_hook(table_ptr: *const u8, pc: u32) -> usize {
+    if table_ptr.is_null() {
+        return 0;
+    }
+    let table = unsafe { &*(table_ptr as *const AotTable) };
+    match aot_lookup_arm(table, pc) {
+        Some(f) => f as usize,
+        None => 0,
+    }
+}
+
 /// Install an `AotTable` on the given CPU. Must be called BEFORE the
 /// first `step_block` (per I11). The CPU keeps a raw pointer to the
 /// table — caller is responsible for keeping the table alive (don't
@@ -49,9 +62,13 @@ fn aot_lookup_for_hook(table_ptr: *const u8, pc: u32) -> usize {
 /// Phase-0 scaffold note: this hands the table off as a raw pointer
 /// because arm7tdmi doesn't link inkwell. The table is a plain
 /// PC->fn map — no LLVM types in its public surface.
+///
+/// Phase-8: also installs the ARM lookup hook. Dispatcher uses
+/// thumb hook when cpsr=THUMB and arm hook when cpsr=ARM.
 pub fn enable_aot_on<I: MemoryInterface>(cpu: &mut Arm7tdmiCore<I>, table: &AotTable) {
     let table_ptr = table as *const AotTable as *const u8;
     cpu.install_aot_hook(table_ptr, aot_lookup_for_hook);
+    cpu.install_aot_hook_arm(aot_lookup_arm_for_hook);
 }
 
 /// Phase-0 entry point. Scan ROM, emit a placeholder block for each
@@ -197,12 +214,22 @@ pub fn compile_rom_with_seeds_full(
         .unwrap_or(0);
     let sweep_cap_bytes: usize = sweep_cap_kb * 1024;
     let sweep_end = rom.len().min(sweep_cap_bytes);
+    let arm_sweep = std::env::var("AOT_SWEEP_ARM").map(|v| v == "1").unwrap_or(false);
     if rom_base == 0x0800_0000 {
         // Skip the 0xC0-byte cartridge header.
         let mut off = 0xC0;
         while off + 1 < sweep_end {
             entries.push((rom_base.wrapping_add(off as u32), Mode::Thumb));
             off += 2;
+        }
+        if arm_sweep {
+            let mut arm_off = 0xC0;
+            // ARM is 4-byte aligned. Round up to next multiple of 4.
+            arm_off = (arm_off + 3) & !3;
+            while arm_off + 3 < sweep_end {
+                entries.push((rom_base.wrapping_add(arm_off as u32), Mode::Arm));
+                arm_off += 4;
+            }
         }
     } else {
         // BIOS sweep (16KB total).
@@ -212,7 +239,10 @@ pub fn compile_rom_with_seeds_full(
             off += 2;
         }
     }
-    eprintln!("AOT: queueing {} sweep entry candidates", entries.len());
+    eprintln!(
+        "AOT: queueing {} sweep entry candidates (arm sweep: {})",
+        entries.len(), arm_sweep,
+    );
 
     let blocks = scan_rom(rom, rom_base, entries);
     let mut compiler = match LlvmCompiler::new() {

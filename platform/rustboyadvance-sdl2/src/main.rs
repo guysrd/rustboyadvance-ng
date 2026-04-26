@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpu_offsets.thumb_seq_cycles[8],
                 cpu_offsets.thumb_nonseq_cycles[8],
             );
-            Box::new(arm7tdmi_aot::compile_rom_with_seeds_step_offsets(
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(
                 &rom_bytes,
                 0x0800_0000,
                 entry_pc,
@@ -229,15 +229,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(arm7tdmi_aot::replay::aot_block_should_abort_thumb_for::<SysBus>),
                 Some(cpu_offsets),
                 Some(arm7tdmi_aot::replay::aot_thumb_fetch_only_for::<SysBus>),
+                // Phase-8: enable ARM block compilation by passing the ARM
+                // whole-block trampoline. AOT scan picks up ARM specs from
+                // BIOS / cart entry / scan-from-thumb-BX traversal.
+                Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
             ))
         } else {
-            Box::new(arm7tdmi_aot::compile_rom_with_seeds(
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(
                 &rom_bytes,
                 0x0800_0000,
                 entry_pc,
                 arm7tdmi_aot::Mode::Arm,
                 &seeds,
                 arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
+                None,
+                None,
+                None,
+                None,
+                Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
             ))
         };
         eprintln!(
