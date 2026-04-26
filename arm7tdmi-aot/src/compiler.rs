@@ -222,6 +222,11 @@ impl LlvmCompiler {
         // trampoline path (separate cycle semantics).
         let f4_log_inline_env = std::env::var("AOT_INLINE_F4_LOG").map(|v| v == "1").unwrap_or(false);
         let f4_arith_inline_env = std::env::var("AOT_INLINE_F4_ARITH").map(|v| v == "1").unwrap_or(false);
+        // F4 shift sub-ops (LSL=2, LSR=3, ASR=4, ROR=7) — runtime amount
+        // (gpr[Rs] & 0xff), per-amount-range CFG to avoid LLVM poison
+        // from shift-by-32+. cycle accounting uses idle_cycle extern
+        // (NOT inline ts_ptr += 1 — see F4 MUL rejection commit 58e054b).
+        let f4_shift_inline_env = std::env::var("AOT_INLINE_F4_SHIFT").map(|v| v == "1").unwrap_or(false);
         let f6_inline_env = std::env::var("AOT_INLINE_F6").map(|v| v == "1").unwrap_or(false);
         // F11 split: STR-only this commit; LDR has misalignment ROR semantics
         // per I14 that needs separate IR work (or a ldr_word extern).
@@ -232,6 +237,7 @@ impl LlvmCompiler {
             || f3_inline_env
             || f4_log_inline_env
             || f4_arith_inline_env
+            || f4_shift_inline_env
             || f6_inline_env
             || f11_str_inline_env
             || f12_inline_env
@@ -254,13 +260,12 @@ impl LlvmCompiler {
         };
 
         // Phase-4 F6 helpers: bus.load_32 + idle_cycle externs.
-        // Registered when both fns are present AND F6 inline is enabled.
-        let (load_32_ref, idle_cycle_ref) = if f6_inline_env
-            && self.load_32_fn.is_some()
-            && self.idle_cycle_fn.is_some()
-        {
+        // load_32 is F6-only; idle_cycle is shared with F4 shifts (which
+        // also need a per-iter idle cycle, charged via the bus path
+        // exactly as F6 does). Per F4 MUL rejection (commit 58e054b),
+        // inline `*ts_ptr += 1` is suspect — bus extern is the safe path.
+        let load_32_ref = if f6_inline_env && self.load_32_fn.is_some() {
             let load_32_fn = self.load_32_fn.unwrap();
-            let idle_fn = self.idle_cycle_fn.unwrap();
             let i8_t_local = self.context.i8_type();
             let load_32_sig = i32_t.fn_type(
                 &[ptr_t.into(), i32_t.into(), i8_t_local.into()],
@@ -269,13 +274,21 @@ impl LlvmCompiler {
             let load_32_name = format!("rba_aot_load_32_{}", id);
             let l32_ref = module.add_function(&load_32_name, load_32_sig, None);
             self.engine.add_global_mapping(&l32_ref, load_32_fn as usize);
+            Some(l32_ref)
+        } else {
+            None
+        };
+        let idle_cycle_ref = if (f6_inline_env || f4_shift_inline_env)
+            && self.idle_cycle_fn.is_some()
+        {
+            let idle_fn = self.idle_cycle_fn.unwrap();
             let idle_sig = self.context.void_type().fn_type(&[ptr_t.into()], false);
             let idle_name = format!("rba_aot_idle_{}", id);
             let idle_ref = module.add_function(&idle_name, idle_sig, None);
             self.engine.add_global_mapping(&idle_ref, idle_fn as usize);
-            (Some(l32_ref), Some(idle_ref))
+            Some(idle_ref)
         } else {
-            (None, None)
+            None
         };
 
         // Phase-4 F11 STR helper: bus.store_32 extern.
@@ -647,6 +660,457 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f2_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F4 ALU shift sub-ops:
+            // LSL(2), LSR(3), ASR(4), ROR(7).
+            // Encoding: 010000_OOOO_SSS_DDD; mask 0xfc00 == 0x4000.
+            // Effects (mirrors arm7tdmi/src/cpu.rs F4 path + alu.rs
+            // shift_by_register / barrel_shift_op with immediate=false):
+            //   val    = gpr[Rd]
+            //   amount = gpr[Rs] & 0xff   (8-bit, runtime — can't fold)
+            //   carry  = old cpsr.C       (preserved when amount==0)
+            //   then bus.idle_cycle().
+            //   alu_update_flags(result, arithmetic=false, c=carry, v=old V):
+            //     N = (result < 0 signed); Z = (result == 0); C = carry; V preserved.
+            //   gpr[Rd] = result          (no setting-flags-no-writeback for shifts).
+            //   pc = fetch_addr + 2; nfa = Seq.
+            //
+            // Per-amount-range CFG (per sub-op) avoids LLVM poison from
+            // `shl/lshr/ashr i32, X` where X >= 32 (UB at LLVM level —
+            // `select` would propagate poison into the live result).
+            //
+            // LSL ranges (immediate=false):
+            //   amount==0   : result=val,         carry=old_C
+            //   1..=31      : result=val<<n,      carry=(val>>(32-n))&1
+            //   ==32        : result=0,           carry=val&1
+            //   >32         : result=0,           carry=0
+            //
+            // LSR ranges (immediate=false):
+            //   amount==0   : result=val,         carry=old_C
+            //   1..=31      : result=val>>n lgcl, carry=(val>>(n-1))&1
+            //   ==32        : result=0,           carry=val>>31
+            //   >32         : result=0,           carry=0
+            //
+            // ASR ranges (immediate=false):
+            //   amount==0   : result=val,         carry=old_C
+            //   1..=31      : result=val>>n arth, carry=(val>>(n-1))&1
+            //   >=32        : result=sext(val),   carry=val>>31
+            //
+            // ROR ranges (immediate=false, rrx=true):
+            //   amount==0   : result=val,         carry=old_C
+            //         (rrx not reached: rrx only fires when immediate=true)
+            //   amount>0    : m = amount % 32
+            //                  if m==0: result=val            carry=val>>31
+            //                  else   : result=rotate_right(val, m); carry=result>>31
+            let f4s_top6 = (opcode >> 10) & 0x3f;
+            let f4s_op = (opcode >> 6) & 0xf;
+            let f4_is_shift = matches!(f4s_op, 2 | 3 | 4 | 7);
+            if inline_enabled
+                && f4_shift_inline_env
+                && idle_cycle_ref.is_some()
+                && f4s_top6 == 0b010000
+                && f4_is_shift
+            {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let idle = idle_cycle_ref.unwrap();
+                let rs = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting (fetch) + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load val = gpr[Rd], amount_full = gpr[Rs], cpsr_old.
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f4s_rd_ptr").ok()?
+                };
+                let val = builder.build_load(i32_t, gpr_rd_ptr, "f4s_val").ok()?
+                    .into_int_value();
+
+                let gpr_rs_off = (off.gpr + rs * 4) as u64;
+                let gpr_rs_off_v = i32_t.const_int(gpr_rs_off, false);
+                let gpr_rs_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rs_off_v], "f4s_rs_ptr").ok()?
+                };
+                let amount_full = builder.build_load(i32_t, gpr_rs_ptr, "f4s_rs_val").ok()?
+                    .into_int_value();
+                // amount = amount_full & 0xff (per shift_by_register).
+                let amount = builder
+                    .build_and(amount_full, i32_t.const_int(0xff, false), "f4s_amount")
+                    .ok()?;
+
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f4s_cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f4s_cpsr_old").ok()?
+                    .into_int_value();
+                // c_old = (cpsr_old >> 29) & 1
+                let c_old_shift = builder
+                    .build_right_shift(cpsr_old, i32_t.const_int(29, false), false, "f4s_c_old_s")
+                    .ok()?;
+                let c_old = builder
+                    .build_and(c_old_shift, i32_t.const_int(1, false), "f4s_c_old")
+                    .ok()?;
+
+                let zero_i32 = i32_t.const_int(0, false);
+                let one_i32 = i32_t.const_int(1, false);
+
+                // Per-sub-op CFG. Each sub-op builds basic blocks and
+                // phi-merges (result, carry) into a join block before
+                // the shared writeback / cpsr / idle_cycle code.
+                let join_blk = self.context.append_basic_block(block_fn, "f4s_join");
+
+                let (result, carry_i32) = match f4s_op {
+                    2 => {
+                        // LSL by amount.
+                        // is_zero block:    result=val,    carry=c_old
+                        // is_lt32 block:    result=val<<n, carry=(val>>(32-n))&1
+                        // is_eq32 block:    result=0,      carry=val&1
+                        // is_gt32 block:    result=0,      carry=0
+                        let is_zero_blk = self.context.append_basic_block(block_fn, "f4s_lsl_z");
+                        let nz_blk = self.context.append_basic_block(block_fn, "f4s_lsl_nz");
+                        let is_lt32_blk = self.context.append_basic_block(block_fn, "f4s_lsl_lt");
+                        let ge32_blk = self.context.append_basic_block(block_fn, "f4s_lsl_ge");
+                        let is_eq32_blk = self.context.append_basic_block(block_fn, "f4s_lsl_eq");
+                        let is_gt32_blk = self.context.append_basic_block(block_fn, "f4s_lsl_gt");
+
+                        // amount == 0 ?
+                        let is_zero = builder
+                            .build_int_compare(IntPredicate::EQ, amount, zero_i32, "f4s_lsl_isz")
+                            .ok()?;
+                        builder.build_conditional_branch(is_zero, is_zero_blk, nz_blk).ok()?;
+
+                        // is_zero_blk: result = val, carry = c_old (only branch to join).
+                        builder.position_at_end(is_zero_blk);
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // nz_blk: amount < 32 ?
+                        builder.position_at_end(nz_blk);
+                        let is_lt32 = builder
+                            .build_int_compare(IntPredicate::ULT, amount, i32_t.const_int(32, false), "f4s_lsl_lt32")
+                            .ok()?;
+                        builder.build_conditional_branch(is_lt32, is_lt32_blk, ge32_blk).ok()?;
+
+                        // is_lt32_blk: result = val << amount; carry = (val >> (32 - amount)) & 1
+                        builder.position_at_end(is_lt32_blk);
+                        let lt_res = builder.build_left_shift(val, amount, "f4s_lsl_lt_res").ok()?;
+                        let neg_amount = builder
+                            .build_int_sub(i32_t.const_int(32, false), amount, "f4s_lsl_lt_neg")
+                            .ok()?;
+                        let cs = builder
+                            .build_right_shift(val, neg_amount, false, "f4s_lsl_lt_cs")
+                            .ok()?;
+                        let lt_carry = builder.build_and(cs, one_i32, "f4s_lsl_lt_c").ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // ge32_blk: amount == 32 ?
+                        builder.position_at_end(ge32_blk);
+                        let is_eq32 = builder
+                            .build_int_compare(IntPredicate::EQ, amount, i32_t.const_int(32, false), "f4s_lsl_eq32")
+                            .ok()?;
+                        builder.build_conditional_branch(is_eq32, is_eq32_blk, is_gt32_blk).ok()?;
+
+                        // is_eq32_blk: result = 0; carry = val & 1
+                        builder.position_at_end(is_eq32_blk);
+                        let eq_carry = builder.build_and(val, one_i32, "f4s_lsl_eq_c").ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // is_gt32_blk: result = 0; carry = 0
+                        builder.position_at_end(is_gt32_blk);
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // join: phi result, phi carry
+                        builder.position_at_end(join_blk);
+                        let res_phi = builder.build_phi(i32_t, "f4s_lsl_res").ok()?;
+                        res_phi.add_incoming(&[
+                            (&val, is_zero_blk),
+                            (&lt_res, is_lt32_blk),
+                            (&zero_i32, is_eq32_blk),
+                            (&zero_i32, is_gt32_blk),
+                        ]);
+                        let c_phi = builder.build_phi(i32_t, "f4s_lsl_c").ok()?;
+                        c_phi.add_incoming(&[
+                            (&c_old, is_zero_blk),
+                            (&lt_carry, is_lt32_blk),
+                            (&eq_carry, is_eq32_blk),
+                            (&zero_i32, is_gt32_blk),
+                        ]);
+                        (res_phi.as_basic_value().into_int_value(), c_phi.as_basic_value().into_int_value())
+                    }
+                    3 => {
+                        // LSR by amount (immediate=false).
+                        let is_zero_blk = self.context.append_basic_block(block_fn, "f4s_lsr_z");
+                        let nz_blk = self.context.append_basic_block(block_fn, "f4s_lsr_nz");
+                        let is_lt32_blk = self.context.append_basic_block(block_fn, "f4s_lsr_lt");
+                        let ge32_blk = self.context.append_basic_block(block_fn, "f4s_lsr_ge");
+                        let is_eq32_blk = self.context.append_basic_block(block_fn, "f4s_lsr_eq");
+                        let is_gt32_blk = self.context.append_basic_block(block_fn, "f4s_lsr_gt");
+
+                        let is_zero = builder
+                            .build_int_compare(IntPredicate::EQ, amount, zero_i32, "f4s_lsr_isz")
+                            .ok()?;
+                        builder.build_conditional_branch(is_zero, is_zero_blk, nz_blk).ok()?;
+
+                        builder.position_at_end(is_zero_blk);
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        builder.position_at_end(nz_blk);
+                        let is_lt32 = builder
+                            .build_int_compare(IntPredicate::ULT, amount, i32_t.const_int(32, false), "f4s_lsr_lt32")
+                            .ok()?;
+                        builder.build_conditional_branch(is_lt32, is_lt32_blk, ge32_blk).ok()?;
+
+                        // is_lt32_blk: result = val >> amount logical; carry = (val >> (amount-1)) & 1
+                        builder.position_at_end(is_lt32_blk);
+                        let lt_res = builder
+                            .build_right_shift(val, amount, false, "f4s_lsr_lt_res")
+                            .ok()?;
+                        let am_m1 = builder
+                            .build_int_sub(amount, one_i32, "f4s_lsr_lt_am1")
+                            .ok()?;
+                        let cs = builder
+                            .build_right_shift(val, am_m1, false, "f4s_lsr_lt_cs")
+                            .ok()?;
+                        let lt_carry = builder.build_and(cs, one_i32, "f4s_lsr_lt_c").ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        builder.position_at_end(ge32_blk);
+                        let is_eq32 = builder
+                            .build_int_compare(IntPredicate::EQ, amount, i32_t.const_int(32, false), "f4s_lsr_eq32")
+                            .ok()?;
+                        builder.build_conditional_branch(is_eq32, is_eq32_blk, is_gt32_blk).ok()?;
+
+                        // is_eq32_blk: result = 0; carry = val >> 31
+                        builder.position_at_end(is_eq32_blk);
+                        let eq_carry = builder
+                            .build_right_shift(val, i32_t.const_int(31, false), false, "f4s_lsr_eq_c")
+                            .ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // is_gt32_blk: result = 0; carry = 0
+                        builder.position_at_end(is_gt32_blk);
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        builder.position_at_end(join_blk);
+                        let res_phi = builder.build_phi(i32_t, "f4s_lsr_res").ok()?;
+                        res_phi.add_incoming(&[
+                            (&val, is_zero_blk),
+                            (&lt_res, is_lt32_blk),
+                            (&zero_i32, is_eq32_blk),
+                            (&zero_i32, is_gt32_blk),
+                        ]);
+                        let c_phi = builder.build_phi(i32_t, "f4s_lsr_c").ok()?;
+                        c_phi.add_incoming(&[
+                            (&c_old, is_zero_blk),
+                            (&lt_carry, is_lt32_blk),
+                            (&eq_carry, is_eq32_blk),
+                            (&zero_i32, is_gt32_blk),
+                        ]);
+                        (res_phi.as_basic_value().into_int_value(), c_phi.as_basic_value().into_int_value())
+                    }
+                    4 => {
+                        // ASR by amount (immediate=false).
+                        // amount==0: result=val,   carry=c_old
+                        // 1..=31:    result=ashr,  carry=(val>>(amount-1))&1
+                        // >=32:      result=sext,  carry=val>>31
+                        //   (sext: 0 or 0xFFFFFFFF — same as ashr 31)
+                        let is_zero_blk = self.context.append_basic_block(block_fn, "f4s_asr_z");
+                        let nz_blk = self.context.append_basic_block(block_fn, "f4s_asr_nz");
+                        let is_lt32_blk = self.context.append_basic_block(block_fn, "f4s_asr_lt");
+                        let is_ge32_blk = self.context.append_basic_block(block_fn, "f4s_asr_ge");
+
+                        let is_zero = builder
+                            .build_int_compare(IntPredicate::EQ, amount, zero_i32, "f4s_asr_isz")
+                            .ok()?;
+                        builder.build_conditional_branch(is_zero, is_zero_blk, nz_blk).ok()?;
+
+                        builder.position_at_end(is_zero_blk);
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        builder.position_at_end(nz_blk);
+                        let is_lt32 = builder
+                            .build_int_compare(IntPredicate::ULT, amount, i32_t.const_int(32, false), "f4s_asr_lt32")
+                            .ok()?;
+                        builder.build_conditional_branch(is_lt32, is_lt32_blk, is_ge32_blk).ok()?;
+
+                        // is_lt32_blk: result = val ashr amount; carry = (val >> (amount-1)) & 1
+                        builder.position_at_end(is_lt32_blk);
+                        let lt_res = builder
+                            .build_right_shift(val, amount, true, "f4s_asr_lt_res")
+                            .ok()?;
+                        let am_m1 = builder
+                            .build_int_sub(amount, one_i32, "f4s_asr_lt_am1")
+                            .ok()?;
+                        let cs = builder
+                            .build_right_shift(val, am_m1, false, "f4s_asr_lt_cs")
+                            .ok()?;
+                        let lt_carry = builder.build_and(cs, one_i32, "f4s_asr_lt_c").ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // is_ge32_blk: result = val ashr 31 (sign-extend); carry = val>>31 & 1
+                        builder.position_at_end(is_ge32_blk);
+                        let ge_res = builder
+                            .build_right_shift(val, i32_t.const_int(31, false), true, "f4s_asr_ge_res")
+                            .ok()?;
+                        let ge_c_shift = builder
+                            .build_right_shift(val, i32_t.const_int(31, false), false, "f4s_asr_ge_cs")
+                            .ok()?;
+                        let ge_carry = builder
+                            .build_and(ge_c_shift, one_i32, "f4s_asr_ge_c")
+                            .ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        builder.position_at_end(join_blk);
+                        let res_phi = builder.build_phi(i32_t, "f4s_asr_res").ok()?;
+                        res_phi.add_incoming(&[
+                            (&val, is_zero_blk),
+                            (&lt_res, is_lt32_blk),
+                            (&ge_res, is_ge32_blk),
+                        ]);
+                        let c_phi = builder.build_phi(i32_t, "f4s_asr_c").ok()?;
+                        c_phi.add_incoming(&[
+                            (&c_old, is_zero_blk),
+                            (&lt_carry, is_lt32_blk),
+                            (&ge_carry, is_ge32_blk),
+                        ]);
+                        (res_phi.as_basic_value().into_int_value(), c_phi.as_basic_value().into_int_value())
+                    }
+                    7 => {
+                        // ROR by amount (immediate=false, rrx=true). With
+                        // immediate=false the rrx path (amount==0 special-
+                        // case) is never reached: scalar's `match amount {
+                        // 0 => if immediate & rrx ... else val }`
+                        // resolves to `val` since immediate=false.
+                        // amount==0: result=val,                 carry=c_old
+                        // amount>0:  m = amount % 32
+                        //   m==0: result=val,                    carry=val>>31
+                        //   else: result=rotate_right(val, m),   carry=result>>31
+                        let is_zero_blk = self.context.append_basic_block(block_fn, "f4s_ror_z");
+                        let nz_blk = self.context.append_basic_block(block_fn, "f4s_ror_nz");
+                        let m_zero_blk = self.context.append_basic_block(block_fn, "f4s_ror_m0");
+                        let m_nz_blk = self.context.append_basic_block(block_fn, "f4s_ror_mnz");
+
+                        let is_zero = builder
+                            .build_int_compare(IntPredicate::EQ, amount, zero_i32, "f4s_ror_isz")
+                            .ok()?;
+                        builder.build_conditional_branch(is_zero, is_zero_blk, nz_blk).ok()?;
+
+                        builder.position_at_end(is_zero_blk);
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // nz_blk: m = amount & 0x1f  (mod 32). m==0 ?
+                        builder.position_at_end(nz_blk);
+                        let m = builder
+                            .build_and(amount, i32_t.const_int(0x1f, false), "f4s_ror_m")
+                            .ok()?;
+                        let m_is_zero = builder
+                            .build_int_compare(IntPredicate::EQ, m, zero_i32, "f4s_ror_misz")
+                            .ok()?;
+                        builder.build_conditional_branch(m_is_zero, m_zero_blk, m_nz_blk).ok()?;
+
+                        // m_zero_blk: result = val; carry = val >> 31 & 1
+                        builder.position_at_end(m_zero_blk);
+                        let m0_c_shift = builder
+                            .build_right_shift(val, i32_t.const_int(31, false), false, "f4s_ror_m0_cs")
+                            .ok()?;
+                        let m0_carry = builder
+                            .build_and(m0_c_shift, one_i32, "f4s_ror_m0_c")
+                            .ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        // m_nz_blk: result = (val >> m) | (val << (32 - m));
+                        //           carry  = result >> 31 & 1.
+                        // Both shifts have m in 1..=31 so neither poisons.
+                        builder.position_at_end(m_nz_blk);
+                        let lo = builder
+                            .build_right_shift(val, m, false, "f4s_ror_lo")
+                            .ok()?;
+                        let neg_m = builder
+                            .build_int_sub(i32_t.const_int(32, false), m, "f4s_ror_negm")
+                            .ok()?;
+                        let hi = builder
+                            .build_left_shift(val, neg_m, "f4s_ror_hi")
+                            .ok()?;
+                        let mnz_res = builder
+                            .build_or(lo, hi, "f4s_ror_mnz_res")
+                            .ok()?;
+                        let mnz_c_shift = builder
+                            .build_right_shift(mnz_res, i32_t.const_int(31, false), false, "f4s_ror_mnz_cs")
+                            .ok()?;
+                        let mnz_carry = builder
+                            .build_and(mnz_c_shift, one_i32, "f4s_ror_mnz_c")
+                            .ok()?;
+                        builder.build_unconditional_branch(join_blk).ok()?;
+
+                        builder.position_at_end(join_blk);
+                        let res_phi = builder.build_phi(i32_t, "f4s_ror_res").ok()?;
+                        res_phi.add_incoming(&[
+                            (&val, is_zero_blk),
+                            (&val, m_zero_blk),
+                            (&mnz_res, m_nz_blk),
+                        ]);
+                        let c_phi = builder.build_phi(i32_t, "f4s_ror_c").ok()?;
+                        c_phi.add_incoming(&[
+                            (&c_old, is_zero_blk),
+                            (&m0_carry, m_zero_blk),
+                            (&mnz_carry, m_nz_blk),
+                        ]);
+                        (res_phi.as_basic_value().into_int_value(), c_phi.as_basic_value().into_int_value())
+                    }
+                    _ => unreachable!(),
+                };
+
+                // bus.idle_cycle() — matches scalar's `self.idle_cycle()`.
+                builder.build_call(idle, &[cpu_ctx.into()], "f4s_idle").ok()?;
+
+                // gpr[Rd] = result. Always writeback (no setting-flags-no-writeback for shifts).
+                builder.build_store(gpr_rd_ptr, result).ok()?;
+
+                // cpsr: clear N|Z|C, preserve V; set N from result bit 31,
+                // Z from (result==0), C from carry. arithmetic=false → V untouched.
+                let nzc_clear = i32_t.const_int(0x1fff_ffff, false);
+                let cleared = builder.build_and(cpsr_old, nzc_clear, "f4s_cpsr_cl").ok()?;
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "f4s_n_bit")
+                    .ok()?;
+                let z_cmp = builder
+                    .build_int_compare(IntPredicate::EQ, result, zero_i32, "f4s_z_cmp")
+                    .ok()?;
+                let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f4s_z_ext").ok()?;
+                let z_bit = builder
+                    .build_left_shift(z_ext, i32_t.const_int(30, false), "f4s_z_bit")
+                    .ok()?;
+                let c_bit = builder
+                    .build_left_shift(carry_i32, i32_t.const_int(29, false), "f4s_c_bit")
+                    .ok()?;
+                let cpsr_n = builder.build_or(cleared, n_bit, "f4s_cpsr_n").ok()?;
+                let cpsr_nz = builder.build_or(cpsr_n, z_bit, "f4s_cpsr_nz").ok()?;
+                let cpsr_new = builder.build_or(cpsr_nz, c_bit, "f4s_cpsr_new").ok()?;
+                builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f4s_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f4s_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f4s_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
