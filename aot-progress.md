@@ -257,10 +257,17 @@ mid-write merge conflicts. Future swarms should either:
 were CPU contention, not -O2's fault. Reverted to -O3; defer the
 test until a quiet system.
 
-**Phase-4-prime coverage now: 17 sub-formats inlined.**
+**Phase-4-prime coverage now: 18 sub-formats inlined.**
 F1, F2, F3, F4_LOG, F4_ARITH, F4_SHIFT, F5, F6, F7, F8, F9, F10,
-F11_STR, F11_LDR, F12, F13, F14, F19_HI. ~92-97% of dynamic
+F11_STR, F11_LDR, F12, F13, F14, F15, F19_HI. ~95-99% of dynamic
 Thumb opcodes covered.
+
+**F15 LDM/STM landed (commit 800d09b, cherry-picked from agent
+worktree feb5762):** rlist unrolled at AOT compile time. Empty-rlist
+(rlist == 0) falls through to step trampoline (handles GBATEK
+quirk). LDM writeback only when Rb not in rlist. STM-with-Rb-in-
+rlist correctly handles the "first-iter-stores-init-addr" rule
+(the formula that broke the previous F15 attempt).
 
 **2 agents running in background (2026-04-26 ~final stretch):**
 - F4 MUL fix attempt (`a83c832d`): hypothesis is replace inline
@@ -302,7 +309,7 @@ MK 368.8 (was peak 384 at 6-format, was 337 at 9-format).
 F4 shifts + F11 LDR (now real) helped MK recover from the
 F11_STR-induced regression but still well below scalar 397.
 
-Still missing: F4 MUL (broken), F15 LDM/STM.
+Still missing: F4 MUL (broken — agent still investigating).
 
 **Earlier 9 sub-formats inlined** (correctness, gated default-off):
 F1, F2, F3, F4_LOG, F4_ARITH, F6, F11_STR, F12, F13, F19_HI.
