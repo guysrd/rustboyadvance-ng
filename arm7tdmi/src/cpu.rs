@@ -930,13 +930,6 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         // `fn_addr == 0` true and we early-out below — saving the
         // Option discriminator branch on every dispatch.
         let lookup = self.aot_lookup_fn;
-        // Cold-start guard (I15): skip AOT until scalar has fetched
-        // at least one instruction. This avoids dispatching into an
-        // AOT block whose first iter would re-fetch pipeline[0] at
-        // a stale pc.
-        if self.pipeline[0] == 0 {
-            return None;
-        }
         // Phase 0 only emits Thumb blocks. Skip AOT lookup in ARM
         // mode to avoid PC-key collisions (ARM 4-byte aligned pcs
         // can match Thumb (entry_pc + 4) keys when entry_pc is
@@ -946,6 +939,17 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         }
         let fn_addr = lookup(self.aot_table, self.pc);
         if fn_addr == 0 {
+            return None;
+        }
+        // Cold-start guard (I15): skip AOT until scalar has fetched
+        // at least one instruction. AT cold start cpu.pc=0 (BIOS reset
+        // vector) and BIOS isn't in the AOT table, so the lookup above
+        // returns 0 and we early-out before reaching here. This guard
+        // is only needed for save-state restores into AOT-keyed PCs
+        // (per I12) — but pipeline[0] is also restored from save-state
+        // so it's never 0 in practice. Keep guard for safety; it's
+        // out of the cold-start mainline path.
+        if self.pipeline[0] == 0 {
             return None;
         }
         let f: unsafe extern "C" fn(*mut u8, *mut u32) -> u32 =
