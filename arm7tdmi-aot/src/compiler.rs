@@ -106,6 +106,11 @@ pub struct LlvmCompiler {
     pub(crate) store_8_fn: Option<AotStore8Fn>,
     /// Phase-4 signed halfword load trampoline for F8 LDSH.
     pub(crate) ldr_sign_half_fn: Option<AotLdrSignHalfFn>,
+    /// Phase-4P-B block-exit pipeline-restore trampoline. Set when
+    /// AOT_BAKED_CYCLES path is wired by the SDL frontend; the per-
+    /// instr emit fn calls this once at block exit when the inline
+    /// path skipped per-opcode pipeline shifts.
+    pub(crate) pipeline_restore_thumb_fn: Option<crate::replay::AotPipelineRestoreFn>,
 }
 
 impl LlvmCompiler {
@@ -138,6 +143,7 @@ impl LlvmCompiler {
             load_8_fn: None,
             store_8_fn: None,
             ldr_sign_half_fn: None,
+            pipeline_restore_thumb_fn: None,
         })
     }
 
@@ -200,6 +206,16 @@ impl LlvmCompiler {
 
     pub fn register_ldr_sign_half(&mut self, f: AotLdrSignHalfFn) {
         self.ldr_sign_half_fn = Some(f);
+    }
+
+    /// Phase-4P-B: register the block-exit pipeline-restore trampoline.
+    /// Required for AOT_BAKED_CYCLES path; without it the IR falls
+    /// back to per-opcode fetch_only.
+    pub fn register_pipeline_restore_thumb(
+        &mut self,
+        f: crate::replay::AotPipelineRestoreFn,
+    ) {
+        self.pipeline_restore_thumb_fn = Some(f);
     }
 
     /// Register the per-I monomorphized phase-0 whole-block trampoline.
@@ -330,17 +346,177 @@ impl LlvmCompiler {
         let inline_enabled = self.cpu_offsets.is_some()
             && self.fetch_only_thumb_fn.is_some()
             && any_format_inline;
+        // Phase-4P-B: detect whether every opcode in this block matches
+        // a registered inline format. If true AND AOT_BAKED_CYCLES=1 AND
+        // pipeline_restore is registered, swap fo_ref to point at an
+        // in-module IR helper that does ONLY the cycle charge (no
+        // load_16, no pipeline shift). Block-exit pipeline_restore
+        // call replaces the cumulative pipeline shifts.
+        let baked_cycles_env = std::env::var("AOT_BAKED_CYCLES")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let block_fully_inline = if baked_cycles_env {
+            opcodes.iter().all(|&op| {
+                thumb_opcode_in_inline_path(
+                    op as u32,
+                    f1_inline_env, f2_inline_env, f3_inline_env,
+                    f4_log_inline_env, f4_arith_inline_env, f4_shift_inline_env, f4_mul_inline_env,
+                    f5_inline_env, f6_inline_env, f7_inline_env, f8_inline_env,
+                    f9_inline_env, f10_inline_env,
+                    f11_str_inline_env, f11_ldr_inline_env,
+                    f12_inline_env, f13_inline_env, f14_inline_env, f15_inline_env,
+                    f19hi_inline_env,
+                )
+            })
+        } else {
+            false
+        };
+        let baked_cycles_active = baked_cycles_env
+            && block_fully_inline
+            && self.pipeline_restore_thumb_fn.is_some()
+            && self.cpu_offsets.is_some();
+
         let (fetch_only_ref, offsets) = if inline_enabled {
-            let fetch_only_fn = self.fetch_only_thumb_fn.unwrap();
             let off = self.cpu_offsets.unwrap();
             let fo_sig = self.context.void_type()
                 .fn_type(&[ptr_t.into(), i32_t.into()], false);
-            let fo_name = format!("rba_aot_fetch_only_{}", id);
-            let fo_ref = module.add_function(&fo_name, fo_sig, None);
-            self.engine.add_global_mapping(&fo_ref, fetch_only_fn as usize);
-            (Some(fo_ref), Some(off))
+
+            let chosen_fo_ref = if baked_cycles_active {
+                // Build the baked-fetch helper IR fn in this module.
+                // Body: read nfa byte from cpu_ctx, look up cycles per
+                // page from baked seq/nonseq const arrays, add to
+                // *sched_ts_ptr. No load_16, no pipeline shift.
+                let bf_name = format!("rba_aot_baked_fetch_{}", id);
+                let bf_ref = module.add_function(&bf_name, fo_sig, None);
+                let bf_entry = self.context.append_basic_block(bf_ref, "entry");
+                let bf_b = self.context.create_builder();
+                bf_b.position_at_end(bf_entry);
+                let bf_cpu = bf_ref.get_nth_param(0).unwrap().into_pointer_value();
+                let bf_fa = bf_ref.get_nth_param(1).unwrap().into_int_value();
+                // page = (fa >> 24) & 0xf
+                let page_shift = bf_b
+                    .build_right_shift(bf_fa, i32_t.const_int(24, false), false, "ps")
+                    .ok()?;
+                let page = bf_b
+                    .build_and(page_shift, i32_t.const_int(0xf, false), "page")
+                    .ok()?;
+                // Read nfa byte (i8).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    bf_b.build_in_bounds_gep(i8_t, bf_cpu, &[nfa_off_v], "nfa_ptr").ok()?
+                };
+                let nfa_val = bf_b
+                    .build_load(i8_t, nfa_ptr, "nfa_val")
+                    .ok()?
+                    .into_int_value();
+                // Build per-page const arrays (i32 x 16) for seq + nonseq cycles.
+                let arr_t = i32_t.array_type(16);
+                let seq_vals: Vec<inkwell::values::IntValue> = (0..16)
+                    .map(|i| i32_t.const_int(off.thumb_seq_cycles[i] as u64, false))
+                    .collect();
+                let nonseq_vals: Vec<inkwell::values::IntValue> = (0..16)
+                    .map(|i| i32_t.const_int(off.thumb_nonseq_cycles[i] as u64, false))
+                    .collect();
+                let seq_const = i32_t.const_array(&seq_vals);
+                let nonseq_const = i32_t.const_array(&nonseq_vals);
+                let seq_global = module.add_global(
+                    arr_t,
+                    None,
+                    &format!("rba_seq_cycles_{}", id),
+                );
+                seq_global.set_initializer(&seq_const);
+                seq_global.set_constant(true);
+                let nonseq_global = module.add_global(
+                    arr_t,
+                    None,
+                    &format!("rba_nonseq_cycles_{}", id),
+                );
+                nonseq_global.set_initializer(&nonseq_const);
+                nonseq_global.set_constant(true);
+                // GEP into both arrays at index `page`, load both.
+                let zero_i32 = i32_t.const_int(0, false);
+                let seq_elem_ptr = unsafe {
+                    bf_b.build_in_bounds_gep(
+                        arr_t,
+                        seq_global.as_pointer_value(),
+                        &[zero_i32, page],
+                        "seq_elem",
+                    ).ok()?
+                };
+                let nonseq_elem_ptr = unsafe {
+                    bf_b.build_in_bounds_gep(
+                        arr_t,
+                        nonseq_global.as_pointer_value(),
+                        &[zero_i32, page],
+                        "nonseq_elem",
+                    ).ok()?
+                };
+                let k_seq = bf_b
+                    .build_load(i32_t, seq_elem_ptr, "k_seq")
+                    .ok()?
+                    .into_int_value();
+                let k_nonseq = bf_b
+                    .build_load(i32_t, nonseq_elem_ptr, "k_nonseq")
+                    .ok()?
+                    .into_int_value();
+                // is_seq = (nfa == 1)
+                let is_seq = bf_b
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        nfa_val,
+                        i8_t.const_int(1, false),
+                        "is_seq",
+                    )
+                    .ok()?;
+                let k_i32 = bf_b
+                    .build_select(is_seq, k_seq, k_nonseq, "k")
+                    .ok()?
+                    .into_int_value();
+                // *sched_ts_ptr += k (as i64)
+                let i64_t_local = self.context.i64_type();
+                let k_i64 = bf_b
+                    .build_int_z_extend(k_i32, i64_t_local, "k_i64")
+                    .ok()?;
+                let ts_ptr_const =
+                    i64_t_local.const_int(off.scheduler_timestamp_ptr, false);
+                let ts_ptr = bf_b
+                    .build_int_to_ptr(ts_ptr_const, ptr_t, "ts_ptr")
+                    .ok()?;
+                let ts_val = bf_b
+                    .build_load(i64_t_local, ts_ptr, "ts_val")
+                    .ok()?
+                    .into_int_value();
+                let new_ts = bf_b
+                    .build_int_add(ts_val, k_i64, "ts_new")
+                    .ok()?;
+                bf_b.build_store(ts_ptr, new_ts).ok()?;
+                bf_b.build_return(None).ok()?;
+                bf_ref
+            } else {
+                let fetch_only_fn = self.fetch_only_thumb_fn.unwrap();
+                let fo_name = format!("rba_aot_fetch_only_{}", id);
+                let fo_ref = module.add_function(&fo_name, fo_sig, None);
+                self.engine.add_global_mapping(&fo_ref, fetch_only_fn as usize);
+                fo_ref
+            };
+            (Some(chosen_fo_ref), Some(off))
         } else {
             (None, None)
+        };
+
+        // Phase-4P-B: register the pipeline_restore extern when baked
+        // path is active, so the for-loop can emit a single block-exit
+        // call to set pipeline[0]/[1] for the next block.
+        let pipe_restore_ref = if baked_cycles_active {
+            let pf = self.pipeline_restore_thumb_fn.unwrap();
+            let pr_sig = self.context.void_type()
+                .fn_type(&[ptr_t.into(), i32_t.into()], false);
+            let pr_name = format!("rba_aot_pipe_restore_{}", id);
+            let pr_ref = module.add_function(&pr_name, pr_sig, None);
+            self.engine.add_global_mapping(&pr_ref, pf as usize);
+            Some(pr_ref)
+        } else {
+            None
         };
 
         // Phase-4 F6 helpers: bus.load_32 + idle_cycle externs.
@@ -3298,6 +3474,30 @@ impl LlvmCompiler {
                 .ok()?;
             builder.position_at_end(cont_blk);
         }
+        // Phase-4P-B: emit one block-exit pipeline_restore call when
+        // the baked-cycle path is active. The per-opcode helper skipped
+        // pipeline shifts; we make the next block's pipeline correct
+        // here. exec_first = entry_pc + 2*N is the address of the next
+        // block's first opcode (= current cpu.pc - 4 since the last
+        // opcode's AdvancePC set pc = fetch_addr_{N-1} + 2 = entry_pc +
+        // 2*N + 4 = exec_first + 4).
+        // Only fires on the fall-through path; PipelineFlushed branches
+        // skip this (the dispatcher reload_pipeline16 at the new target
+        // overwrites whatever pipeline state we have).
+        if baked_cycles_active {
+            if let Some(pr) = pipe_restore_ref {
+                let exec_first =
+                    entry_pc.wrapping_add(2u32.wrapping_mul(opcodes.len() as u32));
+                let exec_first_v = i32_t.const_int(exec_first as u64, false);
+                builder
+                    .build_call(
+                        pr,
+                        &[cpu_ctx.into(), exec_first_v.into()],
+                        "",
+                    )
+                    .ok()?;
+            }
+        }
         // Fell through all opcodes — go to exit.
         builder.build_unconditional_branch(exit_blk).ok()?;
 
@@ -3557,6 +3757,67 @@ impl LlvmCompiler {
 
         Ok(start.elapsed().as_millis())
     }
+}
+
+/// Phase-4P-B: returns true when this Thumb opcode would be handled
+/// by an inline format in `emit_per_instr_thumb_block` given the
+/// current AOT_INLINE_F* env-var settings. Used to decide whether
+/// the whole block can use the baked-cycle fetch path: that requires
+/// EVERY mid-block opcode to be inline (so no step_thumb fallback
+/// runs and breaks the assumed-no-pipeline-shift contract).
+///
+/// Format dispatch order mirrors the if-chain in
+/// `emit_per_instr_thumb_block`'s for-loop body. Block terminators
+/// (F16 Bcc-taken, F17 SWI, F18 B, F19 lo) are handled by the AOT
+/// scan at block boundaries — they don't appear mid-block here.
+#[allow(clippy::too_many_arguments)]
+fn thumb_opcode_in_inline_path(
+    opcode: u32,
+    f1: bool, f2: bool, f3: bool,
+    f4_log: bool, f4_arith: bool, f4_shift: bool, f4_mul: bool,
+    f5: bool, f6: bool, f7: bool, f8: bool,
+    f9: bool, f10: bool,
+    f11_str: bool, f11_ldr: bool,
+    f12: bool, f13: bool, f14: bool, f15: bool,
+    f19hi: bool,
+) -> bool {
+    let op = opcode as u16;
+    let top3 = (op >> 13) & 0x7;
+    let top4 = (op >> 12) & 0xf;
+    let top5 = (op >> 11) & 0x1f;
+    let top6 = (op >> 10) & 0x3f;
+    let top8 = (op >> 8) & 0xff;
+
+    if f1 && top3 == 0b000 && ((op >> 11) & 0x3) != 0b11 { return true; }
+    if f2 && top5 == 0b00011 { return true; }
+    if f3 && top3 == 0b001 { return true; }
+    if top6 == 0b010000 {
+        let f4_op = (op >> 6) & 0xf;
+        let log = matches!(f4_op, 0b0000 | 0b0001 | 0b1000 | 0b1100 | 0b1110 | 0b1111);
+        let arith = matches!(f4_op, 0b0101 | 0b0110 | 0b1001 | 0b1010 | 0b1011);
+        let shift = matches!(f4_op, 0b0010 | 0b0011 | 0b0100 | 0b0111);
+        let mul = f4_op == 0b1101;
+        if (log && f4_log) || (arith && f4_arith) || (shift && f4_shift) || (mul && f4_mul) {
+            return true;
+        }
+    }
+    if f5 && top6 == 0b010001 { return true; }
+    if f6 && top5 == 0b01001 { return true; }
+    if f7 && top4 == 0b0101 && ((op >> 9) & 1) == 0 { return true; }
+    if f8 && top4 == 0b0101 && ((op >> 9) & 1) == 1 { return true; }
+    if f9 && top3 == 0b011 { return true; }
+    if f10 && top4 == 0b1000 { return true; }
+    if top4 == 0b1001 {
+        let l = (op >> 11) & 1;
+        if l == 0 && f11_str { return true; }
+        if l == 1 && f11_ldr { return true; }
+    }
+    if f12 && top4 == 0b1010 { return true; }
+    if f13 && top8 == 0b10110000 { return true; }
+    if f14 && top4 == 0b1011 && ((op >> 9) & 0x3) == 0b10 { return true; }
+    if f15 && top4 == 0b1100 { return true; }
+    if f19hi && top5 == 0b11110 { return true; }
+    false
 }
 
 #[cfg(test)]

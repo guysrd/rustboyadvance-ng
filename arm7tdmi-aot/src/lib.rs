@@ -345,6 +345,74 @@ pub fn compile_rom_with_seeds_full_v6(
     )
 }
 
+/// Phase-4P-B v8: like v7 but also accepts a pipeline_restore_thumb
+/// extern. When AOT_BAKED_CYCLES=1 + cpu_offsets has a non-null gen
+/// counter pointer + every opcode in a block matches an inline format,
+/// the compiler builds an in-module IR helper that does cycle-only
+/// fetch (no load_16, no pipeline shift) and emits a single
+/// pipeline_restore call at block exit. Gen-check on the AotTable
+/// (set via cpu_offsets.aot_gen_counter_ptr) auto-disables AOT for
+/// the rest of the session if WAITCNT changes — correctness-first
+/// stop-gap.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_rom_with_seeds_full_v8(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+    cpu_offsets: Option<CpuOffsets>,
+    fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
+    replay_arm_fn: Option<replay::AotReplayFn>,
+    bios_bytes: Option<&[u8]>,
+    load_32_fn: Option<replay::AotLoad32Fn>,
+    idle_cycle_fn: Option<replay::AotIdleCycleFn>,
+    store_32_fn: Option<replay::AotStore32Fn>,
+    ldr_word_fn: Option<replay::AotLdrWordFn>,
+    ldr_half_fn: Option<replay::AotLdrHalfFn>,
+    store_16_fn: Option<replay::AotStore16Fn>,
+    load_8_fn: Option<replay::AotLoad8Fn>,
+    store_8_fn: Option<replay::AotStore8Fn>,
+    ldr_sign_half_fn: Option<replay::AotLdrSignHalfFn>,
+    pipeline_restore_thumb_fn: Option<replay::AotPipelineRestoreFn>,
+) -> AotTable {
+    let mut table = compile_rom_with_seeds_full_v7_with_pr(
+        rom, rom_base, entry_pc, entry_mode, seeds,
+        replay_thumb_fn, step_thumb_fn, abort_thumb_fn,
+        cpu_offsets, fetch_only_thumb_fn, replay_arm_fn, bios_bytes,
+        load_32_fn, idle_cycle_fn, store_32_fn, ldr_word_fn,
+        ldr_half_fn, store_16_fn, load_8_fn, store_8_fn, ldr_sign_half_fn,
+        pipeline_restore_thumb_fn,
+    );
+    // Phase-4P-B: if AOT_BAKED_CYCLES is on AND the cpu_offsets has a
+    // valid gen counter pointer, install gen-check on the table so the
+    // baked-cycle blocks auto-disable on WAITCNT change. We gate on
+    // the env var (not just ptr-non-null) because gen-check is a
+    // pessimistic lookup-disable that hurts the baseline (non-baked)
+    // path — only use it when baked cycles are actually live.
+    let baked_cycles_env = std::env::var("AOT_BAKED_CYCLES")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if baked_cycles_env && pipeline_restore_thumb_fn.is_some() {
+        if let Some(off) = cpu_offsets {
+            if off.aot_gen_counter_ptr != 0 {
+                table.set_gen_check(
+                    off.aot_gen_counter_ptr as *const u32,
+                    off.aot_gen_baked,
+                );
+                eprintln!(
+                    "AOT: gen-check enabled (baked={}, ptr=0x{:x})",
+                    off.aot_gen_baked, off.aot_gen_counter_ptr,
+                );
+            }
+        }
+    }
+    table
+}
+
 /// Phase-4 v7: also accepts ldr_sign_half trampoline for F8 LDSH.
 pub fn compile_rom_with_seeds_full_v7(
     rom: &[u8],
@@ -368,6 +436,44 @@ pub fn compile_rom_with_seeds_full_v7(
     load_8_fn: Option<replay::AotLoad8Fn>,
     store_8_fn: Option<replay::AotStore8Fn>,
     ldr_sign_half_fn: Option<replay::AotLdrSignHalfFn>,
+) -> AotTable {
+    compile_rom_with_seeds_full_v7_with_pr(
+        rom, rom_base, entry_pc, entry_mode, seeds,
+        replay_thumb_fn, step_thumb_fn, abort_thumb_fn,
+        cpu_offsets, fetch_only_thumb_fn, replay_arm_fn, bios_bytes,
+        load_32_fn, idle_cycle_fn, store_32_fn, ldr_word_fn,
+        ldr_half_fn, store_16_fn, load_8_fn, store_8_fn, ldr_sign_half_fn,
+        None,
+    )
+}
+
+/// Phase-4P-B inner: v7 body extended with optional pipeline_restore.
+/// v7 wraps this with None; v8 wraps this with Some + adds gen-check
+/// install on the returned table.
+#[allow(clippy::too_many_arguments)]
+fn compile_rom_with_seeds_full_v7_with_pr(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+    cpu_offsets: Option<CpuOffsets>,
+    fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
+    replay_arm_fn: Option<replay::AotReplayFn>,
+    bios_bytes: Option<&[u8]>,
+    load_32_fn: Option<replay::AotLoad32Fn>,
+    idle_cycle_fn: Option<replay::AotIdleCycleFn>,
+    store_32_fn: Option<replay::AotStore32Fn>,
+    ldr_word_fn: Option<replay::AotLdrWordFn>,
+    ldr_half_fn: Option<replay::AotLdrHalfFn>,
+    store_16_fn: Option<replay::AotStore16Fn>,
+    load_8_fn: Option<replay::AotLoad8Fn>,
+    store_8_fn: Option<replay::AotStore8Fn>,
+    ldr_sign_half_fn: Option<replay::AotLdrSignHalfFn>,
+    pipeline_restore_thumb_fn: Option<replay::AotPipelineRestoreFn>,
 ) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
@@ -481,6 +587,9 @@ pub fn compile_rom_with_seeds_full_v7(
     }
     if let Some(lsh) = ldr_sign_half_fn {
         compiler.register_ldr_sign_half(lsh);
+    }
+    if let Some(pr) = pipeline_restore_thumb_fn {
+        compiler.register_pipeline_restore_thumb(pr);
     }
     if let Some(arm) = replay_arm_fn {
         compiler.register_replay_arm(arm);

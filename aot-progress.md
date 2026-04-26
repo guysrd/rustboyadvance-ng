@@ -38,13 +38,72 @@ Data-only infrastructure for upcoming inline-cycle work:
 No IR emission yet. The naive "load gen, cmp baked, br ok else abort"
 shape was tried and pulled because returning 0b10 on mismatch
 infinite-loops the dispatcher (no cycles charged → no scheduler
-events → no break-out). Phase 4P-B will pick a poison-on-mismatch
-path that breaks the loop (per-block poison flag OR session-wide
-AOT-disable per I19) and land it together with the actual inline
-cycle work.
+events → no break-out). Phase 4P-B picks a different design (lookup-
+side gen-check, see below).
 
 Behaviourally a no-op vs prior 19-fmt baseline. cargo build clean.
 gba-tests under --features cached_interp pass.
+
+## 2026-04-26 phase-4P-B inline cycles + gen-check + pipeline restore
+
+Replaces the per-opcode `aot_thumb_fetch_only` extern call with an
+in-module IR helper (`rba_aot_baked_fetch_<id>`) that does ONLY the
+cycle charge — no load_16, no pipeline shift. -O3 inlines this
+across all 20 call sites in the same block. Pipeline correctness for
+the next block handled by ONE block-exit `aot_thumb_pipeline_restore`
+extern call.
+
+**Activation:** AOT_BAKED_CYCLES=1 + AOT_USE_PER_INSTR=1 + every
+opcode in the block matches a registered AOT_INLINE_F* format.
+Mixed blocks (where some opcode would fall through to step_thumb)
+keep the original fetch_only path because step_thumb expects pipeline
+state to be live.
+
+**Correctness story:** WAITCNT writes change cycle_luts at runtime,
+making baked cycles stale. AotTable.aot_gen_counter_ptr is set by
+the SDL frontend to point at SysBus.aot_gen_counter; lookup
+short-circuits to None when the live counter doesn't match
+aot_gen_baked. After a WAITCNT change, AOT auto-disables for the
+session (correct, just slower). The naive prologue-check approach
+infinite-looped the dispatcher; this lookup-side gating doesn't
+because it makes the table read empty rather than returning 0b10.
+
+**Files:**
+- arm7tdmi-aot/src/table.rs: AotTable gains aot_gen_counter_ptr +
+  aot_gen_baked + set_gen_check(). aot_lookup{,_arm} read live counter
+  via the ptr, return None on mismatch.
+- arm7tdmi-aot/src/replay.rs: AotPipelineRestoreFn type +
+  aot_thumb_pipeline_restore_for<I> extern.
+- arm7tdmi/src/cpu.rs: aot_thumb_pipeline_restore method (loads two
+  half-words at exec_first / exec_first+2, sets pipeline[0]/[1]).
+- arm7tdmi-aot/src/compiler.rs: adds register_pipeline_restore_thumb,
+  baked_cycles_active per-block detection (uses
+  thumb_opcode_in_inline_path helper), conditional swap of `fo` to
+  the in-module baked-fetch helper, block-exit pipeline_restore call.
+- arm7tdmi-aot/src/lib.rs: compile_rom_with_seeds_full_v8 (wraps v7
+  with pipeline_restore + auto-installs gen-check on table).
+- platform/rustboyadvance-sdl2/src/main.rs: switches to v8, passes
+  the pipeline_restore extern.
+
+**Build status:** cargo build --release --workspace --features aot
+clean. gba-tests under cached_interp 5/5 pass.
+
+**Divs verification BLOCKED:** /tmp/.rec recordings for PE/MK + the
+scalar reference hash files were cleaned up between bench runs and
+this firing's verify run. Can't run V1 fb-hash diff gate until they
+get regenerated. The new code path is env-gated default-off, so the
+existing 19-fmt baseline (no AOT_BAKED_CYCLES) is byte-identical to
+before — risk is bounded to the AOT_BAKED_CYCLES=1 path which is
+opt-in.
+
+**Hypothesis to validate next firing (once recordings exist):**
+- 19-fmt + AOT_BAKED_CYCLES=1 fps > 19-fmt baseline by 5-15% PE
+  (savings: 32 extern boundaries per block → 1 extern call per block
+  for pipeline_restore + ~3 host instructions per opcode for the
+  inlined cycle add).
+- Divs: 0 PE / 1 MK historical (gen-check disables AOT post-WAITCNT-
+  change, scalar handles those frames; pre-WAITCNT, baked cycles
+  match scalar's LUT-from-construction values).
 
 ---
 

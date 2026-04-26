@@ -70,7 +70,21 @@ pub struct AotTable {
     pub(crate) compiled_count: usize,
     /// Phase-8 ARM-compiled-block count.
     pub(crate) arm_compiled_count: usize,
+    /// Phase-4P-B: WAITCNT generation counter pointer. Set by SDL
+    /// frontend (or other host) when enabling baked-cycle paths. Lookup
+    /// reads this pointer at every dispatch and short-circuits to None
+    /// (auto-disable AOT) when the live counter doesn't match
+    /// `aot_gen_baked`. `null` = no gen check (legacy / disabled).
+    pub(crate) aot_gen_counter_ptr: *const u32,
+    /// Phase-4P-B: counter value captured at AOT compile time.
+    pub(crate) aot_gen_baked: u32,
 }
+
+// SAFETY: AotTable is owned by the bus side per I12; the
+// `aot_gen_counter_ptr` points into the SAME bus's SysBus struct so
+// they share lifetime. No threads cross.
+unsafe impl Send for AotTable {}
+unsafe impl Sync for AotTable {}
 
 impl AotTable {
     pub fn new() -> Self {
@@ -84,7 +98,19 @@ impl AotTable {
             arm_opcode_arena: Vec::new(),
             compiled_count: 0,
             arm_compiled_count: 0,
+            aot_gen_counter_ptr: std::ptr::null(),
+            aot_gen_baked: 0,
         }
+    }
+
+    /// Phase-4P-B: install gen-check pointer + baked value. Caller is
+    /// the SDL frontend (or other host) — pointer must outlive the
+    /// table; baked is captured at AOT compile time. After this call,
+    /// `aot_lookup` will return None whenever the live counter doesn't
+    /// match — auto-disabling AOT for stale-WAITCNT blocks.
+    pub fn set_gen_check(&mut self, gen_ptr: *const u32, baked: u32) {
+        self.aot_gen_counter_ptr = gen_ptr;
+        self.aot_gen_baked = baked;
     }
 
     /// Insert a compiled fn for entry-PC `pc`. Thumb / ARM mode
@@ -163,6 +189,16 @@ impl Default for AotTable {
 /// inner loop. Don't add nontrivial logic here — every cycle counts.
 #[inline(always)]
 pub fn aot_lookup(table: &AotTable, pc: u32) -> Option<CompiledFn> {
+    // Phase-4P-B: optional WAITCNT gen check. If a counter pointer is
+    // installed and the live value diverged from the baked value, the
+    // entire AOT table reads as empty — dispatcher falls through to
+    // scalar (correct, just slower). Pointer-null = no check (legacy).
+    if !table.aot_gen_counter_ptr.is_null() {
+        let live = unsafe { *table.aot_gen_counter_ptr };
+        if live != table.aot_gen_baked {
+            return None;
+        }
+    }
     let top = (pc >> 16) as usize;
     // SAFETY: top fits in 16 bits, pages.len() == 65536, so the index
     // is always in bounds. Use get_unchecked to drop the bounds check
@@ -178,6 +214,12 @@ pub fn aot_lookup(table: &AotTable, pc: u32) -> Option<CompiledFn> {
 /// Thumb blocks at the same pc.
 #[inline(always)]
 pub fn aot_lookup_arm(table: &AotTable, pc: u32) -> Option<CompiledFn> {
+    if !table.aot_gen_counter_ptr.is_null() {
+        let live = unsafe { *table.aot_gen_counter_ptr };
+        if live != table.aot_gen_baked {
+            return None;
+        }
+    }
     let top = (pc >> 16) as usize;
     let page = unsafe { table.arm_pages.get_unchecked(top) };
     let leaf = page.as_ref()?;

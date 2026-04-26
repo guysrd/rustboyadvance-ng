@@ -932,6 +932,30 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.pipeline[1] = val as u32;
     }
 
+    /// Phase-4P-B: block-exit pipeline restore. Used by the IR when a
+    /// fully-inline AOT block has skipped per-opcode fetch_only (cycle
+    /// accounting handled inline via baked thumb_seq_cycles). At block
+    /// exit we still need pipeline[0]/[1] to hold the opcodes the next
+    /// block expects to find there.
+    ///
+    /// `exec_first` is the exec_addr of the NEXT block's first opcode.
+    /// Loads opcode at `exec_first` → pipeline[0]; opcode at
+    /// `exec_first + 2` → pipeline[1]. Charges Seq fetch cycles for
+    /// both reads via the bus path (matches scalar's per-iter behavior
+    /// when crossing into a new block). next_fetch_access is left
+    /// at whatever the last inlined opcode set it to.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_thumb_pipeline_restore(&mut self, exec_first: u32) {
+        let access = self.next_fetch_access;
+        let p0 = self.load_16(exec_first, access);
+        self.pipeline[0] = p0 as u32;
+        let p1 = self.load_16(exec_first.wrapping_add(2), MemoryAccess::Seq);
+        self.pipeline[1] = p1 as u32;
+        // pc convention: caller IR has set self.pc = exec_first + 4
+        // (pipeline-head pc) before returning. Don't touch pc here.
+    }
+
     /// AOT-side helper: word-sized LDR with I14 misaligned-LDR ROR
     /// semantics. Used by F11 LDR sp-rel inline IR (and future F9 LDR
     /// word) which has a runtime-computed address — unlike F6 where

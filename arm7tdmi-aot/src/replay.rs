@@ -71,6 +71,30 @@ pub unsafe extern "C" fn aot_thumb_fetch_only_for<I: MemoryInterface>(
     cpu.aot_thumb_fetch_only(fetch_addr);
 }
 
+/// Phase-4P-B: block-exit pipeline restore. Called once at the end of
+/// a fully-inline AOT block to set pipeline[0]/pipeline[1] to the
+/// opcodes the next block expects to find there. `exec_first` is the
+/// exec_addr of the NEXT block's first opcode (= entry_pc + 2*N for a
+/// block of length N starting at entry_pc).
+///
+/// Replaces the per-opcode pipeline shift that fetch_only does. Cycle
+/// accounting for the inlined opcodes is handled by direct
+/// `*sched_ts += K` stores in IR (per the WAITCNT-stale gate via
+/// AotTable.aot_gen_counter_ptr). This helper handles ONLY the
+/// pipeline state for the next block.
+pub type AotPipelineRestoreFn = unsafe extern "C" fn(
+    cpu_ctx: *mut u8,
+    exec_first: u32,
+);
+
+pub unsafe extern "C" fn aot_thumb_pipeline_restore_for<I: MemoryInterface>(
+    cpu_ctx: *mut u8,
+    exec_first: u32,
+) {
+    let cpu = unsafe { &mut *(cpu_ctx as *mut Arm7tdmiCore<I>) };
+    cpu.aot_thumb_pipeline_restore(exec_first);
+}
+
 /// Phase-4 helper: bus-side aligned word load with cycle accounting.
 /// Used by F6 LDR pc-rel inline IR (and future F9/F11 paths).
 /// `addr` MUST be 4-byte aligned (caller guarantees per F6 semantics
