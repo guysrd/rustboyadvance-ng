@@ -18,6 +18,16 @@ findings doc: (A) commit to multi-day phase-4-prime IR-emit grind,
 correctness only, AOT off by default. Recommendation: Option A
 when a sustained work block is available; pause cron otherwise.
 
+**Per-firing action while paused:** ONE 3-run scalar + 3-run AOT
+sweep=0 measurement appended to `results.tsv` as `holding-NNN`.
+Don't make code changes. Don't try perf experiments. The point of
+these data points is to detect any host-system changes (compiler
+upgrades, kernel updates, hardware swaps) that would invalidate
+the ship-state characterization in findings-ladder.md. If a holding
+firing's gap drifts beyond +/- 3% from the documented baseline
+(PE scalar=560, AOT sw=0=553; MK scalar=398, AOT sw=0=388), append
+a note to findings-ladder.md and ping the operator.
+
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
 Rust-level fast paths in `aot_thumb_step`. Per-instr LLVM emit
