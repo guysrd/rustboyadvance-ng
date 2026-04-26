@@ -159,7 +159,7 @@ pub fn compile_rom_with_seeds_step_offsets(
     compile_rom_with_seeds_full(
         rom, rom_base, entry_pc, entry_mode, seeds,
         replay_thumb_fn, step_thumb_fn, abort_thumb_fn,
-        cpu_offsets, fetch_only_thumb_fn, None,
+        cpu_offsets, fetch_only_thumb_fn, None, None,
     )
 }
 
@@ -167,6 +167,12 @@ pub fn compile_rom_with_seeds_step_offsets(
 /// When `replay_arm_fn` is Some, ARM specs are emitted via
 /// `emit_placeholder_arm_block` and inserted into the AotTable's ARM
 /// page lookup. When None, ARM specs are skipped (phase-1 behavior).
+///
+/// `bios_bytes`: optional BIOS bytes (16KB). When provided AND
+/// `replay_arm_fn` is Some, also scans BIOS from entry points
+/// (reset=0, swi=0x8, irq=0x18) and emits those ARM blocks. MK
+/// runs ~59% of dispatches in ARM mode and most of that is BIOS
+/// IRQ handler code, so BIOS scan is required for MK fps gain.
 pub fn compile_rom_with_seeds_full(
     rom: &[u8],
     rom_base: u32,
@@ -179,6 +185,7 @@ pub fn compile_rom_with_seeds_full(
     cpu_offsets: Option<CpuOffsets>,
     fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
     replay_arm_fn: Option<replay::AotReplayFn>,
+    bios_bytes: Option<&[u8]>,
 ) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
@@ -321,6 +328,49 @@ pub fn compile_rom_with_seeds_full(
         "AOT: scanned {} blocks; emitted {} thumb, {} arm, skipped {} arm-no-trampoline, {} failed",
         blocks.len(), emitted, arm_emitted, skipped_arm, emit_failed
     );
+
+    // Phase-8: also scan BIOS for ARM blocks (when replay_arm_fn +
+    // bios_bytes are provided). MK runs ~59% of dispatches in ARM
+    // mode and most of that is in the BIOS IRQ handler / code paths.
+    // Cart-only scan misses these.
+    if arm_enabled && bios_bytes.is_some() {
+        let bios = bios_bytes.unwrap();
+        // Standard ARMv4 BIOS exception vectors:
+        //   0x00 reset, 0x04 undef, 0x08 swi, 0x0C prefetch_abort,
+        //   0x10 data_abort, 0x14 reserved, 0x18 irq, 0x1C fiq.
+        let bios_seeds: Vec<(u32, Mode)> = vec![
+            (0x00000000, Mode::Arm),
+            (0x00000008, Mode::Arm),
+            (0x00000018, Mode::Arm),
+        ];
+        let bios_blocks = scan_rom(bios, 0x00000000, bios_seeds);
+        let mut bios_emitted = 0usize;
+        let mut bios_failed = 0usize;
+        for spec in &bios_blocks {
+            if spec.mode != Mode::Arm {
+                // BIOS scan from arm vectors should only produce arm
+                // blocks unless code BX'es to thumb. skip those.
+                continue;
+            }
+            let opcodes_ptr = table.intern_arm_opcodes(&spec.opcodes);
+            let opcodes_len = spec.opcodes.len() as u32;
+            match compiler.emit_placeholder_arm_block(opcodes_ptr, opcodes_len, spec.entry_pc) {
+                Some(f) => {
+                    let lookup_pc = spec.entry_pc.wrapping_add(8);
+                    table.insert_arm(lookup_pc, f);
+                    bios_emitted += 1;
+                }
+                None => {
+                    bios_failed += 1;
+                }
+            }
+        }
+        eprintln!(
+            "AOT: bios scanned {} blocks; emitted {} arm, {} failed",
+            bios_blocks.len(), bios_emitted, bios_failed
+        );
+    }
+
     // Keep the compiler (and its ExecutionEngine) alive by
     // converting it to a Box<dyn> — dropped only when the AotTable
     // drops. Per I23 we drop+recreate engine across compile_rom

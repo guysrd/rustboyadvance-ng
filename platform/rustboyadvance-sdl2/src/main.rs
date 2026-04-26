@@ -233,6 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // whole-block trampoline. AOT scan picks up ARM specs from
                 // BIOS / cart entry / scan-from-thumb-BX traversal.
                 Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
+                Some(&bios_bin),
             ))
         } else {
             Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(
@@ -247,6 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
+                Some(&bios_bin),
             ))
         };
         eprintln!(
