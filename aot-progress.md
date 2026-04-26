@@ -5,6 +5,19 @@ Started: 2026-04-25
 
 ## Resume marker
 
+**STATE: phase 1 fps-rejected, awaiting phase 4-prime commitment.**
+See `docs/findings-ladder.md` for the formal re-plan per the program
+doc's permanent-fail rule. Phase 1 correctness deliverables are
+accepted; the fps gate (`score > 0 on at least one ROM`) is failed
+on both ROMs (PE -10.5% / MK -0.6% at sweep=64KB; score = -61).
+
+The cron loop should NOT continue with small experiments — each
+firing has reverted at noise floor. Three exit options in the
+findings doc: (A) commit to multi-day phase-4-prime IR-emit grind,
+(B) pivot to LLVM-free Rust fn-ptr dispatch, (C) ship phase 1
+correctness only, AOT off by default. Recommendation: Option A
+when a sustained work block is available; pause cron otherwise.
+
 **Currently in:** phase 1 ACCEPTED at scale (commit 82d4170 fixed
 the trampoline at-scale divs bug). 17 Thumb formats inlined as
 Rust-level fast paths in `aot_thumb_step`. Per-instr LLVM emit
