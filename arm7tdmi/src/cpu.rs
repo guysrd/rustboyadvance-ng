@@ -910,14 +910,24 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         }
     }
 
-    /// Phase-4 helper: do per-iter pipeline shift WITHOUT charging
-    /// cycles. The block emit's inline IR handles cycle accounting
-    /// directly via `*sched_ts_ptr += K_seq_or_nonseq`. Without this
-    /// no-cycles read, going through `load_16` would double-charge.
+    /// Phase-4 helper: do per-iter fetch + cycle accounting + pipeline
+    /// shift. The block emit pairs this with inline LLVM IR for the
+    /// instruction's effect.  No dispatch, no pc update.
+    ///
+    /// Cycles are charged via the bus path so per-page costs always
+    /// reflect the current WAITCNT state (per I7).  Earlier phase-4
+    /// step 2 (commit afb1ebd) tried inline cycle accumulation in IR
+    /// with baked Seq/NonSeq constants, but PE writes WAITCNT during
+    /// BIOS boot — the baked constants silently went stale and the
+    /// inline-IR path picked up ~12 hash-divs at sw=64KB.  Reverting
+    /// to bus-charged cycles here closes that hole.  Re-introducing
+    /// inline cycle IR requires implementing I7 (synchronous recompile
+    /// on WAITCNT write) first.
     #[cfg(feature = "cached_interp")]
     #[inline]
     pub fn aot_thumb_fetch_only(&mut self, fetch_addr: u32) {
-        let val = self.read_16_no_cycles(fetch_addr);
+        let access = self.next_fetch_access;
+        let val = self.load_16(fetch_addr, access);
         self.pipeline[0] = self.pipeline[1];
         self.pipeline[1] = val as u32;
     }

@@ -46,3 +46,4 @@ holding-006	-10	558.1	563.6	397.4	401.8	0	68	0	1.4	0	1	0	holding	holding firing 
 holding-007	-9	556.6	562.3	397.5	401.1	0	68	0	1.4	0	1	0	holding	holding firing #7; PE -1.0% MK -0.9% sw=0 within band
 holding-008	-9	559.9	566.8	400.0	402.0	0	68	0	1.4	0	1	0	holding	holding firing #8; PE -1.2% MK -0.5% sw=0 within band
 phase4-f1-rejected	0	0.0	0.0	0.0	0.0	0	0	0	0.0	88	0	0	reject_divs	tried F1 LSL/LSR/ASR imm5 inline LLVM IR + per-instr + sw=64KB; 88 hash-divs PE → V1 gate fail → reverted; F3 IR alone also shows 12 divs (regression from 2999628)
+f3-ir-waitcnt-fix	-37	502.3	537.1	389.5	392.0	34	68	0	71.0	0	1	0	accept	revert afb1ebd inline cycle accumulation in F3 IR; baked Seq/NonSeq cycle constants went stale after BIOS WAITCNT writes (caused 12 hash-divs at sw=64KB); cycles now charged via bus path (always current); F3 IR back to 0 divs verified at sw=64KB
