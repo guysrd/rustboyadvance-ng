@@ -57,6 +57,17 @@ inline IR was a fps regression, default per-instr is preserved.
 AOT_INLINE_F3=1 to opt in (for correctness verification + further
 iteration).
 
+**Phase 4 infrastructure (commit 376722b):**
+- `SysBus::scheduler_timestamp_ptr() -> *mut usize` — raw pointer
+  at scheduler.timestamp, stable for bus lifetime. AOT bakes as
+  constant ptr in IR; cycle accounting becomes `*ts_ptr += K`.
+- `SysBus::thumb_fetch_cycles(page) -> (s, n)` — Seq/NonSeq cycle
+  costs per page. AOT reads at compile time, bakes as IR constants.
+
+Both unused by current code. Future phase 4 work plumbs these
+through arm7tdmi-aot to enable inline cycle accounting in IR
+(eliminates the fetch_only extern boundary).
+
 **Latest measurement (2026-04-26 post dead-code cleanup):**
 - sweep=0 baseline: 0/0 divs both ROMs, score=+2 (noise).
 - sweep=64KB whole-block: PE 521.2 / scalar 565.4 = -7.8% gap;
