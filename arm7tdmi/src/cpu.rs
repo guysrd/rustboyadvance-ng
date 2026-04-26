@@ -947,6 +947,15 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
         self.ldr_word(addr, access)
     }
 
+    /// Forwards to the private `ldr_half` in `memory.rs`. Misaligned-addr
+    /// (`addr & 1 != 0`) ROR side effect on cpsr.C — same shape as
+    /// `aot_ldr_word`'s I14 behavior but for half-word load.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_ldr_half(&mut self, addr: u32, access: MemoryAccess) -> u32 {
+        self.ldr_half(addr, access)
+    }
+
     /// AOT-side helper: mid-block abort check (K=2 cadence per I2).
     /// Mirrors the scalar `replay_cached_block` per-iter abort guard.
     /// Returns true if the AOT block should yield to the dispatcher.
