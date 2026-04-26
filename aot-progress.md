@@ -68,6 +68,30 @@ hot formats so no opcode falls through to the step trampoline extern
 (elimination of all per-iter externs is the only path to beating
 scalar). That's another 5-10 days of per-format IR emit work.
 
+**Recent rejected experiments (2026-04-26):**
+- `#[inline(always)]` on `SysBus::load_*` (commit b4fde27 row): PE
+  -11.4% at sw=64KB, code bloat hurts I-cache. Reverted.
+- Dispatch guard reorder (commit 46fe2f7): noise.
+- Noop-stub for aot_lookup_fn (commit 6cd1c57): noise.
+
+**Loop status:** approximately every cron firing for the past ~10
+firings has been "small experiment, hit noise floor or regressed,
+revert." The cron interval (5-15 min) is incompatible with the
+multi-day refactor scope of:
+1. Phase 4 proper — emit ALL hot Thumb formats inline in IR.
+2. Phase 8 — ARM block compile path.
+3. LLVM JIT elimination — direct Rust trampoline fn-ptr dispatch.
+
+**Recommendation for next operator (human or sustained AI run):**
+- Pick ONE of the three multi-day projects above.
+- Don't context-switch every cron fire.
+- The infrastructure for phase 4 is ALL in place (CpuOffsets +
+  ScheduleTimestampPtr + read_16_no_cycles + per-format IR emit
+  pattern in compiler.rs). What's left is mechanical per-format
+  emit work (~50-100 lines of IR Rust per format × 12 formats).
+- Or: deliver as-is at -8% fps gap PE / parity MK and call phase 1
+  shippable.
+
 **Phase 4 infrastructure complete (commits 376722b, 990bd11, 1846504):**
 - `SysBus::scheduler_timestamp_ptr() -> *mut usize` — stable raw ptr
   at scheduler.timestamp. Inline IR adds K via `*ts_ptr += K`.
