@@ -180,7 +180,8 @@ impl LlvmCompiler {
         // Per-format env-var gates: AOT_INLINE_F1=1, AOT_INLINE_F3=1, ...
         let f1_inline_env = std::env::var("AOT_INLINE_F1").map(|v| v == "1").unwrap_or(false);
         let f3_inline_env = std::env::var("AOT_INLINE_F3").map(|v| v == "1").unwrap_or(false);
-        let any_format_inline = f1_inline_env || f3_inline_env;
+        let f12_inline_env = std::env::var("AOT_INLINE_F12").map(|v| v == "1").unwrap_or(false);
+        let any_format_inline = f1_inline_env || f3_inline_env || f12_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
             && self.fetch_only_thumb_fn.is_some()
             && any_format_inline;
@@ -395,6 +396,73 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC → always AdvancePC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f1_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F12 LoadAddress (ADD Rd, [PC|SP], #imm8).
+            // Encoding: 1010_S_DDD_IIIIIIII; mask 0xf000 == 0xa000.
+            //   S (bit 11): 0 = PC-relative, 1 = SP-relative.
+            //   imm = (insn & 0xff) << 2 (word-scaled, constant at AOT time).
+            //   if S=0: Rd = ((exec_addr) & ~2) + 4 + imm   (constant at AOT)
+            //   if S=1: Rd = gpr[SP] + imm                  (runtime)
+            //   no flag updates; pc = fetch_addr + 2; nfa = Seq.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F12 path
+            // (which mirrors thumb/exec.rs::exec_thumb_load_address).
+            if inline_enabled && f12_inline_env && (opcode & 0xf000) == 0xa000 {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let sp_flag = (opcode >> 11) & 0x1 != 0;
+                let rd = ((opcode >> 8) & 0x7) as u32;
+                let imm = ((opcode & 0xff) as u32) << 2;
+
+                // Cycle accounting + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                let val = if sp_flag {
+                    // Load gpr[SP] (REG_SP = 13).
+                    let sp_off = (off.gpr + 13 * 4) as u64;
+                    let sp_off_v = i32_t.const_int(sp_off, false);
+                    let sp_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[sp_off_v], "f12_sp_ptr").ok()?
+                    };
+                    let sp_val = builder.build_load(i32_t, sp_ptr, "f12_sp_val").ok()?
+                        .into_int_value();
+                    builder
+                        .build_int_add(sp_val, i32_t.const_int(imm as u64, false), "f12_val")
+                        .ok()?
+                } else {
+                    // PC-relative: val = (exec_addr & !2) + 4 + imm.
+                    let exec_addr_aligned = exec_addr & !0b10;
+                    let val_const = exec_addr_aligned.wrapping_add(4).wrapping_add(imm);
+                    i32_t.const_int(val_const as u64, false)
+                };
+
+                // gpr[Rd] = val.
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f12_gpr_rd_ptr").ok()?
+                };
+                builder.build_store(gpr_rd_ptr, val).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f12_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq (= 1).
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f12_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC → always AdvancePC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f12_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
