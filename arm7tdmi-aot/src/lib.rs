@@ -139,6 +139,30 @@ pub fn compile_rom_with_seeds_step_offsets(
     cpu_offsets: Option<CpuOffsets>,
     fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
 ) -> AotTable {
+    compile_rom_with_seeds_full(
+        rom, rom_base, entry_pc, entry_mode, seeds,
+        replay_thumb_fn, step_thumb_fn, abort_thumb_fn,
+        cpu_offsets, fetch_only_thumb_fn, None,
+    )
+}
+
+/// Phase-8 variant that also accepts an ARM whole-block trampoline.
+/// When `replay_arm_fn` is Some, ARM specs are emitted via
+/// `emit_placeholder_arm_block` and inserted into the AotTable's ARM
+/// page lookup. When None, ARM specs are skipped (phase-1 behavior).
+pub fn compile_rom_with_seeds_full(
+    rom: &[u8],
+    rom_base: u32,
+    entry_pc: u32,
+    entry_mode: Mode,
+    seeds: &[(u32, Mode)],
+    replay_thumb_fn: replay::AotReplayFn,
+    step_thumb_fn: Option<replay::AotStepFn>,
+    abort_thumb_fn: Option<replay::AotAbortFn>,
+    cpu_offsets: Option<CpuOffsets>,
+    fetch_only_thumb_fn: Option<replay::AotFetchOnlyFn>,
+    replay_arm_fn: Option<replay::AotReplayFn>,
+) -> AotTable {
     // Phase-0 scan strategy: static reachability from the supplied
     // entry can't get past the first indirect branch. To get >0%
     // coverage on the SDL replay we ALSO sweep aligned halfwords as
@@ -212,14 +236,36 @@ pub fn compile_rom_with_seeds_step_offsets(
     if let Some(fo) = fetch_only_thumb_fn {
         compiler.register_fetch_only_thumb(fo);
     }
+    if let Some(arm) = replay_arm_fn {
+        compiler.register_replay_arm(arm);
+    }
 
     let mut table = AotTable::new();
     let mut emitted = 0usize;
     let mut skipped_arm = 0usize;
+    let mut arm_emitted = 0usize;
     let mut emit_failed = 0usize;
+    let arm_enabled = replay_arm_fn.is_some();
     for spec in &blocks {
         if spec.mode != Mode::Thumb {
-            skipped_arm += 1;
+            // Phase-8: emit ARM blocks too (when replay_arm_fn is set).
+            if arm_enabled {
+                let opcodes_ptr = table.intern_arm_opcodes(&spec.opcodes);
+                let opcodes_len = spec.opcodes.len() as u32;
+                match compiler.emit_placeholder_arm_block(opcodes_ptr, opcodes_len, spec.entry_pc) {
+                    Some(f) => {
+                        // ARM lookup_pc = exec_addr + 8 (pipeline-head pc).
+                        let lookup_pc = spec.entry_pc.wrapping_add(8);
+                        table.insert_arm(lookup_pc, f);
+                        arm_emitted += 1;
+                    }
+                    None => {
+                        emit_failed += 1;
+                    }
+                }
+            } else {
+                skipped_arm += 1;
+            }
             continue;
         }
         let opcodes_u16: Vec<u16> = spec.opcodes.iter().map(|&o| o as u16).collect();
@@ -232,20 +278,6 @@ pub fn compile_rom_with_seeds_step_offsets(
         };
         match emit_result {
             Some(f) => {
-                // Build the BlockKey-style pc with the Thumb bit so
-                // the dispatcher's lookup (which uses self.pc &
-                // pipeline-head conventions) finds it.
-                //
-                // I6 says cpu.pc at AOT entry == block.entry_pc & !1
-                // (pipeline-head pc, Thumb bit stripped). For Thumb,
-                // entry_pc IS the exec_addr; the dispatcher's
-                // self.pc when it tries the lookup will be
-                // exec_addr (since scalar's reload_pipeline16 left
-                // it there after a branch/reset).
-                //
-                // Wait — actually scalar's pc at block entry is the
-                // PIPELINE-HEAD pc = exec_addr + 4 in Thumb mode.
-                // So lookup is on (exec_addr + 4), not exec_addr.
                 let lookup_pc = spec.entry_pc.wrapping_add(4);
                 table.insert(lookup_pc, f);
                 emitted += 1;
@@ -256,8 +288,8 @@ pub fn compile_rom_with_seeds_step_offsets(
         }
     }
     eprintln!(
-        "AOT: scanned {} blocks; emitted {} thumb, skipped {} arm, {} failed",
-        blocks.len(), emitted, skipped_arm, emit_failed
+        "AOT: scanned {} blocks; emitted {} thumb, {} arm, skipped {} arm-no-trampoline, {} failed",
+        blocks.len(), emitted, arm_emitted, skipped_arm, emit_failed
     );
     // Keep the compiler (and its ExecutionEngine) alive by
     // converting it to a Box<dyn> — dropped only when the AotTable

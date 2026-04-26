@@ -27,3 +27,4 @@ inline-always-rej	-65	479.9	541.5	384.9	388.0	34	68	0	70.9	0	1	0	reject_perf	tri
 arm-scaffold	-4	545.6	547.8	392.2	394.3	-46	0	0	0.0	0	0	0	accept	phase 8 scaffold: aot_arm_step + abort + replay extern (no dispatcher integration yet)
 arm-table-scaffold	2	540.2	539.6	394.8	393.0	0	0	0	0.0	0	0	0	accept	phase 8 step 2: arm_pages + arm_opcode_arena + insert_arm + aot_lookup_arm scaffolded
 arm-emit-scaffold	1	549.6	550.5	405.9	403.7	0	0	0	0.0	0	0	0	accept	phase 8 step 3: emit_placeholder_arm_block scaffolded; sw=0 unchanged
+arm-emit-integration	-3	545.3	549.7	398.1	396.4	0	0	0	0.0	0	0	0	accept	phase 8 step 4: compile_rom_with_seeds_full processes arm specs into separate arm table
