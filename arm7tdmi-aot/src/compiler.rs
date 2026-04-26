@@ -288,6 +288,7 @@ impl LlvmCompiler {
         let f9_inline_env = std::env::var("AOT_INLINE_F9").map(|v| v == "1").unwrap_or(false);
         let f7_inline_env = std::env::var("AOT_INLINE_F7").map(|v| v == "1").unwrap_or(false);
         let f8_inline_env = std::env::var("AOT_INLINE_F8").map(|v| v == "1").unwrap_or(false);
+        let f5_inline_env = std::env::var("AOT_INLINE_F5").map(|v| v == "1").unwrap_or(false);
         let f19hi_inline_env = std::env::var("AOT_INLINE_F19_HI").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
@@ -302,6 +303,7 @@ impl LlvmCompiler {
             || f9_inline_env
             || f7_inline_env
             || f8_inline_env
+            || f5_inline_env
             || f12_inline_env
             || f13_inline_env
             || f19hi_inline_env;
@@ -1586,6 +1588,170 @@ impl LlvmCompiler {
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
+            }
+
+            // Phase-4 inline IR for F5 high-reg ADD/CMP/MOV (AdvancePC subset).
+            // Encoding: 010001_OO_H1_H2_SSS_DDD; mask 0xfc00 == 0x4400.
+            //   OO ∈ {ADD=0, CMP=1, MOV=2, BX=3}.
+            //   dst_reg = if h1 then rd_low+8 else rd_low.
+            //   src_reg = if h2 then rs_low+8 else rs_low.
+            //   ADD/MOV with dst_reg == 15 → PipelineFlushed (block terminator).
+            //   BX (op=3) → always PipelineFlushed.
+            // We inline ONLY the AdvancePC subset:
+            //   - ADD with dst_reg != 15
+            //   - CMP (no writeback; full flag update via alu_sub_flags)
+            //   - MOV with dst_reg != 15
+            // Block terminators (BX, ADD/MOV with R15) fall through to the
+            // step trampoline path. At AOT compile time we know op/h1/rd_low
+            // so the inline emit fires only for the safe subset.
+            // src_reg == 15: get_reg(15) returns pipeline-head pc = fetch_addr.
+            // Mirrors arm7tdmi/src/cpu.rs aot_thumb_step F5 path.
+            if inline_enabled
+                && f5_inline_env
+                && (opcode & 0xfc00) == 0x4400
+            {
+                let op = ((opcode >> 8) & 0x3) as u32;
+                let h1 = (opcode >> 7) & 0x1;
+                let h2 = (opcode >> 6) & 0x1;
+                let rs_low = ((opcode >> 3) & 0x7) as u32;
+                let rd_low = (opcode & 0x7) as u32;
+                let dst_reg = if h1 == 1 { rd_low + 8 } else { rd_low };
+                let src_reg = if h2 == 1 { rs_low + 8 } else { rs_low };
+                let is_add_or_mov = op == 0 || op == 2;
+                let dst_is_pc = dst_reg == 15;
+                // Skip block-terminator cases — let step trampoline handle.
+                if op != 3 && !(is_add_or_mov && dst_is_pc) {
+                    let off = offsets.unwrap();
+                    let fo = fetch_only_ref.unwrap();
+
+                    // fetch_only.
+                    builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                    // Read op2 = gpr[src_reg]. If src_reg==15, baked fetch_addr.
+                    let op2 = if src_reg == 15 {
+                        i32_t.const_int(fetch_addr as u64, false)
+                    } else {
+                        let gpr_src_off = (off.gpr + src_reg * 4) as u64;
+                        let gpr_src_off_v = i32_t.const_int(gpr_src_off, false);
+                        let gpr_src_ptr = unsafe {
+                            builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_src_off_v], "f5_src_ptr").ok()?
+                        };
+                        builder.build_load(i32_t, gpr_src_ptr, "f5_op2").ok()?
+                            .into_int_value()
+                    };
+
+                    // For ADD or CMP we also need op1 = gpr[dst_reg]. MOV
+                    // doesn't read op1.
+                    let op1 = if op == 0 || op == 1 {
+                        if dst_reg == 15 {
+                            // CMP can have dst_reg=15 (uses pc); ADD never
+                            // reaches here with dst_reg=15 (skipped above).
+                            Some(i32_t.const_int(fetch_addr as u64, false))
+                        } else {
+                            let gpr_dst_off = (off.gpr + dst_reg * 4) as u64;
+                            let gpr_dst_off_v = i32_t.const_int(gpr_dst_off, false);
+                            let gpr_dst_ptr = unsafe {
+                                builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_dst_off_v], "f5_dst_ptr").ok()?
+                            };
+                            Some(builder.build_load(i32_t, gpr_dst_ptr, "f5_op1").ok()?
+                                .into_int_value())
+                        }
+                    } else {
+                        None
+                    };
+
+                    match op {
+                        0 => {
+                            // ADD: gpr[dst_reg] = op1 + op2 (no flag update).
+                            // (dst_reg != 15 here.)
+                            let result = builder.build_int_add(op1.unwrap(), op2, "f5_add").ok()?;
+                            let gpr_dst_off = (off.gpr + dst_reg * 4) as u64;
+                            let gpr_dst_off_v = i32_t.const_int(gpr_dst_off, false);
+                            let gpr_dst_ptr = unsafe {
+                                builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_dst_off_v], "f5_dst_w_ptr").ok()?
+                            };
+                            builder.build_store(gpr_dst_ptr, result).ok()?;
+                        }
+                        1 => {
+                            // CMP: full N|Z|C|V flag update from op1 - op2.
+                            // No writeback. Mirrors F2 SUB / F4_ARITH CMP.
+                            let result = builder.build_int_sub(op1.unwrap(), op2, "f5_cmp_res").ok()?;
+                            // carry = op1 >= op2 (unsigned)
+                            let carry_cmp = builder
+                                .build_int_compare(IntPredicate::UGE, op1.unwrap(), op2, "f5_cmp_c")
+                                .ok()?;
+                            let carry_i32 = builder.build_int_z_extend(carry_cmp, i32_t, "f5_cmp_ci").ok()?;
+                            // overflow = ((op1^op2) & (op1^result)) bit 31
+                            let ab_xor = builder.build_xor(op1.unwrap(), op2, "f5_cmp_ab").ok()?;
+                            let ar_xor = builder.build_xor(op1.unwrap(), result, "f5_cmp_ar").ok()?;
+                            let ovf_and = builder.build_and(ab_xor, ar_xor, "f5_cmp_ovf_and").ok()?;
+                            let ovf_shift = builder
+                                .build_right_shift(ovf_and, i32_t.const_int(31, false), false, "f5_cmp_ovf_s")
+                                .ok()?;
+                            let ovf_i32 = builder
+                                .build_and(ovf_shift, i32_t.const_int(1, false), "f5_cmp_ovf")
+                                .ok()?;
+                            // cpsr update: clear N|Z|C|V, set from result/carry/ovf.
+                            let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                            let cpsr_ptr = unsafe {
+                                builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f5_cpsr_ptr").ok()?
+                            };
+                            let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f5_cpsr_old").ok()?
+                                .into_int_value();
+                            let nzcv_clear = i32_t.const_int(0x0fff_ffff, false);
+                            let cleared = builder.build_and(cpsr_old, nzcv_clear, "f5_cpsr_cl").ok()?;
+                            let n_bit = builder
+                                .build_and(result, i32_t.const_int(0x8000_0000, false), "f5_n_bit")
+                                .ok()?;
+                            let z_cmp = builder
+                                .build_int_compare(IntPredicate::EQ, result, i32_t.const_int(0, false), "f5_z_cmp")
+                                .ok()?;
+                            let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f5_z_ext").ok()?;
+                            let z_bit = builder
+                                .build_left_shift(z_ext, i32_t.const_int(30, false), "f5_z_bit")
+                                .ok()?;
+                            let c_bit = builder
+                                .build_left_shift(carry_i32, i32_t.const_int(29, false), "f5_c_bit")
+                                .ok()?;
+                            let v_bit = builder
+                                .build_left_shift(ovf_i32, i32_t.const_int(28, false), "f5_v_bit")
+                                .ok()?;
+                            let cpsr_n = builder.build_or(cleared, n_bit, "f5_cpsr_n").ok()?;
+                            let cpsr_nz = builder.build_or(cpsr_n, z_bit, "f5_cpsr_nz").ok()?;
+                            let cpsr_nzc = builder.build_or(cpsr_nz, c_bit, "f5_cpsr_nzc").ok()?;
+                            let cpsr_new = builder.build_or(cpsr_nzc, v_bit, "f5_cpsr_new").ok()?;
+                            builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+                        }
+                        2 => {
+                            // MOV: gpr[dst_reg] = op2.  (dst_reg != 15 here.)
+                            let gpr_dst_off = (off.gpr + dst_reg * 4) as u64;
+                            let gpr_dst_off_v = i32_t.const_int(gpr_dst_off, false);
+                            let gpr_dst_ptr = unsafe {
+                                builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_dst_off_v], "f5_mov_dst_ptr").ok()?
+                            };
+                            builder.build_store(gpr_dst_ptr, op2).ok()?;
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    // pc = fetch_addr + 2; nfa = Seq.
+                    let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                    let pc_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f5_pc_ptr").ok()?
+                    };
+                    builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+                    let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                    let nfa_ptr = unsafe {
+                        builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f5_nfa_ptr").ok()?
+                    };
+                    builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                    let cont_blk = self.context.append_basic_block(block_fn, "f5_cont");
+                    builder.build_unconditional_branch(cont_blk).ok()?;
+                    builder.position_at_end(cont_blk);
+                    continue;
+                }
+                // else: fall through to step trampoline.
             }
 
             // Phase-4 inline IR for F6 LDR PC-relative (literal pool).
