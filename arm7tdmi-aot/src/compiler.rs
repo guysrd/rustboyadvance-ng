@@ -183,13 +183,16 @@ impl LlvmCompiler {
         let f12_inline_env = std::env::var("AOT_INLINE_F12").map(|v| v == "1").unwrap_or(false);
         let f13_inline_env = std::env::var("AOT_INLINE_F13").map(|v| v == "1").unwrap_or(false);
         let f2_inline_env = std::env::var("AOT_INLINE_F2").map(|v| v == "1").unwrap_or(false);
-        // F4: logical sub-ops only this turn (AND/EOR/TST/ORR/BIC/MVN).
-        // ADC/SBC/NEG/CMP/CMN/MUL/shifts come in later commits.
+        // F4 sub-op groups: logical (AND/EOR/TST/ORR/BIC/MVN),
+        // arithmetic (ADC/SBC/NEG/CMP/CMN). shifts and MUL still in
+        // trampoline path (separate cycle semantics).
         let f4_log_inline_env = std::env::var("AOT_INLINE_F4_LOG").map(|v| v == "1").unwrap_or(false);
+        let f4_arith_inline_env = std::env::var("AOT_INLINE_F4_ARITH").map(|v| v == "1").unwrap_or(false);
         let any_format_inline = f1_inline_env
             || f2_inline_env
             || f3_inline_env
             || f4_log_inline_env
+            || f4_arith_inline_env
             || f12_inline_env
             || f13_inline_env;
         let inline_enabled = self.cpu_offsets.is_some()
@@ -675,6 +678,201 @@ impl LlvmCompiler {
 
                 // Continue (Rd is 3 bits, can't be PC).
                 let cont_blk = self.context.append_basic_block(block_fn, "f4l_cont");
+                builder.build_unconditional_branch(cont_blk).ok()?;
+                builder.position_at_end(cont_blk);
+                continue;
+            }
+
+            // Phase-4 inline IR for F4 ALU arithmetic sub-ops:
+            // ADC(5), SBC(6), NEG(9), CMP(10), CMN(11).
+            // Encoding: 010000_OOOO_SSS_DDD; mask 0xfc00 == 0x4000.
+            // Effects (mirrors arm7tdmi/src/cpu.rs F4 path + alu helpers):
+            //   src = gpr[Rs]; dst = gpr[Rd] (only ADC/SBC/CMP need dst)
+            //   ADC: 64-bit (dst + src + cin); carry = bit 32; ovf = !(a^b)&(b^res) bit31
+            //   SBC: same as ADC with b' = ~src
+            //   NEG: a=0, b=src, SUB-style: res=-src; carry = (src==0); ovf = (a^b)&(a^res)
+            //   CMP: a=dst, b=src, SUB-style; no writeback
+            //   CMN: a=dst, b=src, ADD-style; no writeback
+            //   cpsr: clear N|Z|C|V; set N from result bit 31, Z from
+            //         (result==0), C from carry, V from overflow.
+            let f4a_top6 = (opcode >> 10) & 0x3f;
+            let f4a_op = (opcode >> 6) & 0xf;
+            let f4_arith = matches!(f4a_op, 5 | 6 | 9 | 10 | 11);
+            if inline_enabled && f4_arith_inline_env && f4a_top6 == 0b010000 && f4_arith {
+                let off = offsets.unwrap();
+                let fo = fetch_only_ref.unwrap();
+                let rs = ((opcode >> 3) & 0x7) as u32;
+                let rd = (opcode & 0x7) as u32;
+
+                // Cycle accounting + pipeline shift.
+                builder.build_call(fo, &[cpu_ctx.into(), fa.into()], "").ok()?;
+
+                // Load src = gpr[Rs] always.
+                let gpr_rs_off = (off.gpr + rs * 4) as u64;
+                let gpr_rs_off_v = i32_t.const_int(gpr_rs_off, false);
+                let gpr_rs_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rs_off_v], "f4a_rs_ptr").ok()?
+                };
+                let src = builder.build_load(i32_t, gpr_rs_ptr, "f4a_src").ok()?
+                    .into_int_value();
+
+                // gpr[Rd] ptr (load dst when needed: ADC/SBC/CMP/CMN; NEG uses 0).
+                let gpr_rd_off = (off.gpr + rd * 4) as u64;
+                let gpr_rd_off_v = i32_t.const_int(gpr_rd_off, false);
+                let gpr_rd_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[gpr_rd_off_v], "f4a_rd_ptr").ok()?
+                };
+                let zero_i32 = i32_t.const_int(0, false);
+                let dst = if f4a_op == 9 {
+                    zero_i32
+                } else {
+                    builder.build_load(i32_t, gpr_rd_ptr, "f4a_dst").ok()?
+                        .into_int_value()
+                };
+
+                // For ADC/SBC: read carry-in from cpsr bit 29.
+                let cpsr_off_v = i32_t.const_int(off.cpsr as u64, false);
+                let cpsr_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[cpsr_off_v], "f4a_cpsr_ptr").ok()?
+                };
+                let cpsr_old = builder.build_load(i32_t, cpsr_ptr, "f4a_cpsr_old").ok()?
+                    .into_int_value();
+
+                let i64_t = self.context.i64_type();
+                let (result, carry_i32, ovf_i32) = match f4a_op {
+                    5 | 6 => {
+                        // ADC / SBC: 64-bit add of (a, b_or_notb, cin).
+                        let b_op = if f4a_op == 5 {
+                            src
+                        } else {
+                            // SBC: b' = ~src
+                            builder.build_not(src, "f4a_sbc_notb").ok()?
+                        };
+                        // a, b zero-ext to i64.
+                        let a64 = builder.build_int_z_extend(dst, i64_t, "f4a_a64").ok()?;
+                        let b64 = builder.build_int_z_extend(b_op, i64_t, "f4a_b64").ok()?;
+                        // c_in = (cpsr_old >> 29) & 1, zero-ext to i64.
+                        let c_shift = builder
+                            .build_right_shift(cpsr_old, i32_t.const_int(29, false), false, "f4a_cin_s")
+                            .ok()?;
+                        let c_in_i32 = builder
+                            .build_and(c_shift, i32_t.const_int(1, false), "f4a_cin_i32")
+                            .ok()?;
+                        let c_in = builder.build_int_z_extend(c_in_i32, i64_t, "f4a_cin").ok()?;
+                        let sum = builder.build_int_add(a64, b64, "f4a_sum_ab").ok()?;
+                        let sum = builder.build_int_add(sum, c_in, "f4a_sum_abc").ok()?;
+                        // result = low 32.
+                        let result = builder.build_int_truncate(sum, i32_t, "f4a_res").ok()?;
+                        // carry = (sum >> 32) bit 0.
+                        let carry_shift = builder
+                            .build_right_shift(sum, i64_t.const_int(32, false), false, "f4a_c_s64")
+                            .ok()?;
+                        let carry_trunc = builder.build_int_truncate(carry_shift, i32_t, "f4a_c_tr").ok()?;
+                        let carry_i32 = builder
+                            .build_and(carry_trunc, i32_t.const_int(1, false), "f4a_c_i32")
+                            .ok()?;
+                        // overflow = (!(a ^ b) & (b ^ result)) bit 31.
+                        let ab_xor = builder.build_xor(dst, b_op, "f4a_ab_xor").ok()?;
+                        let ab_xor_not = builder.build_not(ab_xor, "f4a_ab_nxor").ok()?;
+                        let br_xor = builder.build_xor(b_op, result, "f4a_br_xor").ok()?;
+                        let ovf_and = builder.build_and(ab_xor_not, br_xor, "f4a_ovf_and").ok()?;
+                        let ovf_shift = builder
+                            .build_right_shift(ovf_and, i32_t.const_int(31, false), false, "f4a_ovf_s")
+                            .ok()?;
+                        let ovf_i32 = builder
+                            .build_and(ovf_shift, i32_t.const_int(1, false), "f4a_ovf")
+                            .ok()?;
+                        (result, carry_i32, ovf_i32)
+                    }
+                    9 | 10 => {
+                        // NEG (a=0, b=src), CMP (a=dst, b=src) — both SUB-style.
+                        let a = dst;
+                        let b = src;
+                        let result = builder.build_int_sub(a, b, "f4a_sub_res").ok()?;
+                        let carry_cmp = builder
+                            .build_int_compare(IntPredicate::UGE, a, b, "f4a_sub_c_cmp")
+                            .ok()?;
+                        let carry_i32 = builder.build_int_z_extend(carry_cmp, i32_t, "f4a_sub_c").ok()?;
+                        let ab_xor = builder.build_xor(a, b, "f4a_sub_ab").ok()?;
+                        let ar_xor = builder.build_xor(a, result, "f4a_sub_ar").ok()?;
+                        let ovf_and = builder.build_and(ab_xor, ar_xor, "f4a_sub_ovf_and").ok()?;
+                        let ovf_shift = builder
+                            .build_right_shift(ovf_and, i32_t.const_int(31, false), false, "f4a_sub_ovf_s")
+                            .ok()?;
+                        let ovf_i32 = builder
+                            .build_and(ovf_shift, i32_t.const_int(1, false), "f4a_sub_ovf")
+                            .ok()?;
+                        (result, carry_i32, ovf_i32)
+                    }
+                    11 => {
+                        // CMN: ADD-style (no writeback).
+                        let a = dst;
+                        let b = src;
+                        let result = builder.build_int_add(a, b, "f4a_add_res").ok()?;
+                        let carry_cmp = builder
+                            .build_int_compare(IntPredicate::ULT, result, a, "f4a_add_c_cmp")
+                            .ok()?;
+                        let carry_i32 = builder.build_int_z_extend(carry_cmp, i32_t, "f4a_add_c").ok()?;
+                        let ra_xor = builder.build_xor(result, a, "f4a_add_ra").ok()?;
+                        let rb_xor = builder.build_xor(result, b, "f4a_add_rb").ok()?;
+                        let ovf_and = builder.build_and(ra_xor, rb_xor, "f4a_add_ovf_and").ok()?;
+                        let ovf_shift = builder
+                            .build_right_shift(ovf_and, i32_t.const_int(31, false), false, "f4a_add_ovf_s")
+                            .ok()?;
+                        let ovf_i32 = builder
+                            .build_and(ovf_shift, i32_t.const_int(1, false), "f4a_add_ovf")
+                            .ok()?;
+                        (result, carry_i32, ovf_i32)
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Writeback unless CMP(10) or CMN(11).
+                if !matches!(f4a_op, 10 | 11) {
+                    builder.build_store(gpr_rd_ptr, result).ok()?;
+                }
+
+                // cpsr: clear N|Z|C|V, set from result/carry/ovf.
+                let nzcv_clear = i32_t.const_int(0x0fff_ffff, false);
+                let cleared = builder.build_and(cpsr_old, nzcv_clear, "f4a_cpsr_cl").ok()?;
+                let n_bit = builder
+                    .build_and(result, i32_t.const_int(0x8000_0000, false), "f4a_n_bit")
+                    .ok()?;
+                let z_cmp = builder
+                    .build_int_compare(IntPredicate::EQ, result, zero_i32, "f4a_z_cmp")
+                    .ok()?;
+                let z_ext = builder.build_int_z_extend(z_cmp, i32_t, "f4a_z_ext").ok()?;
+                let z_bit = builder
+                    .build_left_shift(z_ext, i32_t.const_int(30, false), "f4a_z_bit")
+                    .ok()?;
+                let c_bit = builder
+                    .build_left_shift(carry_i32, i32_t.const_int(29, false), "f4a_c_bit")
+                    .ok()?;
+                let v_bit = builder
+                    .build_left_shift(ovf_i32, i32_t.const_int(28, false), "f4a_v_bit")
+                    .ok()?;
+                let cpsr_n = builder.build_or(cleared, n_bit, "f4a_cpsr_n").ok()?;
+                let cpsr_nz = builder.build_or(cpsr_n, z_bit, "f4a_cpsr_nz").ok()?;
+                let cpsr_nzc = builder.build_or(cpsr_nz, c_bit, "f4a_cpsr_nzc").ok()?;
+                let cpsr_new = builder.build_or(cpsr_nzc, v_bit, "f4a_cpsr_new").ok()?;
+                builder.build_store(cpsr_ptr, cpsr_new).ok()?;
+
+                // pc = fetch_addr + 2.
+                let pc_off_v = i32_t.const_int(off.pc as u64, false);
+                let pc_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[pc_off_v], "f4a_pc_ptr").ok()?
+                };
+                builder.build_store(pc_ptr, i32_t.const_int(fetch_addr.wrapping_add(2) as u64, false)).ok()?;
+
+                // nfa = Seq.
+                let nfa_off_v = i32_t.const_int(off.next_fetch_access as u64, false);
+                let nfa_ptr = unsafe {
+                    builder.build_in_bounds_gep(i8_t, cpu_ctx, &[nfa_off_v], "f4a_nfa_ptr").ok()?
+                };
+                builder.build_store(nfa_ptr, i8_t.const_int(1, false)).ok()?;
+
+                // Continue (Rd is 3 bits, can't be PC).
+                let cont_blk = self.context.append_basic_block(block_fn, "f4a_cont");
                 builder.build_unconditional_branch(cont_blk).ok()?;
                 builder.position_at_end(cont_blk);
                 continue;
