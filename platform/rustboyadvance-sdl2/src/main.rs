@@ -121,6 +121,177 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     normal_panic(panic_info);
     // }));
 
+    // Per I11: enable_aot_on MUST be called before any
+    // skip_bios() / frame() / step. Doing it right after
+    // GameBoyAdvance::new ensures the BIOS reset path also goes
+    // through the AOT table (currently misses → scalar, but the
+    // hook is in place).
+    #[cfg(feature = "aot")]
+    let _aot_table_keepalive: Option<Box<arm7tdmi_aot::AotTable>> = if opts.aot {
+        eprintln!("--aot: scanning ROM + populating AOT table...");
+        let t0 = std::time::Instant::now();
+        let rom_bytes = std::fs::read(&opts.rom)?;
+        let entry_pc = arm7tdmi_aot::scan::cart_entry_pc(&rom_bytes)
+            .ok_or("ROM bytes 0..3 don't decode as ARM B (cart entry); not a valid GBA ROM?")?;
+        // Read seed entry pcs from the trace-in file (if any). Format:
+        // one line per entry, "08001234 thumb" or "0800abcd arm".
+        let seeds: Vec<(u32, arm7tdmi_aot::Mode)> = if let Some(path) = &opts.aot_trace_in {
+            let s = std::fs::read_to_string(path)?;
+            let mut v = Vec::new();
+            for line in s.lines() {
+                let mut it = line.split_whitespace();
+                if let (Some(hex), Some(mode_str)) = (it.next(), it.next()) {
+                    if let Ok(pc) = u32::from_str_radix(hex, 16) {
+                        let mode = match mode_str {
+                            "thumb" => arm7tdmi_aot::Mode::Thumb,
+                            "arm" => arm7tdmi_aot::Mode::Arm,
+                            _ => continue,
+                        };
+                        // Trace pcs are pipeline-head (= exec_addr + 4 in
+                        // Thumb, +8 in ARM) because scalar's block_cache
+                        // key = self.pc at dispatch which is pipeline-head.
+                        // arm7tdmi-aot's scan treats `entry_pc` as exec_addr
+                        // (= halfword address of the first executed insn),
+                        // so we have to convert here. Without this the AOT
+                        // block scans opcodes 4 bytes ahead of where scalar
+                        // actually started, producing off-by-4 blocks that
+                        // happen to alias real lookup pcs and cause
+                        // divergent state on F19 lo orphan and similar
+                        // shapes. See docs/findings-phase1-trampoline-divs.md
+                        let exec_pc = match mode {
+                            arm7tdmi_aot::Mode::Thumb => pc.wrapping_sub(4),
+                            arm7tdmi_aot::Mode::Arm => pc.wrapping_sub(8),
+                        };
+                        v.push((exec_pc, mode));
+                    }
+                }
+            }
+            eprintln!("--aot-trace-in: loaded {} seed entries from {:?}", v.len(), path);
+            v
+        } else {
+            Vec::new()
+        };
+        // Per-I monomorphized trampolines. SDL frontend uses
+        // SysBus from rustboyadvance-core.
+        //
+        // Default: phase-0 whole-block emit (proven 0 divs at sweep=0).
+        // AOT_USE_PER_INSTR=1: phase-1 per-instruction emit (works
+        // at small scale ≤ ~1000 blocks but produces divergent
+        // results at sweep>=4KB on PE — bug under investigation).
+        use rustboyadvance_core::sysbus::SysBus;
+        let use_per_instr = std::env::var("AOT_USE_PER_INSTR")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let table = if use_per_instr {
+            eprintln!("--aot: phase-1 per-instruction dispatch (AOT_USE_PER_INSTR=1)");
+            // Phase-4 cpu state offsets + bus pointers for inline IR.
+            // arm7tdmi exposes cpu offsets via Arm7tdmiCore::aot_field_offsets
+            // to keep `next_fetch_access`'s pub(crate) visibility intact.
+            // SysBus exposes scheduler_timestamp_ptr + thumb_fetch_cycles
+            // for inline cycle accumulation.
+            use arm7tdmi::Arm7tdmiCore;
+            let (pc_off, gpr_off, cpsr_off, nfa_off, pipe_off) =
+                Arm7tdmiCore::<SysBus>::aot_field_offsets();
+            let sched_ts_ptr = gba.cpu.bus.scheduler_timestamp_ptr() as u64;
+            let mut thumb_seq = [1u32; 16];
+            let mut thumb_nonseq = [1u32; 16];
+            for page in 0..16 {
+                let (s, n) = gba.cpu.bus.thumb_fetch_cycles(page);
+                thumb_seq[page] = s as u32;
+                thumb_nonseq[page] = n as u32;
+            }
+            let aot_gen_ptr = gba.cpu.bus.aot_gen_counter_ptr() as u64;
+            let aot_gen_baked = gba.cpu.bus.aot_gen_counter();
+            let cpu_offsets = arm7tdmi_aot::CpuOffsets {
+                pc: pc_off as u32,
+                gpr: gpr_off as u32,
+                cpsr: cpsr_off as u32,
+                next_fetch_access: nfa_off as u32,
+                pipeline: pipe_off as u32,
+                scheduler_timestamp_ptr: sched_ts_ptr,
+                thumb_seq_cycles: thumb_seq,
+                thumb_nonseq_cycles: thumb_nonseq,
+                aot_gen_counter_ptr: aot_gen_ptr,
+                aot_gen_baked,
+            };
+            eprintln!(
+                "--aot: phase-4 cpu offsets pc={} gpr={} cpsr={} nfa={} sched_ts={:#x} rom_seq8={} rom_nonseq8={}",
+                cpu_offsets.pc, cpu_offsets.gpr, cpu_offsets.cpsr,
+                cpu_offsets.next_fetch_access,
+                cpu_offsets.scheduler_timestamp_ptr,
+                cpu_offsets.thumb_seq_cycles[8],
+                cpu_offsets.thumb_nonseq_cycles[8],
+            );
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full_v8(
+                &rom_bytes,
+                0x0800_0000,
+                entry_pc,
+                arm7tdmi_aot::Mode::Arm,
+                &seeds,
+                arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
+                Some(arm7tdmi_aot::replay::aot_thumb_step_for::<SysBus>),
+                Some(arm7tdmi_aot::replay::aot_block_should_abort_thumb_for::<SysBus>),
+                Some(cpu_offsets),
+                Some(arm7tdmi_aot::replay::aot_thumb_fetch_only_for::<SysBus>),
+                // Phase-8: enable ARM block compilation by passing the ARM
+                // whole-block trampoline. AOT scan picks up ARM specs from
+                // BIOS / cart entry / scan-from-thumb-BX traversal.
+                Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
+                Some(&bios_bin),
+                // Phase-4 F6 helpers: bus.load_32 + idle_cycle externs.
+                Some(arm7tdmi_aot::replay::aot_load_32_for::<SysBus>),
+                Some(arm7tdmi_aot::replay::aot_idle_cycle_for::<SysBus>),
+                // Phase-4 F11 STR helper: bus.store_32 extern.
+                Some(arm7tdmi_aot::replay::aot_store_32_for::<SysBus>),
+                // Phase-4 F11 LDR helper: ldr_word extern (handles I14 ROR + cpsr.C).
+                Some(arm7tdmi_aot::replay::aot_ldr_word_for::<SysBus>),
+                // Phase-4 F10 helpers: ldr_half (misaligned ROR) + store_16.
+                Some(arm7tdmi_aot::replay::aot_ldr_half_for::<SysBus>),
+                Some(arm7tdmi_aot::replay::aot_store_16_for::<SysBus>),
+                // Phase-4 F9 LDRB/STRB helpers: load_8 + store_8.
+                Some(arm7tdmi_aot::replay::aot_load_8_for::<SysBus>),
+                Some(arm7tdmi_aot::replay::aot_store_8_for::<SysBus>),
+                // Phase-4 F8 LDSH helper: ldr_sign_half.
+                Some(arm7tdmi_aot::replay::aot_ldr_sign_half_for::<SysBus>),
+                // Phase-4P-B: block-exit pipeline restore (replaces the
+                // per-opcode pipeline shifts that the inline-cycle path
+                // skips).
+                Some(arm7tdmi_aot::replay::aot_thumb_pipeline_restore_for::<SysBus>),
+            ))
+        } else {
+            Box::new(arm7tdmi_aot::compile_rom_with_seeds_full(
+                &rom_bytes,
+                0x0800_0000,
+                entry_pc,
+                arm7tdmi_aot::Mode::Arm,
+                &seeds,
+                arm7tdmi_aot::replay::aot_replay_thumb_block_for::<SysBus>,
+                None,
+                None,
+                None,
+                None,
+                Some(arm7tdmi_aot::replay::aot_replay_arm_block_for::<SysBus>),
+                Some(&bios_bin),
+            ))
+        };
+        eprintln!(
+            "--aot: scan/compile done in {} ms; {} blocks compiled, {} pages allocated",
+            t0.elapsed().as_millis(),
+            table.block_count(),
+            table.page_count(),
+        );
+        arm7tdmi_aot::enable_aot_on(&mut gba.cpu, table.as_ref());
+        Some(table)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "aot"))]
+    if opts.aot {
+        log::warn!(
+            "--aot requested but binary built without --features aot; ignoring"
+        );
+    }
+
     if opts.skip_bios {
         println!("Skipping bios animation..");
         gba.skip_bios();
@@ -128,8 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if opts.jit {
         log::warn!(
-            "--jit is a no-op on this branch (cache_interp scalar only). \
-             AOT-LLVM work lives behind future feature flags."
+            "--jit is a no-op on this branch. use --aot for the AOT-LLVM dispatcher."
         );
     }
 
@@ -304,6 +474,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "replay done: {} frames in {:.2}s wall, {:.1} avg fps ({} emulated cycles)",
                     replay_frames, elapsed, fps, now
                 );
+                #[cfg(feature = "aot")]
+                {
+                    let h_thumb = gba.cpu.aot_dispatch_hits_thumb;
+                    let h_arm = gba.cpu.aot_dispatch_hits_arm;
+                    let m_thumb = gba.cpu.aot_dispatch_misses_thumb;
+                    let m_arm = gba.cpu.aot_dispatch_misses_arm;
+                    let h = h_thumb + h_arm;
+                    let m = m_thumb + m_arm;
+                    let total = h + m;
+                    let pct = if total > 0 { 100.0 * h as f64 / total as f64 } else { 0.0 };
+                    println!(
+                        "aot dispatch: {} hits ({} thumb / {} arm), {} misses ({} thumb / {} arm), {:.2}% coverage",
+                        h, h_thumb, h_arm, m, m_thumb, m_arm, pct
+                    );
+                }
+                if let Some(path) = &opts.aot_trace_out {
+                    let mut lines = String::new();
+                    let mut count = 0;
+                    for (pc, thumb) in gba.cpu.block_cache.rom_block_keys() {
+                        lines.push_str(&format!(
+                            "{:08x} {}\n",
+                            pc,
+                            if thumb { "thumb" } else { "arm" }
+                        ));
+                        count += 1;
+                    }
+                    std::fs::write(path, lines)?;
+                    eprintln!("--aot-trace-out: wrote {} ROM block entries to {:?}", count, path);
+                }
                 break 'running;
             }
         }

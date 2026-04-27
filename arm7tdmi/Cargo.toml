@@ -34,3 +34,8 @@ debugger = []
 # wrapper overhead from the hot path. Accuracy is preserved — the scheduler still
 # sees per-memory-access cycle advancement as it does today.
 cached_interp = []
+# Enables the AOT dispatch hook: an opaque table pointer + lookup fn the
+# arm7tdmi-aot crate installs to short-circuit block_cache lookup for
+# AOT-compiled blocks. arm7tdmi itself stays inkwell-free; the AOT crate
+# (which depends on this) does the lookup. Implies cached_interp.
+aot_dispatch = ["cached_interp"]

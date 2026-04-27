@@ -106,17 +106,19 @@ pub trait MemoryInterface {
         false
     }
 
-    /// Pay the *extra* cycles a NonSeq Thumb instruction fetch costs
-    /// over a Seq one for `addr` — i.e. `n_cycles16[page] - s_cycles16[page]`
-    /// for a SysBus-style bus, or 0 for a uniform-cost test bus.
+    /// Phase-4 helper: read a halfword without charging cycles. The
+    /// AOT inline IR does its own cycle accumulation via direct
+    /// scheduler.timestamp += K stores, then calls this for pipeline
+    /// maintenance — without this, going through `load_16` would
+    /// double-charge cycles.
     ///
-    /// The dynarec uses this to compensate `thumb_fetch_n`'s pre-paid
-    /// all-Seq fetches when an in-block STORE makes the next fetch
-    /// NonSeq under scalar dispatch. Default implementation does
-    /// nothing, which is correct for buses where fetch cost doesn't
-    /// vary by access mode (most test buses).
+    /// Default impl falls back to `load_16` (correct for buses where
+    /// cycle accounting is no-op like SimpleMemory). Real buses
+    /// override to use their internal no-cycle read path.
     #[inline]
-    fn pay_thumb_fetch_extra_nonseq(&mut self, _addr: u32) {}
+    fn read_16_no_cycles(&mut self, addr: u32) -> u16 {
+        self.load_16(addr, MemoryAccess::Seq)
+    }
 }
 
 impl<I: MemoryInterface> MemoryInterface for Arm7tdmiCore<I> {
@@ -154,6 +156,11 @@ impl<I: MemoryInterface> MemoryInterface for Arm7tdmiCore<I> {
         self.bus.idle_cycle();
     }
 
+    #[inline]
+    fn read_16_no_cycles(&mut self, addr: u32) -> u16 {
+        self.bus.read_16_no_cycles(addr & !1)
+    }
+
     #[cfg(feature = "cached_interp")]
     #[inline]
     fn take_block_cache_dirty(&mut self) -> bool {
@@ -166,10 +173,6 @@ impl<I: MemoryInterface> MemoryInterface for Arm7tdmiCore<I> {
         self.bus.cached_block_should_abort()
     }
 
-    #[inline]
-    fn pay_thumb_fetch_extra_nonseq(&mut self, addr: u32) {
-        self.bus.pay_thumb_fetch_extra_nonseq(addr);
-    }
 }
 
 /// Implementation of memory access helpers

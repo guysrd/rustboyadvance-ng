@@ -1,0 +1,24 @@
+[package]
+name = "arm7tdmi-aot"
+version = "0.1.0"
+edition = "2024"
+
+# AOT-LLVM dispatcher for the ARM7TDMI core. Compiles ROM blocks to
+# native code at load time. See docs/aot-llvm-program.md for the
+# experiment program. Requires LLVM 18 at build time:
+#   export LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
+
+[dependencies]
+arm7tdmi = { path = "../arm7tdmi", features = ["cached_interp", "aot_dispatch"] }
+rustc-hash = "2"
+
+[dependencies.inkwell]
+version = "0.9"
+# llvm18-1-prefer-dynamic links libLLVM-18.so.1 dynamically. The
+# default llvm18-1 feature pulls libPolly via static linking, but
+# Ubuntu 24.04's llvm-18-dev package ships WITHOUT libPolly.a (it's
+# in libpolly-18-dev). prefer-dynamic side-steps that.
+features = ["llvm18-1-prefer-dynamic"]
+
+[features]
+default = []

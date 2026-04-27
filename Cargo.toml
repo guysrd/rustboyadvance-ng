@@ -2,6 +2,7 @@
 members = [
     "core",
     "arm7tdmi",
+    "arm7tdmi-aot",
     "utils",
     "platform/rustboyadvance-sdl2",
     "platform/rustboyadvance-libretro",
@@ -21,6 +22,15 @@ debug = true
 
 [profile.release]
 debug = false
+
+[profile.release-cgu1]
+inherits = "release"
+codegen-units = 1
+
+[profile.release-thinlto]
+inherits = "release"
+codegen-units = 1
+lto = "thin"
 
 [profile.release-dev]
 inherits = "release"

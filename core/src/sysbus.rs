@@ -156,6 +156,12 @@ pub struct SysBus {
 
     cycle_luts: CycleLookupTables,
 
+    /// Phase-4P-A: WAITCNT generation counter. Starts at 0, bumps on
+    /// every WAITCNT write. AOT inline-cycle paths bake this at compile
+    /// time and verify at block prologue; on mismatch the block yields
+    /// to scalar (correctness-first stop-gap until I7 recompile).
+    aot_gen_counter: u32,
+
     pub trace_access: bool,
 
     /// Cached-interpreter invalidation signal. Set whenever the CPU or DMA
@@ -198,6 +204,7 @@ impl SysBus {
             ewram,
             iwram,
             cycle_luts: luts,
+            aot_gen_counter: 0,
             trace_access: false,
 
             #[cfg(feature = "cached_interp")]
@@ -247,9 +254,50 @@ impl SysBus {
 
     pub fn on_waitcnt_written(&mut self, waitcnt: WaitControl) {
         self.cycle_luts.update_gamepak_waitstates(waitcnt);
+        // Phase-4P-A: bump gen counter so AOT inline paths see stale.
+        // wraping_add is fine — even at u32 wrap, the chance of a
+        // false-match is 1 in 4 billion writes.
+        self.aot_gen_counter = self.aot_gen_counter.wrapping_add(1);
+    }
+
+    /// Phase-4P-A: raw `*const u32` to the WAITCNT generation counter.
+    /// Pointer is stable for the bus lifetime; AOT compiler bakes it
+    /// and emits a load+cmp at block prologue.
+    pub fn aot_gen_counter_ptr(&self) -> *const u32 {
+        &self.aot_gen_counter as *const u32
+    }
+
+    /// Phase-4P-A: read current generation counter value. Used by the
+    /// AOT compiler at compile time to bake the expected value into
+    /// each compiled block's prologue check.
+    pub fn aot_gen_counter(&self) -> u32 {
+        self.aot_gen_counter
     }
     pub fn idle_cycle(&mut self) {
         self.scheduler.update(1);
+    }
+
+    /// Phase-4 hook: raw `*mut usize` pointing at `scheduler.timestamp`.
+    /// The AOT compiler bakes this as a constant in the LLVM IR so
+    /// inline cycle accounting can do `*ts_ptr += K` directly without
+    /// going through bus.add_cycles. Pointer is stable for the bus's
+    /// lifetime (Shared<Scheduler> is Rc<UnsafeCell<Scheduler>>).
+    /// `timestamp` is at offset 0 in the `Scheduler` struct.
+    pub fn scheduler_timestamp_ptr(&self) -> *mut usize {
+        let sched_ref: &Scheduler = &self.scheduler;
+        sched_ref as *const Scheduler as *mut usize
+    }
+
+    /// Phase-4 hook: cycle cost for a Thumb16 fetch at the given page,
+    /// for both Seq and NonSeq access. Used by the AOT compiler at
+    /// emit time to bake cycle-cost constants into the LLVM IR.
+    /// Per I7, these are stable until WAITCNT changes (which triggers
+    /// AOT recompile).
+    pub fn thumb_fetch_cycles(&self, page: usize) -> (usize, usize) {
+        (
+            self.cycle_luts.s_cycles16[page],
+            self.cycle_luts.n_cycles16[page],
+        )
     }
 
     #[inline(always)]
@@ -578,20 +626,14 @@ impl MemoryInterface for SysBus {
         self.scheduler.update(1)
     }
 
-    /// Charge `n_cycles16[page] - s_cycles16[page]` for the dynarec's
-    /// in-block STORE NonSeq compensation. The dynarec's
-    /// `thumb_fetch_n` pre-paid every fetch after the first as Seq,
-    /// but scalar STR sets the next fetch's access to NonSeq via
-    /// `CpuAction::AdvancePC(NonSeq)`. The compiled code calls into
-    /// here once per intermediate store to make the timing match.
+    /// Phase-4 override: skip the per-fetch cycle charge that the
+    /// default load_16 path always does, since the AOT inline IR
+    /// does its own cycle accumulation via direct scheduler.timestamp
+    /// += K stores. Without this override, going through load_16
+    /// would double-charge.
     #[inline]
-    fn pay_thumb_fetch_extra_nonseq(&mut self, addr: u32) {
-        let page = ((addr >> 24) & 0xF) as usize;
-        let delta = self.cycle_luts.n_cycles16[page]
-            .saturating_sub(self.cycle_luts.s_cycles16[page]);
-        if delta > 0 {
-            self.scheduler.update(delta);
-        }
+    fn read_16_no_cycles(&mut self, addr: u32) -> u16 {
+        self.read_16(addr)
     }
 
     #[cfg(feature = "cached_interp")]

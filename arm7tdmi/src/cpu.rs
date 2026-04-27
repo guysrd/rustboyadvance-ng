@@ -17,6 +17,7 @@ use super::reg_string;
 use super::{Addr, CpuMode, CpuState, arm::ArmCond, psr::RegPSR};
 
 use super::memory::{MemoryAccess, MemoryInterface};
+use super::registers_consts::{REG_LR, REG_PC, REG_SP};
 use MemoryAccess::*;
 
 use cfg_if::cfg_if;
@@ -93,6 +94,15 @@ pub struct DebuggerState {
     pub trace_exceptions: bool,
 }
 
+/// No-op AOT lookup stub. Returns 0 always. The default for
+/// `aot_lookup_fn` so the dispatcher can call it unconditionally
+/// without an Option discriminator branch. Replaced by the real
+/// lookup fn when AOT is enabled via `install_aot_hook`.
+#[cfg(feature = "aot_dispatch")]
+pub fn aot_lookup_noop(_table: *const u8, _pc: u32) -> usize {
+    0
+}
+
 pub struct Arm7tdmiCore<I: MemoryInterface> {
     pub pc: u32,
     pub bus: Shared<I>,
@@ -117,6 +127,45 @@ pub struct Arm7tdmiCore<I: MemoryInterface> {
     /// `cached_interp` feature is on; zero-sized otherwise.
     #[cfg(feature = "cached_interp")]
     pub block_cache: super::cache::BlockCache<I>,
+
+    /// AOT dispatch hook (per I18 in docs/aot-llvm-program.md).
+    /// Opaque pointer to an AotTable defined in the arm7tdmi-aot
+    /// crate; we keep it as raw `*const u8` here so this crate
+    /// stays inkwell-free. `enable_aot_hook` (called by the AOT
+    /// crate) populates both fields.
+    ///
+    /// Lookup signature: `fn(table, pc) -> usize`. Returns the
+    /// CompiledFn address as a usize (cast back at dispatch site),
+    /// or 0 if no AOT block exists at that pc.
+    ///
+    /// CompiledFn signature (per I8): `extern "C" fn(*mut u8 cpu_ctx,
+    /// *mut u32 pc_out) -> u32` returning 0 / 0b01 (branch) / 0b10
+    /// (abort).
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_table: *const u8,
+    /// AOT lookup hot-path fn ptr. Initialized to a no-op stub that
+    /// always returns 0 so `try_aot_dispatch` can call it
+    /// unconditionally without an `Option` discriminator branch.
+    /// Replaced by the real lookup fn (set by `enable_aot_hook`)
+    /// when AOT is enabled. Saves ~0.5ns per dispatch vs Option check.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_lookup_fn: fn(*const u8, u32) -> usize,
+    /// Phase-8 ARM-mode lookup. Dispatcher uses this when cpsr=ARM.
+    /// Defaults to the no-op stub (returns 0) so try_aot_dispatch can
+    /// call it unconditionally.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_lookup_fn_arm: fn(*const u8, u32) -> usize,
+    /// Per-mode coverage counters bumped from `step_block`. The
+    /// un-segmented total is just `thumb + arm` — recovered at print
+    /// time, no extra runtime add per dispatch.
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_hits_thumb: u64,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_hits_arm: u64,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_misses_thumb: u64,
+    #[cfg(feature = "aot_dispatch")]
+    pub aot_dispatch_misses_arm: u64,
 }
 
 // BlockCache holds handler function pointers keyed by entry-PC; cloning a CPU
@@ -139,6 +188,24 @@ impl<I: MemoryInterface> Clone for Arm7tdmiCore<I> {
             dbg: self.dbg.clone(),
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
+            // AOT hook intentionally NOT cloned: cloned CPUs are
+            // typically used for tests / save-states which don't
+            // share the AOT table state. Re-installing the hook is
+            // the caller's responsibility.
+            #[cfg(feature = "aot_dispatch")]
+            aot_table: std::ptr::null(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn_arm: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_arm: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_arm: 0,
         }
     }
 }
@@ -163,11 +230,914 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
 
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_table: std::ptr::null(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn_arm: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_arm: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_arm: 0,
         }
     }
 
     pub fn weak_ptr(&mut self) -> WeakPointer<Arm7tdmiCore<I>> {
         WeakPointer::new(self as *mut Arm7tdmiCore<I>)
+    }
+
+    /// Install the AOT dispatch hook (per I18). The arm7tdmi-aot
+    /// crate calls this with its `*const AotTable` (cast to
+    /// `*const u8`) and an `aot_lookup` fn that returns the
+    /// CompiledFn address as a `usize` (0 if no AOT block exists
+    /// at that pc).
+    ///
+    /// Caller MUST call this before the first `step_block` per I11
+    /// — otherwise the cold-start BIOS boot misses the AOT cache
+    /// and runs scalar.
+    #[cfg(feature = "aot_dispatch")]
+    pub fn install_aot_hook(
+        &mut self,
+        table: *const u8,
+        lookup_fn: fn(*const u8, u32) -> usize,
+    ) {
+        self.aot_table = table;
+        self.aot_lookup_fn = lookup_fn;
+    }
+
+    /// Phase-8: install ARM-mode AOT lookup hook. Called alongside
+    /// `install_aot_hook` (which sets the Thumb hook + table ptr).
+    /// The same `aot_table` is used by both lookups.
+    #[cfg(feature = "aot_dispatch")]
+    pub fn install_aot_hook_arm(
+        &mut self,
+        lookup_fn: fn(*const u8, u32) -> usize,
+    ) {
+        self.aot_lookup_fn_arm = lookup_fn;
+    }
+
+    /// AOT-side helper: per-iter Thumb step (fetch + pipeline shift +
+    /// THUMB_LUT handler dispatch + AdvancePC bookkeeping). Mirrors
+    /// what scalar `replay_cached_block` does for one iteration.
+    /// Phase-4 cpu state offsets for the AOT inline-IR emit.
+    /// next_fetch_access + pipeline are `pub(crate)` so external
+    /// crates can't use `std::mem::offset_of!` directly — exposing
+    /// the offsets via this fn keeps the field visibility narrow
+    /// while letting the AOT compiler bake them as constants.
+    /// Returns (pc, gpr, cpsr, next_fetch_access, pipeline).
+    pub fn aot_field_offsets() -> (usize, usize, usize, usize, usize) {
+        (
+            std::mem::offset_of!(Arm7tdmiCore<I>, pc),
+            std::mem::offset_of!(Arm7tdmiCore<I>, gpr),
+            std::mem::offset_of!(Arm7tdmiCore<I>, cpsr),
+            std::mem::offset_of!(Arm7tdmiCore<I>, next_fetch_access),
+            std::mem::offset_of!(Arm7tdmiCore<I>, pipeline),
+        )
+    }
+
+    /// arm7tdmi-aot's phase-0 trampoline calls this once per opcode.
+    ///
+    /// Returns:
+    ///   0 → AdvancePC (continue to next instruction).
+    ///   1 → PipelineFlushed (handler updated cpu.pc + cpu.pipeline
+    ///       at branch target; caller exits the block).
+    ///
+    /// Per A1 audit: no Thumb handler reads `pipeline[]`, so the
+    /// `read_16` fetch is for cycle accounting only. Phase 0 keeps
+    /// the actual load to match scalar exactly; phase 4 (per the
+    /// ladder) inlines `add_cycles` and elides the load.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_thumb_step(&mut self, fetch_addr: u32, insn: u32) -> u32 {
+        let access = self.next_fetch_access;
+        let val = self.load_16(fetch_addr, access);
+        self.pipeline[0] = self.pipeline[1];
+        self.pipeline[1] = val as u32;
+        // Pipeline-head pc convention: scalar's self.pc at handler-call
+        // time IS `fetch_addr` (= exec_addr + 4). After AdvancePC
+        // scalar advances pc by 2 → exec_addr + 6 = fetch_addr + 2.
+        self.pc = fetch_addr;
+
+        // Phase-1 Rust-level inline fast paths: skip THUMB_LUT + indirect
+        // handler call for opcodes the AOT path explicitly knows how to
+        // execute. Saves ~3-5ns per inlined instr (one indirect call).
+        // Each fast path is bit-exact with the corresponding scalar
+        // handler in arm7tdmi/src/thumb/exec.rs (verified by SDL replay
+        // diff). Add formats here as their bit-exact equivalent is
+        // ported.
+        let top3 = (insn >> 13) & 0x7;
+        if top3 == 0b000 {
+            // F1 MoveShiftedReg (LSL/LSR/ASR Rd, Rs, #imm5) — bits 15:13 = 000
+            // AND bits 12:11 != 0b11 (the 0b11 case is F2 AddSub).
+            // Encoding: 000_oo_IIIII_SSS_DDD where oo ∈ {LSL=0, LSR=1, ASR=2}.
+            // Mirrors thumb/exec.rs::exec_thumb_move_shifted_reg.
+            let bs_op_bits = ((insn >> 11) & 0x3) as u8;
+            if bs_op_bits != 0b11 {
+                let imm = ((insn >> 6) & 0x1f) as u32;
+                let rs = ((insn >> 3) & 0x7) as usize;
+                let rd = (insn & 0x7) as usize;
+                let mut carry = self.cpsr.C();
+                let bsop = match bs_op_bits {
+                    0 => crate::BarrelShiftOpCode::LSL,
+                    1 => crate::BarrelShiftOpCode::LSR,
+                    2 => crate::BarrelShiftOpCode::ASR,
+                    _ => unsafe { std::hint::unreachable_unchecked() },
+                };
+                let op2 = self.barrel_shift_op(bsop, self.gpr[rs], imm, &mut carry, true);
+                self.gpr[rd] = op2;
+                self.alu_update_flags(op2, false, carry, self.cpsr.V());
+                self.next_fetch_access = MemoryAccess::Seq;
+                self.pc = fetch_addr.wrapping_add(2);
+                return 0; // AdvancePC
+            }
+            // F2 AddSub — bits 15:11 = 00011 (the 0b11 case above).
+            // Encoding: 00011_I_S_NNN_SSS_DDD where:
+            //   I=bit 10 (1 → imm3), S=bit 9 (1 → SUB), NNN=bits 8:6 (Rn or imm3).
+            // Mirrors thumb/exec.rs::exec_thumb_add_sub.
+            let sub = (insn >> 9) & 0x1 != 0;
+            let imm_flag = (insn >> 10) & 0x1 != 0;
+            let rn_or_imm = ((insn >> 6) & 0x7) as u32;
+            let rs = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let op1 = self.gpr[rs];
+            let op2 = if imm_flag { rn_or_imm } else { self.gpr[rn_or_imm as usize] };
+            let mut carry = self.cpsr.C();
+            let mut overflow = self.cpsr.V();
+            let result = if sub {
+                self.alu_sub_flags(op1, op2, &mut carry, &mut overflow)
+            } else {
+                self.alu_add_flags(op1, op2, &mut carry, &mut overflow)
+            };
+            self.alu_update_flags(result, true, carry, overflow);
+            self.gpr[rd] = result;
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        if top3 == 0b001 {
+            // F3 MOV/CMP/ADD/SUB Rd, #imm8 — bits 15:13 = 0b001.
+            // Encoding: 001_oo_RRR_IIIIIIII (oo selects op).
+            //   00 MOV: Rd = imm8        (bit-exact with exec_thumb_data_process_imm<0,RD>)
+            //   01 CMP: temp = Rd - imm8 (no writeback) (op=1)
+            //   10 ADD: Rd = Rd + imm8                  (op=2)
+            //   11 SUB: Rd = Rd - imm8                  (op=3)
+            // Mirrors thumb/exec.rs::exec_thumb_data_process_imm — same
+            // helpers (alu_add_flags / alu_sub_flags / alu_update_flags).
+            let op = ((insn >> 11) & 0x3) as u8;
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let imm = (insn & 0xff) as u32;
+            let op1 = self.gpr[rd];
+            let mut carry = self.cpsr.C();
+            let mut overflow = self.cpsr.V();
+            let result = match op {
+                0 => imm,                                                       // MOV
+                1 | 3 => self.alu_sub_flags(op1, imm, &mut carry, &mut overflow), // CMP / SUB
+                2 => self.alu_add_flags(op1, imm, &mut carry, &mut overflow),   // ADD
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            };
+            let arithmetic = op == 2 || op == 3; // ADD / SUB
+            self.alu_update_flags(result, arithmetic, carry, overflow);
+            if op != 1 {
+                self.gpr[rd] = result; // skip writeback for CMP
+            }
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F4 ALU ops — raw & 0xfc00 == 0x4000 (top6 = 010000).
+        // Encoding: 010000_OOOO_SSS_DDD; OOOO indexes ThumbAluOps.
+        // Mirrors thumb/exec.rs::exec_thumb_alu_ops.
+        if (insn & 0xfc00) == 0x4000 {
+            let op = ((insn >> 6) & 0xf) as u8;
+            let rs = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let dst = self.gpr[rd];
+            let src = self.gpr[rs];
+            let mut carry = self.cpsr.C();
+            let mut overflow = self.cpsr.V();
+            // Helper: shift-by-register pattern with one idle cycle (used by
+            // LSL/LSR/ASR/ROR variants of F4).
+            let result = match op {
+                0b0000 | 0b1000 => dst & src,                                       // AND / TST
+                0b0001 => dst ^ src,                                                // EOR
+                0b0010 => {                                                          // LSL
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::LSL, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0011 => {                                                          // LSR
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::LSR, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0100 => {                                                          // ASR
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::ASR, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0111 => {                                                          // ROR
+                    let r = self.shift_by_register(crate::BarrelShiftOpCode::ROR, rd, rs, &mut carry);
+                    self.idle_cycle();
+                    r
+                }
+                0b0101 => self.alu_adc_flags(dst, src, &mut carry, &mut overflow),  // ADC
+                0b0110 => self.alu_sbc_flags(dst, src, &mut carry, &mut overflow),  // SBC
+                0b1001 => self.alu_sub_flags(0, src, &mut carry, &mut overflow),    // NEG
+                0b1010 => self.alu_sub_flags(dst, src, &mut carry, &mut overflow),  // CMP
+                0b1011 => self.alu_add_flags(dst, src, &mut carry, &mut overflow),  // CMN
+                0b1100 => dst | src,                                                 // ORR
+                0b1101 => {                                                          // MUL
+                    let m = self.get_required_multipiler_array_cycles(src);
+                    for _ in 0..m {
+                        self.idle_cycle();
+                    }
+                    carry = false;
+                    overflow = false;
+                    dst.wrapping_mul(src)
+                }
+                0b1110 => dst & (!src),                                              // BIC
+                0b1111 => !src,                                                       // MVN
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            };
+            // is_arithmetic: ADC / SBC / NEG / CMP / CMN.
+            let arithmetic = matches!(op, 0b0101 | 0b0110 | 0b1001 | 0b1010 | 0b1011);
+            self.alu_update_flags(result, arithmetic, carry, overflow);
+            // is_setting_flags (no writeback): TST / CMP / CMN.
+            let setting_flags = matches!(op, 0b1000 | 0b1010 | 0b1011);
+            if !setting_flags {
+                self.gpr[rd] = result;
+            }
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F5 HiRegOpOrBranchExchange — raw & 0xfc00 == 0x4400.
+        // Encoding: 010001_OO_H1_H2_SSS_DDD where OO ∈ {ADD=0, CMP=1, MOV=2, BX=3}.
+        // Mirrors thumb/exec.rs::exec_thumb_hi_reg_op_or_bx. PipelineFlushed
+        // cases (BX always; ADD/MOV with Rd=R15) return 1 — same as scalar.
+        if (insn & 0xfc00) == 0x4400 {
+            let op = ((insn >> 8) & 0x3) as u8;
+            let h1 = ((insn >> 7) & 0x1) as usize;
+            let h2 = ((insn >> 6) & 0x1) as usize;
+            let rs_low = ((insn >> 3) & 0x7) as usize;
+            let rd_low = (insn & 0x7) as usize;
+            let dst_reg = if h1 == 1 { rd_low + 8 } else { rd_low };
+            let src_reg = if h2 == 1 { rs_low + 8 } else { rs_low };
+            // Per pc_thumb / get_reg semantics: at this point self.pc =
+            // fetch_addr (pipeline-head pc), so get_reg(15) returns the
+            // pipeline-head pc which is what scalar's handler also sees.
+            if op == 3 {
+                // BX — always pipeline flush.
+                self.branch_exchange(self.get_reg(src_reg));
+                return 1; // PipelineFlushed
+            }
+            let op1 = self.get_reg(dst_reg);
+            let op2 = self.get_reg(src_reg);
+            match op {
+                0 => {
+                    // ADD
+                    self.set_reg(dst_reg, op1.wrapping_add(op2));
+                    if dst_reg == REG_PC {
+                        self.reload_pipeline16();
+                        return 1; // PipelineFlushed
+                    }
+                }
+                1 => {
+                    // CMP
+                    let mut carry = self.cpsr.C();
+                    let mut overflow = self.cpsr.V();
+                    let result = self.alu_sub_flags(op1, op2, &mut carry, &mut overflow);
+                    self.alu_update_flags(result, true, carry, overflow);
+                }
+                2 => {
+                    // MOV
+                    self.set_reg(dst_reg, op2);
+                    if dst_reg == REG_PC {
+                        self.reload_pipeline16();
+                        return 1; // PipelineFlushed
+                    }
+                }
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            }
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F6 LDR PC-relative (load from literal pool) — raw & 0xf800 == 0x4800.
+        // Encoding: 01001_DDD_IIIIIIII (Rd, word8 = imm << 2).
+        // Mirrors thumb/exec.rs::exec_thumb_ldr_pc which uses (pc & !3) + ofs
+        // where pc is pipeline-head (= exec_addr + 4).
+        if (insn & 0xf800) == 0x4800 {
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let imm = ((insn & 0xff) << 2) as u32;
+            let addr = (self.pc & !3).wrapping_add(imm);
+            self.gpr[rd] = self.ldr_word(addr, MemoryAccess::NonSeq);
+            self.idle_cycle();
+            // F6 returns AdvancePC(NonSeq), not Seq.
+            self.next_fetch_access = MemoryAccess::NonSeq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F7 LDR/STR with reg offset — raw & 0xf200 == 0x5000.
+        // Encoding: 0101_LB_0_OOO_BBB_DDD; L=bit 11 (load), B=bit 10 (byte), O=Ro.
+        // addr = gpr[Rb] + gpr[Ro]. Mirrors thumb/exec.rs::exec_thumb_ldr_str_reg_offset.
+        if (insn & 0xf200) == 0x5000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let byte = (insn >> 10) & 0x1 != 0;
+            let ro = ((insn >> 6) & 0x7) as usize;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let addr = self.gpr[rb].wrapping_add(self.gpr[ro]);
+            if load {
+                let data = if byte {
+                    self.load_8(addr, MemoryAccess::NonSeq) as u32
+                } else {
+                    self.ldr_word(addr, MemoryAccess::NonSeq)
+                };
+                self.gpr[rd] = data;
+                self.idle_cycle();
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                let value = self.gpr[rd];
+                if byte {
+                    self.store_8(addr, value as u8, MemoryAccess::NonSeq);
+                } else {
+                    self.store_aligned_32(addr, value, MemoryAccess::NonSeq);
+                }
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F8 LDR/STR sign-extended/halfword reg-offset — raw & 0xf200 == 0x5200.
+        // Encoding: 0101_HS_1_OOO_BBB_DDD; H=bit 11 (halfword), S=bit 10 (sign-ext).
+        //   (S,H) = (0,0) STRH, (0,1) LDRH, (1,0) LDSB, (1,1) LDSH
+        // Mirrors thumb/exec.rs::exec_thumb_ldr_str_shb. Always returns
+        // AdvancePC(NonSeq).
+        if (insn & 0xf200) == 0x5200 {
+            let halfword = (insn >> 11) & 0x1 != 0;
+            let sign_extend = (insn >> 10) & 0x1 != 0;
+            let ro = ((insn >> 6) & 0x7) as usize;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let addr = self.gpr[rb].wrapping_add(self.gpr[ro]);
+            match (sign_extend, halfword) {
+                (false, false) => {
+                    // STRH
+                    self.store_aligned_16(addr, self.gpr[rd] as u16, MemoryAccess::NonSeq);
+                }
+                (false, true) => {
+                    // LDRH
+                    self.gpr[rd] = self.ldr_half(addr, MemoryAccess::NonSeq);
+                    self.idle_cycle();
+                }
+                (true, false) => {
+                    // LDSB — load_8 then sign-extend i8 → i32 → u32
+                    let val = self.load_8(addr, MemoryAccess::NonSeq) as i8 as i32 as u32;
+                    self.gpr[rd] = val;
+                    self.idle_cycle();
+                }
+                (true, true) => {
+                    // LDSH
+                    self.gpr[rd] = self.ldr_sign_half(addr, MemoryAccess::NonSeq);
+                    self.idle_cycle();
+                }
+            }
+            self.next_fetch_access = MemoryAccess::NonSeq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F10 LDRH/STRH with imm5*2 offset — raw & 0xf000 == 0x8000.
+        // Encoding: 1000_L_IIIII_BBB_DDD; L=bit 11 (load).
+        // offset = imm5 << 1. Mirrors thumb/exec.rs::exec_thumb_ldr_str_halfword.
+        if (insn & 0xf000) == 0x8000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let imm5 = ((insn >> 6) & 0x1f) as i32;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let base = self.gpr[rb] as i32;
+            let addr = base.wrapping_add(imm5 << 1) as u32;
+            if load {
+                let data = self.ldr_half(addr, MemoryAccess::NonSeq);
+                self.idle_cycle();
+                self.gpr[rd] = data;
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                self.store_aligned_16(addr, self.gpr[rd] as u16, MemoryAccess::NonSeq);
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F9 LDR/STR with imm5 offset — raw & 0xe000 == 0x6000.
+        // Encoding: 011_BL_IIIII_BBB_DDD; B=bit 12 (1 → byte), L=bit 11 (1 → load).
+        // Mirrors thumb/exec.rs::exec_thumb_ldr_str_imm_offset → do_exec_thumb_ldr_str.
+        if (insn & 0xe000) == 0x6000 {
+            let byte = (insn >> 12) & 0x1 != 0;
+            let load = (insn >> 11) & 0x1 != 0;
+            let imm5 = ((insn >> 6) & 0x1f) as u32;
+            let rb = ((insn >> 3) & 0x7) as usize;
+            let rd = (insn & 0x7) as usize;
+            let offset = if byte { imm5 } else { imm5 << 2 };
+            let addr = self.gpr[rb].wrapping_add(offset);
+            if load {
+                let data = if byte {
+                    self.load_8(addr, MemoryAccess::NonSeq) as u32
+                } else {
+                    self.ldr_word(addr, MemoryAccess::NonSeq)
+                };
+                self.gpr[rd] = data;
+                self.idle_cycle();
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                let value = self.gpr[rd];
+                if byte {
+                    self.store_8(addr, value as u8, MemoryAccess::NonSeq);
+                } else {
+                    self.store_aligned_32(addr, value, MemoryAccess::NonSeq);
+                }
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F11 LDR/STR SP-relative (word) — raw & 0xf000 == 0x9000.
+        // Encoding: 1001_L_DDD_IIIIIIII; L=bit 11 (1 → load).
+        // word8 = imm << 2. Mirrors thumb/exec.rs::exec_thumb_ldr_str_sp.
+        if (insn & 0xf000) == 0x9000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let word8 = ((insn & 0xff) << 2) as u32;
+            let addr = self.gpr[REG_SP].wrapping_add(word8);
+            if load {
+                let data = self.ldr_word(addr, MemoryAccess::NonSeq);
+                self.idle_cycle();
+                self.gpr[rd] = data;
+                self.next_fetch_access = MemoryAccess::Seq;
+            } else {
+                self.store_aligned_32(addr, self.gpr[rd], MemoryAccess::NonSeq);
+                self.next_fetch_access = MemoryAccess::NonSeq;
+            }
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F12 LoadAddress (ADD Rd, [PC|SP], #imm8) — raw & 0xf000 == 0xa000.
+        // Encoding: 1010_S_DDD_IIIIIIII; S=bit 11 (1 → SP, 0 → PC).
+        // Mirrors thumb/exec.rs::exec_thumb_load_address.
+        if (insn & 0xf000) == 0xa000 {
+            let sp = (insn >> 11) & 0x1 != 0;
+            let rd = ((insn >> 8) & 0x7) as usize;
+            let imm = ((insn & 0xff) << 2) as u32; // word8: imm << 2
+            // self.pc here is fetch_addr = exec_addr + 4. pc_thumb() = pc - 4.
+            // Per scalar: (pc_thumb() & !2) + 4 + imm = ((fetch_addr - 4) & !2) + 4 + imm.
+            let val = if sp {
+                self.gpr[REG_SP].wrapping_add(imm)
+            } else {
+                ((self.pc.wrapping_sub(4)) & !0b10).wrapping_add(4).wrapping_add(imm)
+            };
+            self.gpr[rd] = val;
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F13 AddSp (ADD/SUB SP, #imm7<<2) — raw & 0xff00 == 0xb000.
+        // Encoding: 10110000_S_IIIIIII; S=bit 7 (1 → SUB).
+        // Mirrors thumb/exec.rs::exec_thumb_add_sp.
+        if (insn & 0xff00) == 0xb000 {
+            let sub = (insn >> 7) & 0x1 != 0;
+            let offset = ((insn & 0x7f) << 2) as i32;
+            let sp = self.gpr[REG_SP] as i32;
+            self.gpr[REG_SP] = if sub {
+                sp.wrapping_sub(offset) as u32
+            } else {
+                sp.wrapping_add(offset) as u32
+            };
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC
+        }
+
+        // F15 LDM/STM — raw & 0xf000 == 0xc000.
+        // Encoding: 1100_L_BBB_RRRRRRRR; L=bit 11 (load), B=Rb (bits 10:8).
+        // Mirrors thumb/exec.rs::exec_thumb_ldm_stm. Always returns
+        // AdvancePC(NonSeq) unless empty-rlist LDM (which flushes pipeline).
+        if (insn & 0xf000) == 0xc000 {
+            let load = (insn >> 11) & 0x1 != 0;
+            let rb = ((insn >> 8) & 0x7) as usize;
+            let rlist = (insn & 0xff) as u8;
+            let align_preserve = self.gpr[rb] & 3;
+            let mut addr = self.gpr[rb] & !3;
+            if rlist != 0 {
+                if load {
+                    let mut access = MemoryAccess::NonSeq;
+                    for r in 0..8 {
+                        if (rlist >> r) & 1 != 0 {
+                            let val = self.load_32(addr, access);
+                            access = MemoryAccess::Seq;
+                            addr = addr.wrapping_add(4);
+                            self.gpr[r] = val;
+                        }
+                    }
+                    self.idle_cycle();
+                    if (rlist >> rb) & 1 == 0 {
+                        self.gpr[rb] = addr.wrapping_add(align_preserve);
+                    }
+                } else {
+                    let mut first = true;
+                    let mut access = MemoryAccess::NonSeq;
+                    let count = (rlist.count_ones() as u32).wrapping_sub(1);
+                    for r in 0..8 {
+                        if (rlist >> r) & 1 != 0 {
+                            let v = if r != rb {
+                                self.gpr[r]
+                            } else if first {
+                                addr
+                            } else {
+                                addr.wrapping_add(count.wrapping_mul(4))
+                            };
+                            self.store_32(addr, v, access);
+                            access = MemoryAccess::Seq;
+                            addr = addr.wrapping_add(4);
+                            first = false;
+                        }
+                        // Mirrors scalar's quirky "set rb every iter" pattern.
+                        self.gpr[rb] = addr.wrapping_add(align_preserve);
+                    }
+                }
+            } else {
+                // Empty rlist edge case (GBATEK ARMv4 quirk):
+                // LDM empty: loads PC from addr; STM empty: stores PC+2 at addr.
+                // Both: rb += 0x40.
+                if load {
+                    let val = self.load_32(addr, MemoryAccess::NonSeq);
+                    self.pc = val & !1;
+                    self.reload_pipeline16();
+                    addr = addr.wrapping_add(0x40);
+                    self.gpr[rb] = addr.wrapping_add(align_preserve);
+                    return 1; // PipelineFlushed
+                } else {
+                    self.store_32(addr, self.pc.wrapping_add(2), MemoryAccess::NonSeq);
+                    addr = addr.wrapping_add(0x40);
+                    self.gpr[rb] = addr.wrapping_add(align_preserve);
+                }
+            }
+            self.next_fetch_access = MemoryAccess::NonSeq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC(NonSeq)
+        }
+
+        // F14 PUSH/POP — raw & 0xf600 == 0xb400.
+        // Encoding: 1011_L_10_R_RRRRRRRR; L=bit 11 (1=POP), R=bit 8 (LR/PC).
+        // Mirrors thumb/exec.rs::exec_thumb_push_pop.
+        if (insn & 0xf600) == 0xb400 {
+            let pop = (insn >> 11) & 0x1 != 0;
+            let flag_r = (insn >> 8) & 0x1 != 0;
+            let rlist = (insn & 0xff) as u8;
+            if pop {
+                let mut access = MemoryAccess::NonSeq;
+                for r in 0..8 {
+                    if (rlist >> r) & 1 != 0 {
+                        let stack_addr = self.gpr[REG_SP] & !3;
+                        self.gpr[r] = self.load_32(stack_addr, access);
+                        access = MemoryAccess::Seq;
+                        self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_add(4);
+                    }
+                }
+                if flag_r {
+                    // pop! 1-arg in scalar uses Seq.
+                    let stack_addr = self.gpr[REG_SP] & !3;
+                    let val = self.load_32(stack_addr, MemoryAccess::Seq);
+                    self.set_reg(REG_PC, val);
+                    self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_add(4);
+                    self.pc &= !1;
+                    self.reload_pipeline16();
+                    self.idle_cycle();
+                    return 1; // PipelineFlushed
+                }
+                self.idle_cycle();
+                self.next_fetch_access = MemoryAccess::NonSeq;
+                self.pc = fetch_addr.wrapping_add(2);
+                return 0; // AdvancePC(NonSeq)
+            } else {
+                // PUSH
+                let mut access = MemoryAccess::NonSeq;
+                if flag_r {
+                    self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_sub(4);
+                    let stack_addr = self.gpr[REG_SP] & !3;
+                    self.store_32(stack_addr, self.gpr[REG_LR], access);
+                    access = MemoryAccess::Seq;
+                }
+                for r in (0..8).rev() {
+                    if (rlist >> r) & 1 != 0 {
+                        self.gpr[REG_SP] = self.gpr[REG_SP].wrapping_sub(4);
+                        let stack_addr = self.gpr[REG_SP] & !3;
+                        self.store_32(stack_addr, self.gpr[r], access);
+                        access = MemoryAccess::Seq;
+                    }
+                }
+                self.next_fetch_access = MemoryAccess::NonSeq;
+                self.pc = fetch_addr.wrapping_add(2);
+                return 0; // AdvancePC(NonSeq)
+            }
+        }
+
+        // F16 Bcc — raw & 0xf000 == 0xd000.
+        // Encoding: 1101_CCCC_IIIIIIII where CCCC=cond, IIIIIIII signed imm8.
+        // SWI (cond=0xF) and undefined (cond=0xE) handled via LUT below.
+        // Mirrors thumb/exec.rs::exec_thumb_branch_with_cond.
+        if (insn & 0xf000) == 0xd000 {
+            let cond = ((insn >> 8) & 0xf) as u8;
+            if cond < 0xe {
+                let cond_enum = match num::FromPrimitive::from_u8(cond) {
+                    Some(c) => c,
+                    None => unsafe { std::hint::unreachable_unchecked() },
+                };
+                if !self.check_arm_cond(cond_enum) {
+                    // Not taken — AdvancePC(Seq).
+                    self.next_fetch_access = MemoryAccess::Seq;
+                    self.pc = fetch_addr.wrapping_add(2);
+                    return 0;
+                }
+                // Taken — same offset math as bcond_offset(): sign-extend
+                // the 8-bit imm to 32 bits then shift left by 1 so it's a
+                // halfword offset.
+                let offset = ((((insn & 0xff) as u32) << 24) as i32) >> 23;
+                self.pc = (self.pc as i32).wrapping_add(offset) as u32;
+                self.reload_pipeline16();
+                return 1; // PipelineFlushed
+            }
+            // SWI / undefined — fall through to LUT.
+        }
+
+        // F19 hi (top5=11110) — Linear part of BL pair. Sets gpr[LR].
+        // Mirrors thumb/exec.rs::exec_thumb_branch_long_with_link<false>.
+        // F19 lo (top5=11111) is the terminator and goes through LUT
+        // for now (handler does reload_pipeline16 + flag setup).
+        if (insn >> 11) == 0b11110 {
+            // off = (insn.offset11() << 21) >> 9 (sign-extend 11-bit to 32-bit then << 12)
+            let off = (((insn & 0x7ff) as u32) << 21) as i32 >> 9;
+            self.gpr[REG_LR] = (self.pc as i32).wrapping_add(off) as u32;
+            self.next_fetch_access = MemoryAccess::Seq;
+            self.pc = fetch_addr.wrapping_add(2);
+            return 0; // AdvancePC(Seq)
+        }
+
+        // Fallback: LUT + handler dispatch (unsupported format).
+        let thumb_info = &Self::THUMB_LUT[((insn >> 6) as usize) & 0x3FF];
+        match (thumb_info.handler_fn)(self, insn as u16) {
+            CpuAction::AdvancePC(next_access) => {
+                self.next_fetch_access = next_access;
+                self.pc = fetch_addr.wrapping_add(2);
+                0
+            }
+            CpuAction::PipelineFlushed => 1,
+        }
+    }
+
+    /// Phase-4 helper: do per-iter fetch + cycle accounting + pipeline
+    /// shift. The block emit pairs this with inline LLVM IR for the
+    /// instruction's effect.  No dispatch, no pc update.
+    ///
+    /// Cycles are charged via the bus path so per-page costs always
+    /// reflect the current WAITCNT state (per I7).  Earlier phase-4
+    /// step 2 (commit afb1ebd) tried inline cycle accumulation in IR
+    /// with baked Seq/NonSeq constants, but PE writes WAITCNT during
+    /// BIOS boot — the baked constants silently went stale and the
+    /// inline-IR path picked up ~12 hash-divs at sw=64KB.  Reverting
+    /// to bus-charged cycles here closes that hole.  Re-introducing
+    /// inline cycle IR requires implementing I7 (synchronous recompile
+    /// on WAITCNT write) first.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_thumb_fetch_only(&mut self, fetch_addr: u32) {
+        let access = self.next_fetch_access;
+        let val = self.load_16(fetch_addr, access);
+        self.pipeline[0] = self.pipeline[1];
+        self.pipeline[1] = val as u32;
+    }
+
+    /// Phase-4P-B: block-exit pipeline restore. Used by the IR when a
+    /// fully-inline AOT block has skipped per-opcode fetch_only (cycle
+    /// accounting handled inline via baked thumb_seq_cycles). At block
+    /// exit we still need pipeline[0]/[1] to hold the opcodes the next
+    /// block expects to find there.
+    ///
+    /// `exec_first` is the exec_addr of the NEXT block's first opcode.
+    /// Loads opcode at `exec_first` → pipeline[0]; opcode at
+    /// `exec_first + 2` → pipeline[1]. Charges Seq fetch cycles for
+    /// both reads via the bus path (matches scalar's per-iter behavior
+    /// when crossing into a new block). next_fetch_access is left
+    /// at whatever the last inlined opcode set it to.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_thumb_pipeline_restore(&mut self, exec_first: u32) {
+        let access = self.next_fetch_access;
+        let p0 = self.load_16(exec_first, access);
+        self.pipeline[0] = p0 as u32;
+        let p1 = self.load_16(exec_first.wrapping_add(2), MemoryAccess::Seq);
+        self.pipeline[1] = p1 as u32;
+        // pc convention: caller IR has set self.pc = exec_first + 4
+        // (pipeline-head pc) before returning. Don't touch pc here.
+    }
+
+    /// AOT-side helper: word-sized LDR with I14 misaligned-LDR ROR
+    /// semantics. Used by F11 LDR sp-rel inline IR (and future F9 LDR
+    /// word) which has a runtime-computed address — unlike F6 where
+    /// the address is constant-aligned at AOT compile time.
+    ///
+    /// Forwards to the private `ldr_word` in `memory.rs`. Side effect:
+    /// when `addr & 3 != 0`, sets `cpsr.C` from the rotated result's
+    /// top bit (per I14). The IR caller must NOT separately update
+    /// cpsr.C around this call.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_ldr_word(&mut self, addr: u32, access: MemoryAccess) -> u32 {
+        self.ldr_word(addr, access)
+    }
+
+    /// Forwards to the private `ldr_half` in `memory.rs`. Misaligned-addr
+    /// (`addr & 1 != 0`) ROR side effect on cpsr.C — same shape as
+    /// `aot_ldr_word`'s I14 behavior but for half-word load.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_ldr_half(&mut self, addr: u32, access: MemoryAccess) -> u32 {
+        self.ldr_half(addr, access)
+    }
+
+    /// Forwards to the private `ldr_sign_half` in `memory.rs`. F8 LDSH
+    /// uses this; misaligned-addr (`addr & 1 != 0`) does sign-extended
+    /// byte load instead of halfword.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_ldr_sign_half(&mut self, addr: u32, access: MemoryAccess) -> u32 {
+        self.ldr_sign_half(addr, access)
+    }
+
+    /// AOT-side helper: mid-block abort check (K=2 cadence per I2).
+    /// Mirrors the scalar `replay_cached_block` per-iter abort guard.
+    /// Returns true if the AOT block should yield to the dispatcher.
+    ///
+    /// The block was recorded as Thumb only (per phase-0 scope); the
+    /// mode-flip check fires if cpu.cpsr.state() flipped to ARM.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_block_should_abort_thumb(&mut self) -> bool {
+        if !matches!(self.cpsr.state(), CpuState::THUMB) {
+            return true;
+        }
+        if self.bus.take_block_cache_dirty() {
+            self.block_cache.flush();
+            return true;
+        }
+        self.bus.cached_block_should_abort()
+    }
+
+    /// AOT-side helper: per-iter ARM step (fetch + pipeline shift +
+    /// cond check + ARM_LUT handler dispatch + AdvancePC bookkeeping).
+    /// Phase-8 scaffolding — mirrors `aot_thumb_step` but for ARM mode.
+    ///
+    /// Returns:
+    ///   0 → AdvancePC (continue to next instruction).
+    ///   1 → PipelineFlushed (handler updated cpu.pc + cpu.pipeline
+    ///       at branch target; caller exits the block).
+    ///
+    /// Pipeline-head pc convention: scalar's self.pc at handler-call
+    /// time IS `fetch_addr` (= exec_addr + 8 in ARM mode). After
+    /// AdvancePC scalar advances pc by 4 → exec_addr + 12 = fetch_addr + 4.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_arm_step(&mut self, fetch_addr: u32, insn: u32) -> u32 {
+        let access = self.next_fetch_access;
+        let val = self.load_32(fetch_addr, access);
+        self.pipeline[0] = self.pipeline[1];
+        self.pipeline[1] = val;
+        self.pc = fetch_addr;
+
+        // ARM cond field (bits 28..32). AL = 0xE = always; skip cond
+        // check on AL for the common case.
+        let cond_bits = ((insn >> 28) & 0xf) as u8;
+        if cond_bits != 0xE {
+            // Cond is not AL; check it.
+            let cond = match num::FromPrimitive::from_u8(cond_bits) {
+                Some(c) => c,
+                None => unsafe { std::hint::unreachable_unchecked() },
+            };
+            if !self.check_arm_cond(cond) {
+                // Cond false — skip handler entirely. Scalar mirror:
+                // `advance_arm(); next_fetch_access = NonSeq;`.
+                self.next_fetch_access = MemoryAccess::NonSeq;
+                self.pc = fetch_addr.wrapping_add(4);
+                return 0; // AdvancePC
+            }
+        }
+
+        // Dispatch via ARM_LUT (same hash as scalar's step_arm_exec).
+        let hash = (((insn >> 16) & 0xff0) | ((insn >> 4) & 0xf)) as usize;
+        let arm_info = &Self::ARM_LUT[hash];
+        match (arm_info.handler_fn)(self, insn) {
+            CpuAction::AdvancePC(next_access) => {
+                self.next_fetch_access = next_access;
+                self.pc = fetch_addr.wrapping_add(4);
+                0
+            }
+            CpuAction::PipelineFlushed => 1,
+        }
+    }
+
+    /// AOT-side helper: ARM mode mid-block abort check. Mirrors
+    /// `aot_block_should_abort_thumb` but the mode-flip check fires
+    /// if cpu state flipped to Thumb.
+    #[cfg(feature = "cached_interp")]
+    #[inline]
+    pub fn aot_block_should_abort_arm(&mut self) -> bool {
+        if matches!(self.cpsr.state(), CpuState::THUMB) {
+            return true;
+        }
+        if self.bus.take_block_cache_dirty() {
+            self.block_cache.flush();
+            return true;
+        }
+        self.bus.cached_block_should_abort()
+    }
+
+    /// Try to dispatch an AOT-compiled block at the current pc. Returns
+    /// `Some(can_chain)` on hit, `None` on miss (caller falls through
+    /// to block_cache + scalar replay).
+    ///
+    /// Per I8 ABI: CompiledFn returns
+    ///   0     → fall-through (caller chains).
+    ///   0b01  → branch fired; dispatcher reloads pipeline at *pc_out.
+    ///   0b10  → mid-block abort; caller yields to outer run loop.
+    ///
+    /// Per I15 cold-start: AOT lookup is gated on
+    /// `cpu.pipeline[0] != 0` (a zero pipeline means the CPU just
+    /// reset and scalar must bootstrap before AOT takes over). See
+    /// findings-pipeline-read.md for the rationale.
+    #[cfg(feature = "aot_dispatch")]
+    #[inline]
+    fn try_aot_dispatch(&mut self) -> Option<bool> {
+        // Phase-8: select Thumb or ARM lookup based on mode. Both
+        // default to the no-op stub (returns 0) so try_aot_dispatch
+        // can call unconditionally without an Option discriminator.
+        let is_thumb = matches!(self.cpsr.state(), CpuState::THUMB);
+        let lookup = if is_thumb {
+            self.aot_lookup_fn
+        } else {
+            self.aot_lookup_fn_arm
+        };
+        let fn_addr = lookup(self.aot_table, self.pc);
+        if fn_addr == 0 {
+            return None;
+        }
+        // Per-mode hit counter (phase-8 debugging).
+        if is_thumb {
+            self.aot_dispatch_hits_thumb = self.aot_dispatch_hits_thumb.wrapping_add(1);
+        } else {
+            self.aot_dispatch_hits_arm = self.aot_dispatch_hits_arm.wrapping_add(1);
+        }
+        // Cold-start guard (I15): skip AOT until scalar has fetched
+        // at least one instruction. AT cold start cpu.pc=0 (BIOS reset
+        // vector) and BIOS isn't in the AOT table, so the lookup above
+        // returns 0 and we early-out before reaching here. This guard
+        // is only needed for save-state restores into AOT-keyed PCs
+        // (per I12) — but pipeline[0] is also restored from save-state
+        // so it's never 0 in practice. Keep guard for safety; it's
+        // out of the cold-start mainline path.
+        if self.pipeline[0] == 0 {
+            return None;
+        }
+        let f: unsafe extern "C" fn(*mut u8, *mut u32) -> u32 =
+            unsafe { std::mem::transmute(fn_addr) };
+        let cpu_ctx = self as *mut Arm7tdmiCore<I> as *mut u8;
+        let mut pc_out: u32 = 0;
+        let ret = unsafe { f(cpu_ctx, &mut pc_out) };
+        if ret & 0b10 != 0 {
+            return Some(false); // mid-block abort, yield
+        }
+        if ret & 0b01 != 0 {
+            // Branch fired. Apply mode + reload pipeline at target.
+            let thumb_bit = pc_out & 1 != 0;
+            self.cpsr.set_state(if thumb_bit { CpuState::THUMB } else { CpuState::ARM });
+            self.pc = pc_out & if thumb_bit { !1 } else { !3 };
+            if thumb_bit { self.reload_pipeline16() } else { self.reload_pipeline32() }
+        }
+        Some(true) // can chain
     }
 
     pub fn from_saved_state(bus: Shared<I>, state: SavedCpuState) -> Arm7tdmiCore<I> {
@@ -191,6 +1161,22 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
 
             #[cfg(feature = "cached_interp")]
             block_cache: super::cache::BlockCache::new(),
+            // AOT hook is process-level state, not save-state state.
+            // Caller re-installs after restore.
+            #[cfg(feature = "aot_dispatch")]
+            aot_table: std::ptr::null(),
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
+            aot_lookup_fn_arm: aot_lookup_noop,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_hits_arm: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_thumb: 0,
+            #[cfg(feature = "aot_dispatch")]
+            aot_dispatch_misses_arm: 0,
         }
     }
 
@@ -519,6 +1505,54 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
                 return;
             }
 
+            // AOT fast path (per I18). When a hook is installed and
+            // the current pc matches a compiled block, dispatch it
+            // directly without going through block_cache. On miss
+            // (None), fall through to the normal cache-or-record
+            // path.
+            #[cfg(feature = "aot_dispatch")]
+            if let Some(can_chain) = self.try_aot_dispatch() {
+                // try_aot_dispatch already bumps the per-mode hit
+                // counters; the un-segmented total is just the sum.
+                if !can_chain {
+                    return;
+                }
+                // Inter-block abort check (matches scalar's
+                // replay_cached_block exit). Without this, AOT
+                // accumulates ~0.0001 cycles drift per dispatch
+                // because scalar yields to the outer loop on every
+                // block boundary while AOT chains blindly to the next
+                // block — IRQs/DMA events fire ~1 instr late on AOT
+                // vs scalar. Bisected to seed 0x080008ca (a hot 7-instr
+                // loop); 18950 cycles drift over the PE replay with
+                // just that seed enabled.
+                //
+                // Phase 0c worried this would fire too often vs scalar
+                // because AOT's scan splits at Bcc-as-Branch making
+                // smaller blocks. Phase 0d's Bcc-as-Linear fix made
+                // AOT's blocks comparable to scalar's recorded blocks,
+                // so the cadence concern no longer applies.
+                if self.bus.cached_block_should_abort() {
+                    return;
+                }
+                continue;
+            }
+            #[cfg(feature = "aot_dispatch")]
+            if self.aot_lookup_fn as *const () != aot_lookup_noop as *const ()
+                || self.aot_lookup_fn_arm as *const () != aot_lookup_noop as *const ()
+            {
+                // Hook installed (thumb or arm), lookup missed —
+                // count as scalar dispatch.  Only per-mode counters now;
+                // the un-segmented total is `thumb + arm`.
+                if matches!(self.cpsr.state(), CpuState::THUMB) {
+                    self.aot_dispatch_misses_thumb =
+                        self.aot_dispatch_misses_thumb.wrapping_add(1);
+                } else {
+                    self.aot_dispatch_misses_arm =
+                        self.aot_dispatch_misses_arm.wrapping_add(1);
+                }
+            }
+
             let thumb = matches!(self.cpsr.state(), CpuState::THUMB);
             let key = super::cache::BlockKey::new(self.pc, thumb);
 
@@ -682,7 +1716,12 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             if entry_thumb {
                 let pc = self.pc & !1;
                 let fetched_now = self.load_16(pc, self.next_fetch_access);
-                let insn = self.pipeline[0];
+                // pipeline[0] is u32; in thumb mode only the low 16 bits
+                // are the live opcode. truncate before LUT index — without
+                // this, stale upper bits from a prior arm-mode block can
+                // index the 1024-entry LUT well past its end. usually
+                // hidden by codegen ordering; exposed by LTO.
+                let insn = self.pipeline[0] as u16;
                 self.pipeline[0] = self.pipeline[1];
                 self.pipeline[1] = fetched_now as u32;
                 let handler = Self::THUMB_LUT[(insn >> 6) as usize].handler_fn;
