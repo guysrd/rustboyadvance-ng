@@ -1716,7 +1716,12 @@ impl<I: MemoryInterface> Arm7tdmiCore<I> {
             if entry_thumb {
                 let pc = self.pc & !1;
                 let fetched_now = self.load_16(pc, self.next_fetch_access);
-                let insn = self.pipeline[0];
+                // pipeline[0] is u32; in thumb mode only the low 16 bits
+                // are the live opcode. truncate before LUT index — without
+                // this, stale upper bits from a prior arm-mode block can
+                // index the 1024-entry LUT well past its end. usually
+                // hidden by codegen ordering; exposed by LTO.
+                let insn = self.pipeline[0] as u16;
                 self.pipeline[0] = self.pipeline[1];
                 self.pipeline[1] = fetched_now as u32;
                 let handler = Self::THUMB_LUT[(insn >> 6) as usize].handler_fn;
