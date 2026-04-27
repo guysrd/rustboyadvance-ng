@@ -228,6 +228,50 @@ A future operator with more debugging time can revisit live cycle_luts
 once the deadlock root cause is found (suspicion: GEP indexing or
 int_to_ptr semantics around the `*const usize` -> i64 array I built).
 
+## 2026-04-27 cherry-pick: THUMB_LUT bounds fix + cached_interp_perf
+
+User-requested side investigation on `cached_interp_perf` branch
+turned up a pre-existing latent correctness bug. record_new_block
+indexes the 1024-entry THUMB_LUT with `(pipeline[0] >> 6) as usize`
+where pipeline[0] is u32. when stale upper bits from a prior arm-
+mode opcode persist (the pipeline state isn't zeroed across mode
+flips), the shifted index goes way past 1023 and the bounds check
+panics. masked by default codegen ordering (release -O3 happens to
+truncate via downstream `as u16` flow); exposed by lto.
+
+Fixed via `let insn = self.pipeline[0] as u16;` truncation before
+the LUT index (commit 0648be7 cherry-picked from cached_interp_perf
+1d7092d). Behaviorally identical for non-lto builds; fixes the LTO
+crash. Keeps the door open for future LTO experimentation.
+
+A second bug remains visible under thinLTO (cpu in thumb mode at
+bios addr 0x16; "executing undefind thumb instruction ea00") —
+not addressed this firing, deeper audit needed.
+
+Side measurements on cached_interp_perf branch with new recordings:
+| build                   | PE      | MK      |
+|-------------------------|---------|---------|
+| release (default cgu)   | 472     | 351     |
+| release-cgu1            | 465     | 356     |
+| release-thinlto         | panic   | panic   |
+
+cgu=1 alone shows no measurable gain over default release (within
+~2% noise). The earlier "243 PE / 184 MK" cached_interp-only number
+was system-load contention, not a build artifact. Real cached_interp
+perf sits around PE 472 / MK 351 on these recordings — within ~10%
+of the AOT-built-no-runtime-aot's 534/396, not the 2x gap I claimed
+earlier. So the apples-to-apples postmortem comparisons hold; there
+is no significant build-config win to be had without LTO.
+
+Recordings on disk:
+- `/home/user/pokeemerlad/recordings/pokeemerald_run.rec` (28377 frames)
+- `/home/user/pokeemerlad/recordings/mks.rec` (11267 frames)
+- `/home/user/pokeemerlad/recordings/pe_scalar_ref.txt` (472 fb_hashes)
+- `/home/user/pokeemerlad/recordings/mk_scalar_ref.txt` (187 fb_hashes)
+- `/home/user/pokeemerlad/recordings/roms/mks.gba` (4MB Mario Kart ROM)
+
+scripts/aot_measure.sh updated to use these stable paths.
+
 ---
 
 # Older entries below
