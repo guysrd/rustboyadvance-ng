@@ -5,12 +5,29 @@ Started: 2026-04-25
 
 ## Resume marker
 
-**STATE (2026-04-26 evening): phase-4-prime done as "19 fmts inlined,
-net regression vs whole-block at 19/19" (postmortem in
-`docs/findings-phase4-prime-postmortem.md`). Pivoting to phase
+**STATE (2026-04-27): phase-4P REPLAN. After 4 attempts (original
+phase 4P + 4P-A foundation + 4P-B inline+gen-check + 4P-C live
+cycle_luts) none crossed the score>0 fps gate. See
+`docs/findings-replan-after-4p.md` for the replan; recommendation
+is to hold and pivot to phase 7 (block chaining) when an operator
+has multi-firing focused-debug time available. Phase 7 is multi-day
+work; should NOT be sliced one-commit-per-firing or it'll repeat
+the 4P-C shallow-then-revert pattern.**
+
+Cron loop is HOLDING per program-doc protocol: ONE measurement
+appended to results.tsv per fire, no code changes, until operator
+green-lights phase 7.
+
+(Older state below.)
+
+## (Older) phase-4P attempts
+
+Phase-4-prime done as "19 fmts inlined, net regression vs whole-
+block at 19/19" (postmortem in
+`docs/findings-phase4-prime-postmortem.md`). Pivoted to phase
 4P-A/B/C per `docs/findings-phase4p-batched.md`: optimise the
 existing 19-fmt path (NOT add more formats) so it actually beats
-scalar.**
+scalar.
 
 Levers per findings-phase4p-batched.md:
 - 4P-A: WAITCNT generation counter infrastructure (this commit, data-only)
